@@ -4,6 +4,7 @@ import dataclasses
 import gc
 import logging
 import math
+import time
 from argparse import Namespace
 from collections.abc import Callable, Sequence
 from contextlib import nullcontext
@@ -53,6 +54,7 @@ from .initialize import is_first_replica_megatron_main_rank
 from .lora_utils import is_lora_enabled, is_lora_model
 from .model_provider import get_model_provider_func
 from .parallel import get_packed_seq_params
+from .trainable_state import _capture_external_train_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -656,6 +658,14 @@ def train(
     parallel_state = get_parallel_state()
     args = get_args()
     disable_optimizer = args.debug_disable_optimizer or optimizer is None
+    capture_external_stats = (
+        getattr(args, "external_policy_sync_path", None) is not None
+        and torch.distributed.get_rank() == 0
+    )
+    train_started = time.monotonic() if capture_external_stats else None
+    if capture_external_stats:
+        args._external_train_metrics = {}
+        args._external_train_seconds = None
 
     for iterator in data_iterator:
         iterator.reset()
@@ -796,6 +806,7 @@ def train(
                 extra_metrics=extra_metrics,
                 should_log=True,
             )
+            _capture_external_train_metrics(args, log_dict)
 
             if args.ci_test and not args.ci_disable_kl_checker:
                 check_kl(args, log_dict, step_id, accumulated_step_id)
@@ -816,6 +827,8 @@ def train(
     if pre_hook_enabled:
         disable_forward_pre_hook(model)
 
+    if train_started is not None:
+        args._external_train_seconds = time.monotonic() - train_started
     return train_step_outcome
 
 

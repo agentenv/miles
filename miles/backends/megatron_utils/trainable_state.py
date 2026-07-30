@@ -19,6 +19,10 @@ class TrainableState:
     policy_version: int
     layout_hash: str
     tensors: Mapping[str, torch.Tensor]
+    train_rollout_kl: float | None = None
+    ess_ratio: float | None = None
+    pg_clipfrac: float | None = None
+    train_seconds: float | None = None
 
 
 def _layout_hash(tensors: Mapping[str, torch.Tensor]) -> str:
@@ -40,6 +44,11 @@ def _layout_hash(tensors: Mapping[str, torch.Tensor]) -> str:
 def make_trainable_state(
     policy_version: int,
     tensors: Mapping[str, torch.Tensor],
+    *,
+    train_rollout_kl: float | None = None,
+    ess_ratio: float | None = None,
+    pg_clipfrac: float | None = None,
+    train_seconds: float | None = None,
 ) -> TrainableState:
     if policy_version < 0:
         raise ValueError("policy version must be non-negative")
@@ -53,7 +62,29 @@ def make_trainable_state(
         if not torch.isfinite(value).all().item():
             raise ValueError(f"{name!r} contains NaN or Inf")
         canonical[name] = value.clone()
-    return TrainableState(policy_version, _layout_hash(canonical), canonical)
+    return TrainableState(
+        policy_version,
+        _layout_hash(canonical),
+        canonical,
+        train_rollout_kl,
+        ess_ratio,
+        pg_clipfrac,
+        train_seconds,
+    )
+
+
+def _capture_external_train_metrics(args, metrics: Mapping[str, Any]) -> None:
+    if getattr(args, "external_policy_sync_path", None) is None or dist.get_rank() != 0:
+        return
+    args._external_train_metrics = {
+        name: float(metrics[name])
+        for name in (
+            "train/train_rollout_kl",
+            "train/ess_ratio",
+            "train/pg_clipfrac",
+        )
+        if name in metrics
+    }
 
 
 def _adapter_sides(actor) -> tuple[tuple[str, Any], ...]:
@@ -116,7 +147,19 @@ def export_trainable_state(actor, *, policy_version: int) -> TrainableState:
             side.megatron_module,
         )
         tensors[name] = next(iter(converted.values()))
-    return make_trainable_state(policy_version, tensors)
+    metrics = (
+        getattr(actor.args, "_external_train_metrics", {})
+        if getattr(actor.args, "external_policy_sync_path", None) is not None
+        else {}
+    )
+    return make_trainable_state(
+        policy_version,
+        tensors,
+        train_rollout_kl=metrics.get("train/train_rollout_kl"),
+        ess_ratio=metrics.get("train/ess_ratio"),
+        pg_clipfrac=metrics.get("train/pg_clipfrac"),
+        train_seconds=getattr(actor.args, "_external_train_seconds", None),
+    )
 
 
 def _optimizer_children(optimizer) -> list[Any]:

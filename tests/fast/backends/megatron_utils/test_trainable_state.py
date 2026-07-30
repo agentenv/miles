@@ -75,6 +75,43 @@ def test_export_trainable_state_is_canonical(monkeypatch):
     assert torch.equal(state.tensors[NAME], torch.tensor([[1.25, 2.5]]))
 
 
+def test_export_trainable_state_carries_external_round_stats(monkeypatch):
+    actor, side, *_ = _actor()
+    actor.args.external_policy_sync_path = "project.sync.create"
+    actor.args._external_train_metrics = {
+        "train/train_rollout_kl": 0.1,
+        "train/ess_ratio": 0.8,
+        "train/pg_clipfrac": 0.25,
+    }
+    actor.args._external_train_seconds = 1.5
+    monkeypatch.setattr(trainable_state, "_adapter_sides", lambda _actor: [(NAME, side)])
+
+    state = trainable_state.export_trainable_state(actor, policy_version=3)
+
+    assert state.train_rollout_kl == 0.1
+    assert state.ess_ratio == 0.8
+    assert state.pg_clipfrac == 0.25
+    assert state.train_seconds == 1.5
+
+
+def test_external_train_metric_capture_is_rank_zero_only(monkeypatch):
+    args = SimpleNamespace(external_policy_sync_path="project.sync.create")
+    metrics = {
+        "train/train_rollout_kl": 0.1,
+        "train/ess_ratio": 0.8,
+        "train/pg_clipfrac": 0.25,
+    }
+    monkeypatch.setattr(trainable_state.dist, "get_rank", lambda: 0)
+
+    trainable_state._capture_external_train_metrics(args, metrics)
+
+    assert args._external_train_metrics == metrics
+    del args._external_train_metrics
+    monkeypatch.setattr(trainable_state.dist, "get_rank", lambda: 1)
+    trainable_state._capture_external_train_metrics(args, metrics)
+    assert not hasattr(args, "_external_train_metrics")
+
+
 def test_apply_trainable_state_resets_only_lora_and_preserves_scheduler(monkeypatch):
     actor, side, unrelated, inner, backups = _actor()
     monkeypatch.setattr(trainable_state, "_adapter_sides", lambda _actor: [(NAME, side)])

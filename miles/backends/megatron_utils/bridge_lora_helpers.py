@@ -136,7 +136,9 @@ def _setup_lora_model_via_bridge(args: Namespace) -> list:
         hidden_size = hf_config.text_config.hidden_size if hasattr(hf_config, "text_config") else hf_config.hidden_size
         provider.register_pre_wrap_hook(_make_value_model_hook(hidden_size, provider.sequence_parallel))
 
-    use_distributed_optimizer = args.use_distributed_optimizer
+    use_distributed_optimizer = "muon" not in (args.optimizer or "").lower()
+    if getattr(args, "external_policy_sync_path", None) is not None:
+        use_distributed_optimizer = args.use_distributed_optimizer
     if is_multi_lora_enabled(args):
         # Per-slot LayerWise optimizers: plain DDP all-reduce keeps full grads on
         # every rank (whole-param sharding + retained-gradient idempotency).
