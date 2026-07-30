@@ -96,6 +96,7 @@ def _setup_lora_model_via_bridge(args: Namespace) -> list:
     provider.virtual_pipeline_model_parallel_size = args.virtual_pipeline_model_parallel_size
     provider.context_parallel_size = args.context_parallel_size
     provider.gradient_accumulation_fusion = args.gradient_accumulation_fusion
+    provider.attention_backend = args.attention_backend
     provider.recompute_granularity = args.recompute_granularity
     provider.recompute_method = args.recompute_method
     provider.recompute_num_layers = args.recompute_num_layers

@@ -30,6 +30,8 @@ def make_args(**overrides: Any) -> Namespace:
         # rollout core
         rollout_num_gpus=8,
         rollout_num_gpus_per_engine=1,
+        rollout_engine_base_port=15000,
+        train_master_base_port=None,
         num_gpus_per_node=8,
         rollout_batch_size=8,
         n_samples_per_prompt=4,
@@ -66,6 +68,7 @@ def make_args(**overrides: Any) -> Namespace:
         # sglang router
         sglang_router_ip=None,
         sglang_router_port=None,
+        sglang_router_prometheus_port=None,
         sglang_router_policy=None,
         sglang_router_request_timeout_secs=600,
         sglang_dp_size=1,

@@ -74,6 +74,18 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help="Number of GPUs per inference engine, just like the tp_size in sglang.",
             )
             parser.add_argument(
+                "--rollout-engine-base-port",
+                type=int,
+                default=15000,
+                help="First host port considered for rollout engine allocation.",
+            )
+            parser.add_argument(
+                "--train-master-base-port",
+                type=int,
+                default=None,
+                help="First host port considered for the training process group.",
+            )
+            parser.add_argument(
                 "--num-gpus-per-node",
                 type=int,
                 default=8,

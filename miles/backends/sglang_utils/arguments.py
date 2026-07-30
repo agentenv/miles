@@ -20,6 +20,12 @@ def add_sglang_router_arguments(parser):
         help="Port of the SGLang router",
     )
     parser.add_argument(
+        "--sglang-router-prometheus-port",
+        type=int,
+        default=None,
+        help="Prometheus port of the SGLang router",
+    )
+    parser.add_argument(
         "--sglang-router-policy",
         type=str,
         default=None,

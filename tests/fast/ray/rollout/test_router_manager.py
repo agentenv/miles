@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -37,6 +38,40 @@ class TestStartRouter:
         ), patch("miles.ray.rollout.router_manager.is_port_available", return_value=False):
             with pytest.raises(RuntimeError, match="already in use"):
                 start_router(args)
+
+    def test_configured_prometheus_port_is_forwarded(self, monkeypatch):
+        args = make_args(
+            sglang_router_ip=None,
+            sglang_router_port=21000,
+            sglang_router_prometheus_port=21001,
+        )
+        router_args = SimpleNamespace()
+        process = SimpleNamespace(start=lambda: None)
+        context = SimpleNamespace(Process=lambda **_kwargs: process)
+        monkeypatch.setattr(
+            "miles.ray.rollout.router_manager.get_host_info",
+            lambda: ("host", "127.0.0.1"),
+        )
+        monkeypatch.setattr(
+            "miles.ray.rollout.router_manager.RouterArgs.from_cli_args",
+            lambda *_args, **_kwargs: router_args,
+        )
+        monkeypatch.setattr(
+            "miles.ray.rollout.router_manager.multiprocessing.get_context",
+            lambda _method: context,
+        )
+        monkeypatch.setattr(
+            "miles.ray.rollout.router_manager.is_port_available",
+            lambda _port: True,
+        )
+        monkeypatch.setattr(
+            "miles.ray.rollout.router_manager.wait_for_server_ready",
+            lambda *_args, **_kwargs: None,
+        )
+
+        start_router(args)
+
+        assert router_args.prometheus_port == 21001
 
 
 class TestStartSessionServer:

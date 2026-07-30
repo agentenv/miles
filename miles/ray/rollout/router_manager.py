@@ -45,7 +45,12 @@ def start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool =
         router_args = RouterArgs.from_cli_args(args, use_router_prefix=True)
         router_args.host = router_ip
         router_args.port = router_port
-        router_args.prometheus_port = find_available_port(random.randint(4000, 5000))
+        prometheus_port = getattr(args, "sglang_router_prometheus_port", None)
+        router_args.prometheus_port = (
+            prometheus_port
+            if prometheus_port is not None and not force_new
+            else find_available_port(random.randint(4000, 5000))
+        )
         router_args.log_level = "warn"
         router_args.request_timeout_secs = args.sglang_router_request_timeout_secs
 

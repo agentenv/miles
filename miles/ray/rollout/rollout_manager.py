@@ -282,7 +282,7 @@ class RolloutManager:
     # -------------------------- external start/stop -----------------------------
 
     async def start_cell(self, cell_id: int):
-        port_cursors = PortCursors.empty()
+        port_cursors = PortCursors.empty(self.args.rollout_engine_base_port)
         idx = get_cell_indexer_of_id_map(self.servers)[cell_id]
         group = self.servers[idx.srv_key].server_groups[idx.group_index]
         await group.recover(port_cursors=port_cursors, filter_indices=idx.engine_indices)
