@@ -12,7 +12,7 @@ from miles.utils.debug_utils.periodic_py_spy import maybe_start_periodic_pyspy_d
 from miles.utils.ft_utils.control_server.server import start_control_server
 from miles.utils.ft_utils.mini_ft_controller import maybe_start_mini_ft_controller
 from miles.utils.logging_utils import configure_logger
-from miles.utils.misc import should_run_periodic_action
+from miles.utils.misc import load_function, should_run_periodic_action
 from miles.utils.tracking_utils.tracking import finish_tracking, init_tracking
 
 logger = logging.getLogger(__name__)
@@ -31,6 +31,16 @@ async def train(args):
 
     # create the actor and critic models
     actor_model, critic_model = await create_training_models(args, pgs, rollout_manager)
+
+    external_policy_sync = None
+    if args.external_policy_sync_path is not None:
+        if critic_model is not None:
+            raise ValueError("external policy synchronization does not support a critic")
+        external_policy_sync = load_function(args.external_policy_sync_path)(args)
+        await external_policy_sync.initialize(
+            actor_model=actor_model,
+            rollout_manager=rollout_manager,
+        )
 
     if args.control_server_port:
         start_control_server(
@@ -106,6 +116,13 @@ async def train(args):
         else:
             await actor_model.train(rollout_id, rollout_data_ref)
 
+        if external_policy_sync is not None:
+            await external_policy_sync.after_local_train(
+                rollout_id=rollout_id,
+                actor_model=actor_model,
+                rollout_data=rollout_data_ref,
+            )
+
         external_save = args.save_trigger_sentinel is not None and os.path.exists(args.save_trigger_sentinel)
         if external_save or should_run_periodic_action(
             rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout
@@ -135,6 +152,8 @@ async def train(args):
             )
             break
 
+    if external_policy_sync is not None:
+        await external_policy_sync.finalize()
     await rollout_manager.dispose.remote()
 
 

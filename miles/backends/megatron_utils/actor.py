@@ -55,6 +55,9 @@ from .lora_utils import is_lora_enabled
 from .model import TrainStepOutcome, forward_only, initialize_model_and_optimizer, save, train
 from .parallel import verify_megatron_parallel_state
 from .replay_utils import register_replay_list_moe
+from .trainable_state import TrainableState
+from .trainable_state import apply_trainable_state as apply_external_trainable_state
+from .trainable_state import export_trainable_state as export_external_trainable_state
 from .update_weight.common import named_params_and_buffers
 from .update_weight.update_weight_from_distributed.broadcast import UpdateWeightFromDistributed
 from .update_weight.update_weight_from_distributed.p2p import UpdateWeightP2P
@@ -261,6 +264,25 @@ class MegatronTrainRayActor(TrainRayActor):
         self.prof.on_init_end()
 
         return start_rollout_id
+
+    def export_trainable_state(self) -> TrainableState | None:
+        """Export one complete replicated LoRA state from global rank zero."""
+        if dist.get_rank() != 0:
+            return None
+        return export_external_trainable_state(
+            self,
+            policy_version=getattr(self, "_external_policy_version", 0),
+        )
+
+    def apply_trainable_state(self, state: TrainableState, *, reset_optimizer: bool) -> int:
+        """Apply a complete replicated LoRA state on this Megatron rank."""
+        reset_count = apply_external_trainable_state(
+            self,
+            state,
+            reset_optimizer=reset_optimizer,
+        )
+        self._external_policy_version = state.policy_version
+        return reset_count
 
     @with_logs
     @timer

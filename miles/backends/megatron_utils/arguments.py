@@ -15,6 +15,8 @@ def set_default_megatron_args(args):
     args.use_distributed_optimizer = (args.optimizer is None or args.optimizer.lower() == "adam") and not getattr(
         args, "debug_disable_optimizer", False
     )
+    if getattr(args, "external_policy_sync_path", None) is not None:
+        args.use_distributed_optimizer = False
     # Multi-LoRA: per-slot LayerWise optimizers require plain DDP all-reduce.
     if getattr(args, "multi_lora_n_adapters", 0) > 0:
         args.use_distributed_optimizer = False

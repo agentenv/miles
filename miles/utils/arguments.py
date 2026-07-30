@@ -270,6 +270,15 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--external-policy-sync-path",
+                type=str,
+                default=None,
+                help=(
+                    "Factory for an external policy synchronizer. The returned object is called "
+                    "after local training and before weights are published to rollout engines."
+                ),
+            )
+            parser.add_argument(
                 "--recompute-loss-function",
                 action="store_true",
                 help="Whether to enable recompute loss function to save memory during training.",

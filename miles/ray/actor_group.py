@@ -7,6 +7,7 @@ import asyncio
 
 from ray.util.placement_group import PlacementGroup
 
+from miles.backends.megatron_utils.trainable_state import TrainableState
 from miles.ray.train.actor_factory import allocate_gpus_for_actor
 from miles.utils.ft_utils.indep_dp import IndepDPInfo
 
@@ -83,6 +84,25 @@ class RayTrainGroup:
             witness_info=None,
             attempt=0,
         )
+
+    async def export_trainable_state(self) -> TrainableState:
+        """Export replicated trainable state from Megatron global rank zero."""
+        results = await self._broadcast("export_trainable_state")
+        exported = [result for result in results if result is not None]
+        if len(exported) != 1:
+            raise RuntimeError("trainable state must be exported by exactly one rank")
+        return exported[0]
+
+    async def apply_trainable_state(self, state: TrainableState, *, reset_optimizer: bool) -> int:
+        """Apply trainable state to every Megatron rank."""
+        results = await self._broadcast(
+            "apply_trainable_state",
+            state,
+            reset_optimizer=reset_optimizer,
+        )
+        if not results or any(result != results[0] for result in results[1:]):
+            raise RuntimeError("Megatron ranks disagree after applying trainable state")
+        return results[0]
 
     async def save_model(self, rollout_id, force_sync=False):
         """Save actor model"""
