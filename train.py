@@ -1,4 +1,5 @@
 import asyncio
+import itertools
 import logging
 import os
 
@@ -94,7 +95,13 @@ async def train(args):
 
     # train loop.
     # note that for async training, one can change the position of the sync operation(ray.get).
-    for rollout_id in range(args.start_rollout_id, args.num_rollout):
+    rollout_ids = (
+        itertools.count(args.start_rollout_id)
+        if external_policy_sync is not None
+        and getattr(args, "external_policy_sync_run_until_stop", False)
+        else range(args.start_rollout_id, args.num_rollout)
+    )
+    for rollout_id in rollout_ids:
         if args.eval_interval is not None and rollout_id == args.start_rollout_id and not args.skip_eval_before_train:
             await rollout_manager.eval.remote(rollout_id)
 
@@ -116,12 +123,13 @@ async def train(args):
         else:
             await actor_model.train(rollout_id, rollout_data_ref)
 
+        should_stop = False
         if external_policy_sync is not None:
-            await external_policy_sync.after_local_train(
+            should_stop = bool(await external_policy_sync.after_local_train(
                 rollout_id=rollout_id,
                 actor_model=actor_model,
                 rollout_data=rollout_data_ref,
-            )
+            ))
 
         external_save = args.save_trigger_sentinel is not None and os.path.exists(args.save_trigger_sentinel)
         if external_save or should_run_periodic_action(
@@ -137,6 +145,8 @@ async def train(args):
         await actor_model.update_weights(rollout_id=rollout_id)
         if args.offload_rollout:
             await rollout_manager.onload_kv.remote()
+        if should_stop:
+            break
 
         if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
             await rollout_manager.eval.remote(rollout_id)

@@ -135,6 +135,31 @@ def test_apply_trainable_state_resets_only_lora_and_preserves_scheduler(monkeypa
     assert backups == ["actor"]
 
 
+def test_partial_trainable_state_applies_preserve_optimizer_and_advance_scheduler(
+    monkeypatch,
+):
+    actor, side, unrelated, inner, backups = _actor()
+    adapter_state = inner.state[side.param_weight.main_param]
+    monkeypatch.setattr(trainable_state, "_adapter_sides", lambda _actor: [(NAME, side)])
+
+    for policy_version, value in ((1, 5.0), (2, 7.0)):
+        reset_count = trainable_state.apply_trainable_state(
+            actor,
+            trainable_state.make_trainable_state(
+                policy_version,
+                {NAME: torch.full((1, 2), value)},
+            ),
+            reset_optimizer=False,
+        )
+        assert reset_count == 0
+        assert inner.state[side.param_weight.main_param] is adapter_state
+        assert unrelated in inner.state
+
+    assert actor.opt_param_scheduler.num_steps == 16
+    assert torch.equal(side.param_weight.main_param, torch.tensor([[7.0, 7.0]]))
+    assert backups == ["actor", "actor"]
+
+
 def test_apply_trainable_state_rejects_layout_change(monkeypatch):
     actor, side, *_ = _actor()
     monkeypatch.setattr(trainable_state, "_adapter_sides", lambda _actor: [(NAME, side)])

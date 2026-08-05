@@ -121,6 +121,7 @@ async def test_external_policy_sync_wraps_miles_weight_publication(monkeypatch):
         save_trigger_sentinel=None,
         save_interval=None,
         debug_exit_after_rollout=None,
+        external_policy_sync_run_until_stop=False,
     )
 
     await train_module.train(args)
@@ -131,5 +132,82 @@ async def test_external_policy_sync_wraps_miles_weight_publication(monkeypatch):
         ("train", 0, "rollout-0"),
         ("sync", 0, "rollout-0"),
         ("update", 0),
+        "finalize",
+    ]
+
+
+async def test_external_policy_sync_stops_only_after_final_weight_publication(
+    monkeypatch,
+):
+    events = []
+
+    class Actor:
+        async def update_weights(self, rollout_id=None):
+            events.append(("update", rollout_id))
+
+        async def train(self, rollout_id, rollout_data):
+            events.append(("train", rollout_id))
+
+        async def clear_memory(self):
+            pass
+
+    actor = Actor()
+    rollout = SimpleNamespace(
+        generate=_Remote(lambda rollout_id: f"rollout-{rollout_id}"),
+        dispose=_Remote(lambda: None),
+    )
+
+    class Sync:
+        async def initialize(self, **_kwargs):
+            pass
+
+        async def after_local_train(self, *, rollout_id, **_kwargs):
+            events.append(("sync", rollout_id))
+            return rollout_id == 1
+
+        async def finalize(self):
+            events.append("finalize")
+
+    monkeypatch.setattr(train_module, "configure_logger", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(train_module, "maybe_start_periodic_pyspy_dump", lambda: None)
+    monkeypatch.setattr(train_module, "maybe_start_mini_ft_controller", lambda _args: None)
+    monkeypatch.setattr(train_module, "create_placement_groups", lambda _args: {"rollout": object()})
+    monkeypatch.setattr(train_module, "create_rollout_manager", lambda *_args: (rollout, 1))
+
+    async def create_models(*_args):
+        return actor, None
+
+    monkeypatch.setattr(train_module, "create_training_models", create_models)
+    monkeypatch.setattr(train_module, "init_tracking", lambda _args: None)
+    monkeypatch.setattr(train_module, "load_function", lambda _path: lambda _args: Sync())
+    monkeypatch.setattr(train_module, "should_run_periodic_action", lambda *_args: False)
+
+    args = SimpleNamespace(
+        external_policy_sync_path="project.sync.create",
+        external_policy_sync_run_until_stop=True,
+        control_server_port=None,
+        offload_rollout=False,
+        check_weight_update_equal=False,
+        num_rollout=1,
+        eval_interval=None,
+        offload_train=False,
+        use_critic=False,
+        start_rollout_id=0,
+        skip_eval_before_train=False,
+        save_trigger_sentinel=None,
+        save_interval=None,
+        debug_exit_after_rollout=None,
+    )
+
+    await train_module.train(args)
+
+    assert events == [
+        ("update", None),
+        ("train", 0),
+        ("sync", 0),
+        ("update", 0),
+        ("train", 1),
+        ("sync", 1),
+        ("update", 1),
         "finalize",
     ]
