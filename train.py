@@ -38,6 +38,8 @@ async def train(args):
         if critic_model is not None:
             raise ValueError("external policy synchronization does not support a critic")
         external_policy_sync = load_function(args.external_policy_sync_path)(args)
+        if args.offload_train:
+            await actor_model.onload()
         await external_policy_sync.initialize(
             actor_model=actor_model,
             rollout_manager=rollout_manager,
@@ -58,6 +60,8 @@ async def train(args):
 
     # always update weight first so that sglang has the loaded weights from training.
     await actor_model.update_weights()
+    if external_policy_sync is not None and args.offload_train:
+        await actor_model.offload()
 
     if args.check_weight_update_equal:
         await rollout_manager.check_weights.remote(

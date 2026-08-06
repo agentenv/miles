@@ -66,10 +66,25 @@ async def test_external_policy_sync_wraps_miles_weight_publication(monkeypatch):
     events = []
 
     class Actor:
+        awake = False
+
+        async def onload(self):
+            assert not self.awake
+            self.awake = True
+            events.append("onload")
+
+        async def offload(self):
+            assert self.awake
+            self.awake = False
+            events.append("offload")
+
         async def update_weights(self, rollout_id=None):
+            assert self.awake is (rollout_id is None)
             events.append(("update", rollout_id))
 
         async def train(self, rollout_id, rollout_data):
+            assert not self.awake
+            self.awake = True
             events.append(("train", rollout_id, rollout_data))
 
         async def clear_memory(self):
@@ -84,6 +99,7 @@ async def test_external_policy_sync_wraps_miles_weight_publication(monkeypatch):
     class Sync:
         async def initialize(self, *, actor_model, rollout_manager):
             assert actor_model is actor and rollout_manager is rollout
+            assert actor_model.awake
             events.append("initialize")
 
         async def after_local_train(self, *, rollout_id, actor_model, rollout_data):
@@ -114,7 +130,7 @@ async def test_external_policy_sync_wraps_miles_weight_publication(monkeypatch):
         check_weight_update_equal=False,
         num_rollout=1,
         eval_interval=None,
-        offload_train=False,
+        offload_train=True,
         use_critic=False,
         start_rollout_id=0,
         skip_eval_before_train=False,
@@ -127,10 +143,13 @@ async def test_external_policy_sync_wraps_miles_weight_publication(monkeypatch):
     await train_module.train(args)
 
     assert events == [
+        "onload",
         "initialize",
         ("update", None),
+        "offload",
         ("train", 0, "rollout-0"),
         ("sync", 0, "rollout-0"),
+        "offload",
         ("update", 0),
         "finalize",
     ]
