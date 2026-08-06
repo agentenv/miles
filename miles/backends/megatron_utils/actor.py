@@ -658,6 +658,10 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.offload_train:
             destroy_process_groups()
 
+    def prepare_weight_update(self) -> None:
+        if isinstance(self.weight_updater, UpdateWeightFromTensor):
+            self.weight_updater.prepare_weight_update()
+
     @with_logs
     @timer
     def update_weights(self, info: "EnginesAndLock") -> None:

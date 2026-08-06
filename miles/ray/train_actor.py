@@ -166,6 +166,9 @@ class TrainRayActor(RayActor):
     def save_model(self, rollout_id, force_sync=False):
         raise NotImplementedError
 
+    def prepare_weight_update(self) -> None:
+        pass
+
     @abc.abstractmethod
     def update_weights(self, info: "EnginesAndLock") -> None:
         raise NotImplementedError

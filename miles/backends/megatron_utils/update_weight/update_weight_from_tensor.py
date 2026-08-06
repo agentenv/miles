@@ -190,6 +190,19 @@ class UpdateWeightFromTensor:
         return out
 
     @torch.no_grad()
+    def prepare_weight_update(self) -> None:
+        if self.is_lora:
+            self._prepared_lora_weights = self._collect_lora_weights(self.weights_getter())
+
+    def _collect_lora_weights(self, megatron_local_weights) -> list:
+        accumulated_named_tensors: list = []
+        for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(
+            megatron_local_weights, weight_type="lora"
+        ):
+            accumulated_named_tensors.extend(hf_named_tensors)
+        return accumulated_named_tensors
+
+    @torch.no_grad()
     def update_weights(self) -> None:
         """
         version++, flush caches, process buckets. Progress on rank 0.
@@ -210,6 +223,8 @@ class UpdateWeightFromTensor:
             and not getattr(self.args, "check_weight_update_equal", False)
         )
 
+        prepared_lora_weights = self.__dict__.pop("_prepared_lora_weights", None)
+
         if rank == 0:
             mode = self.args.pause_generation_mode
             ray.get([engine.pause_generation.remote(mode=mode) for engine in self.rollout_engines])
@@ -218,7 +233,9 @@ class UpdateWeightFromTensor:
                 begin_weight_update(self.rollout_engines)
         dist.barrier(group=get_gloo_group())
 
-        megatron_local_weights = self.weights_getter()
+        megatron_local_weights = None
+        if not skip_base_sync or (self.is_lora and prepared_lora_weights is None):
+            megatron_local_weights = self.weights_getter()
 
         if not skip_base_sync:
             for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(
@@ -233,11 +250,11 @@ class UpdateWeightFromTensor:
             # SGLang's load_lora_adapter_from_tensors expects the full adapter in
             # one call; drain the bridge's chunker so --update-weight-buffer-size
             # only bounds the base path.
-            accumulated_named_tensors: list = []
-            for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(
-                megatron_local_weights, weight_type="lora"
-            ):
-                accumulated_named_tensors.extend(hf_named_tensors)
+            accumulated_named_tensors = (
+                prepared_lora_weights
+                if prepared_lora_weights is not None
+                else self._collect_lora_weights(megatron_local_weights)
+            )
 
             if not accumulated_named_tensors:
                 raise RuntimeError(
@@ -340,8 +357,13 @@ def _send_to_colocated_engine(
     serialized_tensors: list = []
     for _dtype, named_tensors in converted_named_tensors_by_dtypes.items():
         flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
+        flattened_tensor = flattened_tensor_bucket.get_flattened_tensor()
+        if is_lora and not flattened_tensor.is_cuda:
+            # Use an independent CUDA allocation for IPC rather than a CPU fd or
+            # storage tied to the trainer's offload lifecycle.
+            flattened_tensor = flattened_tensor.cuda()
         flattened_tensor_data = {
-            "flattened_tensor": flattened_tensor_bucket.get_flattened_tensor(),
+            "flattened_tensor": flattened_tensor,
             "metadata": flattened_tensor_bucket.get_metadata(),
         }
         long_live_tensors.append(flattened_tensor_data)

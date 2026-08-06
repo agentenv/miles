@@ -9,9 +9,11 @@ register_cpu_ci(est_time=60, suite="stage-a-cpu", labels=[])
 
 
 from argparse import Namespace
+from contextlib import nullcontext
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 
 from miles.backends.megatron_utils.update_weight.hf_weight_iterator_base import HfWeightIteratorBase
 
@@ -56,3 +58,33 @@ class TestHfWeightIteratorFactory:
             HfWeightIteratorBase.create(
                 args=args, model=[MagicMock()], is_lora=False, model_name="qwen", quantization_config=None
             )
+
+
+def test_bridge_lora_materializes_cpu_weights_before_ipc(monkeypatch):
+    from miles.backends.megatron_utils.update_weight import hf_weight_iterator_bridge as bridge_module
+
+    calls = []
+
+    class Bridge:
+        def export_adapter_weights(self, model, *, cpu, show_progress):
+            calls.append((model, cpu, show_progress))
+            return [("layer.lora_A.weight", torch.ones(1), "adapter.weight")]
+
+    iterator = object.__new__(bridge_module.HfWeightIteratorBridge)
+    iterator._bridge = Bridge()
+    iterator.model = [object()]
+    iterator.model_name = "qwen"
+    iterator.args = Namespace(update_weight_buffer_size=1024)
+    iterator.quantization_config = None
+    iterator._postprocess_and_quantize = lambda weights, _weight_type: weights
+    monkeypatch.setattr(bridge_module, "get_atomic_update_groups", lambda *_args: [])
+    monkeypatch.setattr(
+        bridge_module.megatron_bridge_utils,
+        "patch_megatron_model",
+        lambda _model: nullcontext(),
+    )
+
+    chunks = list(iterator.get_hf_weight_chunks({}, weight_type="lora"))
+
+    assert calls == [(iterator.model, True, False)]
+    assert chunks[0][0][0] == "layer.lora_A.weight"

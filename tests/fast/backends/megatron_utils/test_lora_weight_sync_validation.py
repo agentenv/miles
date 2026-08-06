@@ -24,7 +24,10 @@ from miles.backends.megatron_utils.update_weight.update_weight_from_distributed.
 from miles.backends.megatron_utils.update_weight.update_weight_from_distributed.mixin import (
     DistBucketedWeightUpdateMixin,
 )
-from miles.backends.megatron_utils.update_weight.update_weight_from_tensor import UpdateWeightFromTensor
+from miles.backends.megatron_utils.update_weight.update_weight_from_tensor import (
+    UpdateWeightFromTensor,
+    _send_to_colocated_engine,
+)
 from miles.utils.lora import LORA_ADAPTER_NAME
 
 _UW_MODULE = "miles.backends.megatron_utils.update_weight.update_weight_from_tensor"
@@ -169,6 +172,77 @@ class TestSendHfParamsEmptyLoraDetection:
         refs, _ = updater._send_lora_params(SAMPLE_LORA_WEIGHTS)
         # Should not raise; mock_send was called with the LoRA tensors
         assert mock_send.called
+
+
+@patch(f"{_UW_MODULE}.MultiprocessingSerializer")
+@patch(f"{_UW_MODULE}.FlattenedTensorBucket")
+@patch(f"{_UW_MODULE}.dist")
+def test_colocated_lora_uses_fresh_cuda_storage_for_ipc(mock_dist, mock_bucket_cls, mock_serializer):
+    cpu_flat = MagicMock()
+    cpu_flat.is_cuda = False
+    cuda_flat = MagicMock()
+    cpu_flat.cuda.return_value = cuda_flat
+
+    bucket = mock_bucket_cls.return_value
+    bucket.get_flattened_tensor.return_value = cpu_flat
+    bucket.get_metadata.return_value = {"names": ["layer.lora_A.weight"]}
+    mock_bucket_cls.supports_multi_dtypes = True
+    mock_serializer.serialize.return_value = "payload"
+    mock_dist.get_rank.return_value = 0
+    mock_dist.get_world_size.return_value = 1
+
+    def gather(value, *, object_gather_list, **_kwargs):
+        object_gather_list[0] = value
+
+    mock_dist.gather_object.side_effect = gather
+
+    engine = MagicMock()
+    _, long_lived = _send_to_colocated_engine(
+        [("layer.lora_A.weight", torch.ones(1))],
+        ipc_engine=engine,
+        ipc_gather_src=0,
+        ipc_gather_group=object(),
+        lora_config={"r": 8},
+        lora_name="miles_lora",
+    )
+
+    cpu_flat.cuda.assert_called_once_with()
+    assert long_lived[0]["flattened_tensor"] is cuda_flat
+    assert mock_serializer.serialize.call_args.args[0]["flattened_tensor"] is cuda_flat
+
+
+def test_prepared_lora_weights_are_consumed_after_model_offload(monkeypatch):
+    from miles.backends.megatron_utils.update_weight import update_weight_from_tensor as update_module
+
+    updater = object.__new__(UpdateWeightFromTensor)
+    updater.args = SimpleNamespace(
+        check_weight_update_equal=False,
+        pause_generation_mode="retract",
+    )
+    updater.is_lora = True
+    updater.use_distribute = False
+    updater.rollout_engines = []
+    updater.weight_version = 0
+    updater._lora_base_synced = False
+    updater.weights_getter = MagicMock(return_value={})
+    updater._hf_weight_iterator = MagicMock()
+    updater._hf_weight_iterator.get_hf_weight_chunks.return_value = [
+        [("layer.lora_A.weight", torch.ones(1))]
+    ]
+    updater._send_lora_params = MagicMock(return_value=([], []))
+
+    monkeypatch.setattr(update_module, "lora_base_cpu_backup_enabled", lambda _args: True)
+    monkeypatch.setattr(update_module, "get_gloo_group", MagicMock())
+    monkeypatch.setattr(update_module.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(update_module.dist, "barrier", MagicMock())
+    monkeypatch.setattr(update_module.ray, "get", MagicMock())
+
+    updater.prepare_weight_update()
+    updater.weights_getter.side_effect = AssertionError("model is offloaded")
+    updater.update_weights()
+
+    updater._hf_weight_iterator.get_hf_weight_chunks.assert_called_once_with({}, weight_type="lora")
+    updater._send_lora_params.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

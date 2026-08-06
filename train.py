@@ -143,6 +143,10 @@ async def train(args):
             if external_save:
                 os.remove(args.save_trigger_sentinel)
 
+        if args.offload_train and (
+            not args.use_critic or rollout_id >= args.num_critic_only_steps
+        ):
+            await actor_model.prepare_weight_update()
         await offload_train()
         if args.offload_rollout:
             await rollout_manager.onload_weights.remote()

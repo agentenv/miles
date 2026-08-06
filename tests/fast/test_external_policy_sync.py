@@ -87,6 +87,10 @@ async def test_external_policy_sync_wraps_miles_weight_publication(monkeypatch):
             self.awake = True
             events.append(("train", rollout_id, rollout_data))
 
+        async def prepare_weight_update(self):
+            assert self.awake
+            events.append("prepare_weight_update")
+
         async def clear_memory(self):
             pass
 
@@ -149,6 +153,7 @@ async def test_external_policy_sync_wraps_miles_weight_publication(monkeypatch):
         "offload",
         ("train", 0, "rollout-0"),
         ("sync", 0, "rollout-0"),
+        "prepare_weight_update",
         "offload",
         ("update", 0),
         "finalize",
