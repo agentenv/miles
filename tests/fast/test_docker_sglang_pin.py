@@ -2,7 +2,7 @@ from pathlib import Path
 
 
 SGLANG_REPOSITORY = "https://github.com/agentenv/sglang.git"
-SGLANG_COMMIT = "b34df47cb760b5210c4861de8d2d3a54ea3695a2"
+SGLANG_COMMIT = "b34df47444271ebda0673d68fe000399804c181b"
 SGLANG_IMAGE_TAG = "v0.5.16"
 
 

@@ -16,7 +16,7 @@ FROM lmsysorg/sglang:${SGLANG_IMAGE_TAG} AS sglang
 # ======================================== Arguments =============================================
 
 ARG SGLANG_REPOSITORY=https://github.com/agentenv/sglang.git
-ARG SGLANG_COMMIT=b34df47cb760b5210c4861de8d2d3a54ea3695a2
+ARG SGLANG_COMMIT=b34df47444271ebda0673d68fe000399804c181b
 
 ARG MEGATRON_REPO=radixark/Megatron-LM
 ARG MEGATRON_BRANCH=miles-main
