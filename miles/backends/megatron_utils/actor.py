@@ -60,7 +60,6 @@ from .trainable_state import apply_trainable_state as apply_external_trainable_s
 from .trainable_state import export_trainable_state as export_external_trainable_state
 from .update_weight.common import named_params_and_buffers
 from .update_weight.update_weight_from_distributed.broadcast import UpdateWeightFromDistributed
-from .update_weight.update_weight_from_distributed.p2p import UpdateWeightP2P
 from .update_weight.update_weight_from_tensor import UpdateWeightFromTensor
 
 if TYPE_CHECKING:
@@ -232,6 +231,8 @@ class MegatronTrainRayActor(TrainRayActor):
 
                 update_weight_cls = UpdateWeightFromDiskDelta
             else:
+                from .update_weight.update_weight_from_distributed.p2p import UpdateWeightP2P
+
                 update_weight_cls = UpdateWeightP2P
         self.weight_updater = update_weight_cls(
             self.args,
