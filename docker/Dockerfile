@@ -238,6 +238,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
       rm -rf /root/.cargo /root/.rustup /build/sgl-model-gateway /build/gateway_wheels; \
     fi
 
+# FlashQLA installs apache-tvm-ffi 0.1.9, but SGLang's Cutlass DSL requires 0.1.11.
+RUN pip install --force-reinstall --no-deps "apache-tvm-ffi==0.1.11" && \
+    python3 -c "import inspect; from tvm_ffi.utils.kwargs_wrapper import make_kwargs_wrapper; assert 'map_dataclass_to_tuple' in inspect.signature(make_kwargs_wrapper).parameters"
+
 RUN rm -rf /tmp/wheels
 
 # The cu130 sglang base ships its baked Rust toolchain outside the default PATH.
