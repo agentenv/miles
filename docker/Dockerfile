@@ -15,8 +15,8 @@ FROM lmsysorg/sglang:${SGLANG_IMAGE_TAG} AS sglang
 
 # ======================================== Arguments =============================================
 
-ARG SGLANG_BRANCH=sglang-miles
-ARG SGLANG_COMMIT=""
+ARG SGLANG_REPOSITORY=https://github.com/agentenv/sglang.git
+ARG SGLANG_COMMIT=f187485a79b98a1f2c3aade37ce72c2e1f3e89f5
 
 ARG MEGATRON_REPO=radixark/Megatron-LM
 ARG MEGATRON_BRANCH=miles-main
@@ -172,16 +172,12 @@ RUN if [ "${ENABLE_CUDA_13}" = "1" ]; then \
 
 RUN rm -rf /root/.cache/pip /root/flash-attention
 
-# ====================================== Install sglang-miles ============================================
+# ====================================== Install pinned SGLang ============================================
 
-# Install sglang from sglang-miles branch
 RUN cd /sgl-workspace/sglang && \
-    git fetch origin ${SGLANG_BRANCH} && \
-    if [ -n "${SGLANG_COMMIT}" ]; then \
-      git checkout ${SGLANG_COMMIT}; \
-    else \
-      git checkout FETCH_HEAD; \
-    fi && \
+    git fetch --depth 1 ${SGLANG_REPOSITORY} ${SGLANG_COMMIT} && \
+    git checkout --detach ${SGLANG_COMMIT} && \
+    test "$(git rev-parse HEAD)" = "${SGLANG_COMMIT}" && \
     pip install -e "python[all]" --no-deps
 
 # =========================== Mooncake structured object store wheel ===========================
