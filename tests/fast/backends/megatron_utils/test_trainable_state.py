@@ -94,6 +94,41 @@ def test_export_trainable_state_carries_external_round_stats(monkeypatch):
     assert state.train_seconds == 1.5
 
 
+def test_model_parallel_export_is_collective_and_only_rank_zero_returns(monkeypatch):
+    actor, side, *_ = _actor()
+    actor.args.tensor_model_parallel_size = 2
+    actor.args.pipeline_model_parallel_size = 2
+    monkeypatch.setattr(
+        trainable_state,
+        "_collective_adapter_tensors",
+        lambda _actor: {NAME: torch.tensor([[1.0, 2.0]])},
+    )
+    monkeypatch.setattr(trainable_state.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(trainable_state.dist, "get_rank", lambda: 1)
+
+    assert trainable_state.export_trainable_state(actor, policy_version=4) is None
+
+    monkeypatch.setattr(trainable_state.dist, "get_rank", lambda: 0)
+    state = trainable_state.export_trainable_state(actor, policy_version=4)
+    assert state is not None
+    assert state.policy_version == 4
+    assert torch.equal(state.tensors[NAME], torch.tensor([[1.0, 2.0]]))
+
+
+def test_collective_conversion_reads_f32_master_and_restores_model_parameter(monkeypatch):
+    actor, side, *_ = _actor()
+    original = side.param_weight.data
+    side.param_weight.main_param.copy_(torch.tensor([[3.0, 4.0]]))
+    monkeypatch.setattr(trainable_state, "_adapter_sides", lambda _actor: [(NAME, side)])
+
+    with trainable_state._optimizer_masters_as_model_parameters(actor):
+        assert side.param_weight.dtype == torch.float32
+        assert side.param_weight.data.data_ptr() == side.param_weight.main_param.data_ptr()
+
+    assert side.param_weight.dtype == torch.bfloat16
+    assert side.param_weight.data.data_ptr() == original.data_ptr()
+
+
 def test_external_train_metric_capture_is_rank_zero_only(monkeypatch):
     args = SimpleNamespace(external_policy_sync_path="project.sync.create")
     metrics = {

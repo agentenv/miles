@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import struct
 from collections.abc import Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -110,20 +111,33 @@ def _adapter_sides(actor) -> tuple[tuple[str, Any], ...]:
         for task in tasks:
             for side in (task.linear_in_task, task.linear_out_task):
                 parameter = side.param_weight
-                main = getattr(parameter, "main_param", None)
-                if main is None or main.dtype != torch.float32 or main.numel() != parameter.numel():
-                    raise RuntimeError(f"LoRA parameter {side.param_name!r} has no complete FP32 optimizer master")
-                converted = side.mapping.megatron_to_hf(main.view(parameter.shape), side.megatron_module)
-                if len(converted) != 1:
-                    raise RuntimeError(f"ambiguous LoRA mapping for {side.param_name!r}")
-                raw_name = next(iter(converted))
+                hf_param = side.mapping.hf_param
+                if isinstance(hf_param, str):
+                    raw_name = hf_param
+                elif isinstance(hf_param, dict) and len(set(hf_param.values())) == 1:
+                    raw_name = next(iter(hf_param.values()))
+                else:
+                    raise RuntimeError(
+                        f"ambiguous canonical LoRA mapping for {side.param_name!r}"
+                    )
                 name = raw_name if raw_name.startswith(_CANONICAL_PREFIX) else _CANONICAL_PREFIX + raw_name
+                if parameter is not None:
+                    main = getattr(parameter, "main_param", None)
+                    if (
+                        main is None
+                        or main.dtype != torch.float32
+                        or main.numel() != parameter.numel()
+                    ):
+                        raise RuntimeError(
+                            f"LoRA parameter {side.param_name!r} has no complete "
+                            "FP32 optimizer master"
+                        )
                 sides.append((name, side))
 
     names = [name for name, _ in sides]
     if not names or len(names) != len(set(names)):
         raise RuntimeError("Megatron produced an empty or duplicate LoRA mapping")
-    mapped = {id(side.param_weight) for _, side in sides}
+    mapped = {id(side.param_weight) for _, side in sides if side.param_weight is not None}
     trainable = {
         id(parameter)
         for model_chunk in actor.model
@@ -137,16 +151,83 @@ def _adapter_sides(actor) -> tuple[tuple[str, Any], ...]:
     return actor._external_trainable_sides
 
 
-@torch.no_grad()
-def export_trainable_state(actor, *, policy_version: int) -> TrainableState:
-    tensors = {}
-    for name, side in _adapter_sides(actor):
+@contextmanager
+def _optimizer_masters_as_model_parameters(actor):
+    """Expose f32 optimizer masters to Bridge conversion without replacing Parameters."""
+
+    originals = []
+    for _name, side in _adapter_sides(actor):
         parameter = side.param_weight
-        converted = side.mapping.megatron_to_hf(
-            parameter.main_param.view(parameter.shape),
-            side.megatron_module,
+        if parameter is None:
+            continue
+        originals.append((parameter, parameter.data))
+        parameter.data = parameter.main_param.view(parameter.shape)
+    try:
+        yield
+    finally:
+        for parameter, original in originals:
+            parameter.data = original
+
+
+def _collective_adapter_tensors(actor) -> dict[str, torch.Tensor]:
+    """Collect a complete canonical f32 PEFT state across TP and PP ranks."""
+
+    from megatron.bridge import AutoBridge
+
+    from miles.utils import megatron_bridge_utils
+
+    bridge = AutoBridge.from_hf_pretrained(
+        actor.args.hf_checkpoint,
+        trust_remote_code=True,
+    )
+    tensors: dict[str, torch.Tensor] = {}
+    with _optimizer_masters_as_model_parameters(actor):
+        with megatron_bridge_utils.patch_megatron_model(actor.model):
+            for raw_name, weight, _megatron_name in bridge.export_adapter_weights(
+                actor.model,
+                cpu=True,
+                show_progress=False,
+            ):
+                name = (
+                    raw_name
+                    if raw_name.startswith(_CANONICAL_PREFIX)
+                    else _CANONICAL_PREFIX + raw_name
+                )
+                value = weight.detach().to(dtype=torch.float32).contiguous()
+                previous = tensors.get(name)
+                if previous is not None and not torch.equal(previous, value):
+                    raise RuntimeError(f"conflicting collective LoRA tensor {name!r}")
+                tensors[name] = value
+    expected = {name for name, _side in _adapter_sides(actor)}
+    if set(tensors) != expected:
+        missing = sorted(expected - set(tensors))
+        extra = sorted(set(tensors) - expected)
+        raise RuntimeError(
+            f"collective LoRA export mismatch: missing={missing}, extra={extra}"
         )
-        tensors[name] = next(iter(converted.values()))
+    return tensors
+
+
+@torch.no_grad()
+def export_trainable_state(actor, *, policy_version: int) -> TrainableState | None:
+    tensor_parallel = int(getattr(actor.args, "tensor_model_parallel_size", 1))
+    pipeline_parallel = int(getattr(actor.args, "pipeline_model_parallel_size", 1))
+    if tensor_parallel > 1 or pipeline_parallel > 1:
+        # Bridge conversion is collective: every Megatron rank must enter it.
+        tensors = _collective_adapter_tensors(actor)
+    else:
+        tensors = {}
+        for name, side in _adapter_sides(actor):
+            parameter = side.param_weight
+            if parameter is None:
+                raise RuntimeError(f"single-rank LoRA side {name!r} is absent")
+            converted = side.mapping.megatron_to_hf(
+                parameter.main_param.view(parameter.shape),
+                side.megatron_module,
+            )
+            tensors[name] = next(iter(converted.values()))
+    if dist.is_initialized() and dist.get_rank() != 0:
+        return None
     metrics = (
         getattr(actor.args, "_external_train_metrics", {})
         if getattr(actor.args, "external_policy_sync_path", None) is not None
@@ -213,30 +294,47 @@ def apply_trainable_state(
         extra = sorted(set(incoming.tensors) - set(sides))
         raise RuntimeError(f"global LoRA mapping mismatch: missing={missing}, extra={extra}")
     current = export_trainable_state(actor, policy_version=state.policy_version)
-    if incoming.layout_hash != current.layout_hash:
+    current_layout = current.layout_hash if current is not None else None
+    if dist.is_initialized():
+        values = [current_layout]
+        dist.broadcast_object_list(values, src=0)
+        current_layout = values[0]
+    if incoming.layout_hash != current_layout:
         raise RuntimeError("global LoRA layout hash mismatch")
 
     mapped = {}
-    for name, side in sides.items():
-        value = incoming.tensors[name].to(device=side.param_weight.device)
-        target = side.mapping.hf_to_megatron(value, side.megatron_module)
-        if target.numel() != side.param_weight.numel():
-            raise RuntimeError(f"global LoRA shape mismatch for {name!r}")
-        mapped[name] = target.reshape(side.param_weight.shape).contiguous()
+    with _optimizer_masters_as_model_parameters(actor):
+        for name, side in sides.items():
+            if side.param_weight is None:
+                continue
+            value = incoming.tensors[name]
+            target = side.mapping.hf_to_megatron(value, side.megatron_module)
+            if target.numel() != side.param_weight.numel():
+                raise RuntimeError(f"global LoRA shape mismatch for {name!r}")
+            mapped[name] = target.reshape(side.param_weight.shape).contiguous()
 
-    _align_scheduler(actor, state.policy_version)
-    for name, side in sides.items():
-        side.param_weight.main_param.view(side.param_weight.shape).copy_(mapped[name])
+        _align_scheduler(actor, state.policy_version)
+        for name, target in mapped.items():
+            side = sides[name]
+            side.param_weight.main_param.view(side.param_weight.shape).copy_(target)
+
     _copy_masters_to_model(actor)
     if dist.is_initialized():
         dist.barrier()
+    local_parameters = [
+        side.param_weight.main_param
+        for side in sides.values()
+        if side.param_weight is not None
+    ]
     reset_count = (
         _reset_optimizer_state(
             actor,
-            [side.param_weight.main_param for side in sides.values()],
+            local_parameters,
         )
         if reset_optimizer
         else 0
     )
     actor.weights_backuper.backup("actor")
-    return reset_count
+    # Ray requires an identical result from every rank.  Report canonical
+    # tensors rather than local TP/PP parameter shards.
+    return len(incoming.tensors) if reset_optimizer else 0
