@@ -337,6 +337,11 @@ def create_lora_instance(args: Namespace):
 
     lora = lora_cls(**lora_kwargs)
 
+    if os.environ.get("YETO_DSV4_CLONE_ONLY_LORA") == "1":
+        from yeto.rl.deepseek_v4_clone_lora import wrap_clone_only_lora
+
+        lora = wrap_clone_only_lora(lora)
+
     logger.info(
         f"Created {lora_cls.__name__}: rank={args.lora_rank}, alpha={args.lora_alpha}, "
         f"dropout={args.lora_dropout}, target_modules={target_modules}, "

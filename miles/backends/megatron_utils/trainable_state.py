@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import struct
 from collections.abc import Mapping
 from contextlib import contextmanager
@@ -13,6 +14,18 @@ import torch
 import torch.distributed as dist
 
 _CANONICAL_PREFIX = "base_model.model."
+_CLONE_LAYERS = 43
+_CLONE_ORIGINAL_EXPERTS = 256
+_CLONE_TOTAL_EXPERTS = 288
+_CLONE_PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
+_CLONE_SIDES = ("A", "B")
+_EXPERT_LORA = re.compile(
+    r"^(?P<prefix>base_model\.model\.model\.layers\."
+    r"(?P<layer>\d+)\.mlp\.experts\.)"
+    r"(?P<expert>\d+)\."
+    r"(?P<projection>gate_proj|up_proj|down_proj)\."
+    r"lora_(?P<side>A|B)\.weight$"
+)
 
 
 @dataclass(frozen=True)
@@ -151,6 +164,214 @@ def _adapter_sides(actor) -> tuple[tuple[str, Any], ...]:
     return actor._external_trainable_sides
 
 
+def _clone_only_lora(actor) -> bool:
+    return bool(getattr(actor.args, "yeto_rl_clone_only_lora", False))
+
+
+def _expected_adapter_names(
+    actor,
+    sides: tuple[tuple[str, Any], ...] | None = None,
+) -> frozenset[str]:
+    """Return the external canonical policy names for this actor.
+
+    A standard grouped-expert LoRA parameter has one representative Bridge
+    side but exports 288 logical expert tensors.  Yeto therefore passes the
+    synthesized canonical name set explicitly for the E288 clone recipe.
+    """
+
+    if not _clone_only_lora(actor):
+        return frozenset(name for name, _side in (sides or _adapter_sides(actor)))
+    cached = getattr(actor, "_external_expected_adapter_names", None)
+    if cached is not None:
+        return cached
+    raw = getattr(actor.args, "yeto_rl_canonical_lora_names", None)
+    if not isinstance(raw, (list, tuple)) or not raw:
+        raise RuntimeError(
+            "clone-only LoRA has no synthesized canonical policy name contract"
+        )
+    names = tuple(str(name) for name in raw)
+    expected = frozenset(names)
+    if len(expected) != len(names):
+        raise RuntimeError("clone-only canonical policy contains duplicate names")
+
+    expert_keys = set()
+    for name in expected:
+        if ".mlp.experts." not in name:
+            continue
+        match = _EXPERT_LORA.fullmatch(name)
+        if match is None:
+            raise RuntimeError(f"malformed clone-only expert LoRA name {name!r}")
+        expert_keys.add(
+            (
+                int(match.group("layer")),
+                int(match.group("expert")),
+                match.group("projection"),
+                match.group("side"),
+            )
+        )
+    required_keys = {
+        (layer, expert, projection, side)
+        for layer in range(_CLONE_LAYERS)
+        for expert in range(_CLONE_TOTAL_EXPERTS)
+        for projection in _CLONE_PROJECTIONS
+        for side in _CLONE_SIDES
+    }
+    if expert_keys != required_keys:
+        missing = len(required_keys - expert_keys)
+        extra = len(expert_keys - required_keys)
+        raise RuntimeError(
+            "clone-only canonical expert policy is incomplete: "
+            f"missing={missing}, extra={extra}"
+        )
+
+    local_sides = sides or _adapter_sides(actor)
+    missing_local = [name for name, _side in local_sides if name not in expected]
+    if missing_local:
+        raise RuntimeError(
+            "local Bridge sides are absent from the canonical policy: "
+            f"{missing_local[:4]}"
+        )
+    actor._external_expected_adapter_names = expected
+    return expected
+
+
+def _validate_clone_canonical_tensors(tensors: Mapping[str, torch.Tensor]) -> None:
+    """Enforce exact-zero originals at every external policy boundary."""
+
+    found = 0
+    for name, value in tensors.items():
+        if ".mlp.experts." not in name:
+            continue
+        match = _EXPERT_LORA.fullmatch(name)
+        if match is None:
+            raise RuntimeError(f"malformed clone-only expert LoRA name {name!r}")
+        found += 1
+        expert = int(match.group("expert"))
+        if expert < 0 or expert >= _CLONE_TOTAL_EXPERTS:
+            raise RuntimeError(f"clone-only expert ID is out of range in {name!r}")
+        if expert < _CLONE_ORIGINAL_EXPERTS and torch.count_nonzero(value).item():
+            raise RuntimeError(
+                f"original expert adapter is nonzero at policy boundary: {name!r}"
+            )
+    if not found:
+        raise RuntimeError("clone-only canonical policy contains no expert tensors")
+
+
+def _expert_name(match: re.Match[str], expert: int, projection: str, side: str) -> str:
+    return (
+        f"{match.group('prefix')}{expert}.{projection}.lora_{side}.weight"
+    )
+
+
+def _expert_parallel_coordinates(actor) -> tuple[int, int]:
+    injected_rank = getattr(actor.args, "yeto_rl_expert_parallel_rank", None)
+    injected_size = getattr(actor.args, "yeto_rl_expert_parallel_size", None)
+    if injected_rank is not None or injected_size is not None:
+        if injected_rank is None or injected_size is None:
+            raise RuntimeError("incomplete injected expert-parallel coordinates")
+        rank, size = int(injected_rank), int(injected_size)
+    else:
+        from megatron.core import parallel_state
+
+        rank = int(parallel_state.get_expert_model_parallel_rank())
+        size = int(parallel_state.get_expert_model_parallel_world_size())
+    configured = int(getattr(actor.args, "expert_model_parallel_size", size))
+    if size <= 0 or not 0 <= rank < size or configured != size:
+        raise RuntimeError(
+            f"invalid expert-parallel coordinates rank={rank}, size={size}, "
+            f"configured={configured}"
+        )
+    return rank, size
+
+
+def _pack_expert_side(
+    name: str,
+    side: Any,
+    tensors: Mapping[str, torch.Tensor],
+    *,
+    expert_parallel_rank: int,
+    expert_parallel_size: int,
+) -> torch.Tensor:
+    """Pack global canonical expert tensors into one rank's 3-D parameter."""
+
+    match = _EXPERT_LORA.fullmatch(name)
+    if match is None:
+        raise RuntimeError(f"cannot pack non-expert LoRA side {name!r}")
+    parameter = side.param_weight
+    if parameter is None or parameter.ndim != 3:
+        raise RuntimeError(f"packed expert side {name!r} is not a rank-3 parameter")
+    local_count = int(parameter.shape[0])
+    start = expert_parallel_rank * local_count
+    if (
+        local_count <= 0
+        or local_count * expert_parallel_size != _CLONE_TOTAL_EXPERTS
+        or start + local_count > _CLONE_TOTAL_EXPERTS
+    ):
+        raise RuntimeError(
+            "invalid packed expert ownership "
+            f"rank={expert_parallel_rank}, size={expert_parallel_size}, "
+            f"start={start}, count={local_count}"
+        )
+    projection = match.group("projection")
+    adapter_side = match.group("side")
+    if projection == "up_proj":
+        raise RuntimeError("packed fc1 representative unexpectedly uses up_proj")
+
+    packed = []
+    for expert in range(start, start + local_count):
+        if projection == "down_proj":
+            value = tensors[
+                _expert_name(match, expert, "down_proj", adapter_side)
+            ]
+        elif adapter_side == "A":
+            gate = tensors[_expert_name(match, expert, "gate_proj", "A")]
+            up = tensors[_expert_name(match, expert, "up_proj", "A")]
+            if not torch.equal(gate, up):
+                raise RuntimeError(
+                    f"fused fc1 gate/up LoRA A tensors differ for layer "
+                    f"{match.group('layer')} expert {expert}"
+                )
+            value = gate
+        else:
+            gate = tensors[_expert_name(match, expert, "gate_proj", "B")]
+            up = tensors[_expert_name(match, expert, "up_proj", "B")]
+            value = torch.cat((gate, up), dim=0)
+        packed.append(value)
+    target = torch.stack(packed, dim=0).contiguous()
+    if tuple(target.shape) != tuple(parameter.shape):
+        raise RuntimeError(
+            f"packed expert LoRA shape mismatch for {name!r}: "
+            f"got {tuple(target.shape)}, expected {tuple(parameter.shape)}"
+        )
+    return target
+
+
+def _assert_original_packed_masters_zero(
+    sides: tuple[tuple[str, Any], ...],
+    *,
+    expert_parallel_rank: int,
+) -> None:
+    found = 0
+    for name, side in sides:
+        match = _EXPERT_LORA.fullmatch(name)
+        parameter = side.param_weight
+        if match is None or parameter is None:
+            continue
+        found += 1
+        start = expert_parallel_rank * int(parameter.shape[0])
+        original_count = max(
+            0,
+            min(int(parameter.shape[0]), _CLONE_ORIGINAL_EXPERTS - start),
+        )
+        master = parameter.main_param.view(parameter.shape)
+        if original_count and torch.count_nonzero(master[:original_count]).item():
+            raise RuntimeError(
+                f"original packed expert LoRA master is nonzero for {name!r}"
+            )
+    if not found:
+        raise RuntimeError("clone-only actor has no packed expert LoRA sides")
+
+
 @contextmanager
 def _optimizer_masters_as_model_parameters(actor):
     """Expose f32 optimizer masters to Bridge conversion without replacing Parameters."""
@@ -198,13 +419,16 @@ def _collective_adapter_tensors(actor) -> dict[str, torch.Tensor]:
                 if previous is not None and not torch.equal(previous, value):
                     raise RuntimeError(f"conflicting collective LoRA tensor {name!r}")
                 tensors[name] = value
-    expected = {name for name, _side in _adapter_sides(actor)}
+    sides = _adapter_sides(actor)
+    expected = _expected_adapter_names(actor, sides)
     if set(tensors) != expected:
         missing = sorted(expected - set(tensors))
         extra = sorted(set(tensors) - expected)
         raise RuntimeError(
             f"collective LoRA export mismatch: missing={missing}, extra={extra}"
         )
+    if _clone_only_lora(actor):
+        _validate_clone_canonical_tensors(tensors)
     return tensors
 
 
@@ -212,7 +436,13 @@ def _collective_adapter_tensors(actor) -> dict[str, torch.Tensor]:
 def export_trainable_state(actor, *, policy_version: int) -> TrainableState | None:
     tensor_parallel = int(getattr(actor.args, "tensor_model_parallel_size", 1))
     pipeline_parallel = int(getattr(actor.args, "pipeline_model_parallel_size", 1))
-    if tensor_parallel > 1 or pipeline_parallel > 1:
+    expert_parallel = int(getattr(actor.args, "expert_model_parallel_size", 1))
+    if (
+        tensor_parallel > 1
+        or pipeline_parallel > 1
+        or expert_parallel > 1
+        or _clone_only_lora(actor)
+    ):
         # Bridge conversion is collective: every Megatron rank must enter it.
         tensors = _collective_adapter_tensors(actor)
     else:
@@ -233,7 +463,7 @@ def export_trainable_state(actor, *, policy_version: int) -> TrainableState | No
         if getattr(actor.args, "external_policy_sync_path", None) is not None
         else {}
     )
-    return make_trainable_state(
+    state = make_trainable_state(
         policy_version,
         tensors,
         train_rollout_kl=metrics.get("train/train_rollout_kl"),
@@ -241,6 +471,12 @@ def export_trainable_state(actor, *, policy_version: int) -> TrainableState | No
         pg_clipfrac=metrics.get("train/pg_clipfrac"),
         train_seconds=getattr(actor.args, "_external_train_seconds", None),
     )
+    expected_layout = getattr(actor.args, "yeto_rl_layout_hash", None)
+    if expected_layout is not None and state.layout_hash != expected_layout:
+        raise RuntimeError(
+            "exported LoRA layout does not match Yeto's synthesized policy contract"
+        )
+    return state
 
 
 def _optimizer_children(optimizer) -> list[Any]:
@@ -288,11 +524,15 @@ def apply_trainable_state(
     if incoming.layout_hash != state.layout_hash:
         raise RuntimeError("trainable state layout hash mismatch")
 
-    sides = dict(_adapter_sides(actor))
-    if set(incoming.tensors) != set(sides):
-        missing = sorted(set(sides) - set(incoming.tensors))
-        extra = sorted(set(incoming.tensors) - set(sides))
+    side_items = _adapter_sides(actor)
+    sides = dict(side_items)
+    expected = _expected_adapter_names(actor, side_items)
+    if set(incoming.tensors) != expected:
+        missing = sorted(expected - set(incoming.tensors))
+        extra = sorted(set(incoming.tensors) - expected)
         raise RuntimeError(f"global LoRA mapping mismatch: missing={missing}, extra={extra}")
+    if _clone_only_lora(actor):
+        _validate_clone_canonical_tensors(incoming.tensors)
     current = export_trainable_state(actor, policy_version=state.policy_version)
     current_layout = current.layout_hash if current is not None else None
     if dist.is_initialized():
@@ -303,12 +543,24 @@ def apply_trainable_state(
         raise RuntimeError("global LoRA layout hash mismatch")
 
     mapped = {}
+    expert_coordinates = (
+        _expert_parallel_coordinates(actor) if _clone_only_lora(actor) else None
+    )
     with _optimizer_masters_as_model_parameters(actor):
         for name, side in sides.items():
             if side.param_weight is None:
                 continue
-            value = incoming.tensors[name]
-            target = side.mapping.hf_to_megatron(value, side.megatron_module)
+            if _clone_only_lora(actor) and _EXPERT_LORA.fullmatch(name):
+                target = _pack_expert_side(
+                    name,
+                    side,
+                    incoming.tensors,
+                    expert_parallel_rank=expert_coordinates[0],
+                    expert_parallel_size=expert_coordinates[1],
+                )
+            else:
+                value = incoming.tensors[name]
+                target = side.mapping.hf_to_megatron(value, side.megatron_module)
             if target.numel() != side.param_weight.numel():
                 raise RuntimeError(f"global LoRA shape mismatch for {name!r}")
             mapped[name] = target.reshape(side.param_weight.shape).contiguous()
@@ -317,6 +569,12 @@ def apply_trainable_state(
         for name, target in mapped.items():
             side = sides[name]
             side.param_weight.main_param.view(side.param_weight.shape).copy_(target)
+
+        if _clone_only_lora(actor):
+            _assert_original_packed_masters_zero(
+                side_items,
+                expert_parallel_rank=expert_coordinates[0],
+            )
 
     _copy_masters_to_model(actor)
     if dist.is_initialized():

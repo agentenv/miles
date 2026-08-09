@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -215,3 +216,196 @@ def test_apply_trainable_state_rejects_scheduler_rewind(monkeypatch):
 
     with pytest.raises(RuntimeError, match="ahead of the committed policy"):
         trainable_state.apply_trainable_state(actor, state, reset_optimizer=True)
+
+
+def _tiny_clone_policy():
+    tensors = {NAME: torch.tensor([[9.0, 10.0]])}
+    for expert in range(4):
+        for projection in ("gate_proj", "up_proj", "down_proj"):
+            for side in ("A", "B"):
+                if projection in {"gate_proj", "up_proj"}:
+                    shape = (2, 3) if side == "A" else (4, 2)
+                else:
+                    shape = (2, 4) if side == "A" else (3, 2)
+                value = 0.0 if expert < 2 else float(expert + 1)
+                tensors[
+                    "base_model.model.model.layers.0.mlp.experts."
+                    f"{expert}.{projection}.lora_{side}.weight"
+                ] = torch.full(shape, value)
+    return tensors
+
+
+def _packed_side(name, shape):
+    parameter = torch.nn.Parameter(torch.zeros(shape, dtype=torch.bfloat16))
+    parameter.main_param = torch.zeros(shape, dtype=torch.float32)
+    return SimpleNamespace(
+        mapping=_Mapping(),
+        megatron_module=None,
+        param_weight=parameter,
+    )
+
+
+def test_clone_only_apply_packs_full_canonical_experts_and_resets_optimizer(
+    monkeypatch,
+):
+    monkeypatch.setattr(trainable_state, "_CLONE_LAYERS", 1)
+    monkeypatch.setattr(trainable_state, "_CLONE_ORIGINAL_EXPERTS", 2)
+    monkeypatch.setattr(trainable_state, "_CLONE_TOTAL_EXPERTS", 4)
+    tensors = _tiny_clone_policy()
+    state = trainable_state.make_trainable_state(1, tensors)
+
+    attention = _packed_side(NAME, (1, 2))
+    prefix = "base_model.model.model.layers.0.mlp.experts.2"
+    expert_sides = {
+        f"{prefix}.gate_proj.lora_A.weight": _packed_side("fc1_a", (2, 2, 3)),
+        f"{prefix}.gate_proj.lora_B.weight": _packed_side("fc1_b", (2, 8, 2)),
+        f"{prefix}.down_proj.lora_A.weight": _packed_side("fc2_a", (2, 2, 4)),
+        f"{prefix}.down_proj.lora_B.weight": _packed_side("fc2_b", (2, 3, 2)),
+    }
+    sides = [(NAME, attention), *expert_sides.items()]
+    parameters = [side.param_weight for _name, side in sides]
+    inner = SimpleNamespace(
+        state={parameter.main_param: {"step": torch.tensor(1.0)} for parameter in parameters}
+    )
+
+    def copy_main_to_model():
+        for parameter in parameters:
+            parameter.copy_(parameter.main_param)
+
+    optimizer = SimpleNamespace(
+        chained_optimizers=[
+            SimpleNamespace(
+                optimizer=inner,
+                _copy_main_params_to_model_params=copy_main_to_model,
+            )
+        ]
+    )
+
+    class Scheduler:
+        num_steps = 0
+
+        def step(self, increment):
+            self.num_steps += increment
+
+    backups = []
+    actor = SimpleNamespace(
+        args=SimpleNamespace(
+            global_batch_size=1,
+            num_steps_per_rollout=1,
+            yeto_rl_clone_only_lora=True,
+            yeto_rl_canonical_lora_names=tuple(sorted(tensors)),
+            yeto_rl_expert_parallel_rank=1,
+            yeto_rl_expert_parallel_size=2,
+        ),
+        optimizer=optimizer,
+        opt_param_scheduler=Scheduler(),
+        weights_backuper=SimpleNamespace(backup=backups.append),
+    )
+    monkeypatch.setattr(trainable_state, "_adapter_sides", lambda _actor: tuple(sides))
+    monkeypatch.setattr(
+        trainable_state,
+        "export_trainable_state",
+        lambda _actor, policy_version: state,
+    )
+
+    reset_count = trainable_state.apply_trainable_state(
+        actor,
+        state,
+        reset_optimizer=True,
+    )
+
+    assert reset_count == len(tensors)
+    assert torch.equal(attention.param_weight.main_param, tensors[NAME])
+    for side in expert_sides.values():
+        assert torch.all(side.param_weight.main_param[0] == 3)
+        assert torch.all(side.param_weight.main_param[1] == 4)
+    assert not inner.state
+    assert backups == ["actor"]
+
+
+def test_clone_only_policy_rejects_nonzero_originals_and_split_fc1_a(monkeypatch):
+    monkeypatch.setattr(trainable_state, "_CLONE_ORIGINAL_EXPERTS", 2)
+    monkeypatch.setattr(trainable_state, "_CLONE_TOTAL_EXPERTS", 4)
+    tensors = _tiny_clone_policy()
+    original = (
+        "base_model.model.model.layers.0.mlp.experts.0."
+        "gate_proj.lora_A.weight"
+    )
+    tensors[original].fill_(1)
+    with pytest.raises(RuntimeError, match="original expert adapter is nonzero"):
+        trainable_state._validate_clone_canonical_tensors(tensors)
+
+    tensors = _tiny_clone_policy()
+    tensors[
+        "base_model.model.model.layers.0.mlp.experts.2.up_proj.lora_A.weight"
+    ].fill_(7)
+    name = (
+        "base_model.model.model.layers.0.mlp.experts.2."
+        "gate_proj.lora_A.weight"
+    )
+    side = _packed_side(name, (2, 2, 3))
+    with pytest.raises(RuntimeError, match="gate/up LoRA A tensors differ"):
+        trainable_state._pack_expert_side(
+            name,
+            side,
+            tensors,
+            expert_parallel_rank=1,
+            expert_parallel_size=2,
+        )
+
+
+def test_clone_only_collective_export_accepts_expanded_logical_experts(
+    monkeypatch,
+):
+    """Packed Bridge representatives must export the full canonical E288 policy."""
+
+    monkeypatch.setattr(trainable_state, "_CLONE_LAYERS", 1)
+    monkeypatch.setattr(trainable_state, "_CLONE_ORIGINAL_EXPERTS", 2)
+    monkeypatch.setattr(trainable_state, "_CLONE_TOTAL_EXPERTS", 4)
+    tensors = _tiny_clone_policy()
+    attention = _packed_side(NAME, (1, 2))
+    representative_name = (
+        "base_model.model.model.layers.0.mlp.experts.0."
+        "gate_proj.lora_A.weight"
+    )
+    representative = _packed_side(representative_name, (2, 2, 3))
+    actor = SimpleNamespace(
+        args=SimpleNamespace(
+            hf_checkpoint="/synthetic/e288",
+            yeto_rl_clone_only_lora=True,
+            yeto_rl_canonical_lora_names=tuple(sorted(tensors)),
+        ),
+        model=[],
+    )
+    monkeypatch.setattr(
+        trainable_state,
+        "_adapter_sides",
+        lambda _actor: (
+            (NAME, attention),
+            (representative_name, representative),
+        ),
+    )
+
+    class _Bridge:
+        def export_adapter_weights(self, *_args, **_kwargs):
+            for name, value in sorted(tensors.items()):
+                yield name, value, "synthetic"
+
+    from megatron.bridge import AutoBridge
+    from miles.utils import megatron_bridge_utils
+
+    monkeypatch.setattr(
+        AutoBridge,
+        "from_hf_pretrained",
+        lambda *_args, **_kwargs: _Bridge(),
+    )
+    monkeypatch.setattr(
+        megatron_bridge_utils,
+        "patch_megatron_model",
+        lambda _model: nullcontext(),
+    )
+
+    exported = trainable_state._collective_adapter_tensors(actor)
+    assert set(exported) == set(tensors)
+    assert torch.equal(exported[NAME], tensors[NAME])
+    trainable_state._validate_clone_canonical_tensors(exported)

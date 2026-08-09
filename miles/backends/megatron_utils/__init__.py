@@ -25,4 +25,18 @@ try:
 except Exception as _e:  # best-effort; not every environment uses megatron.bridge
     logging.warning("miles megatron.bridge plugins failed to load: %s", _e)
 
+# Yeto ships the pinned DeepSeek-V4 registration separately because the
+# NVIDIA Megatron-Bridge version in this image predates V4, while Miles already
+# contains the V4 MCore implementation.  Ray actor processes import this module
+# independently of the controller, so registration must happen here as well as
+# in Yeto's learner entry point.  Ordinary Miles installations without Yeto
+# remain unaffected.
+try:
+    from yeto.rl.deepseek_v4_bridge import ensure_deepseek_v4_bridge
+except ModuleNotFoundError as _e:
+    if (_e.name or "").split(".", 1)[0] != "yeto":
+        raise
+else:
+    ensure_deepseek_v4_bridge()
+
 logging.getLogger("megatron").setLevel(logging.WARNING)
