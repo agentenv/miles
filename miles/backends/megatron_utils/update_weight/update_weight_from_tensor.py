@@ -2,6 +2,7 @@ import hashlib
 import logging
 from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import contextmanager
 from typing import Any
 
 import ray
@@ -29,6 +30,63 @@ from .update_weight_from_distributed.broadcast import (
 )
 
 logger = logging.getLogger(__name__)
+
+_LORA_FLAT_BUCKET_MAX_BYTES = 256 * 1024 * 1024
+_LORA_FLAT_BUCKET_MAX_TENSORS = 1024
+_LORA_FLAT_BUCKET_MAX_THREADS = 16
+
+
+def _partition_lora_tensors(
+    named_tensors: list[tuple[str, torch.Tensor]],
+    *,
+    max_bytes: int = _LORA_FLAT_BUCKET_MAX_BYTES,
+    max_tensors: int = _LORA_FLAT_BUCKET_MAX_TENSORS,
+) -> list[list[tuple[str, torch.Tensor]]]:
+    """Split a full adapter before flattening it.
+
+    torch.cat scales pathologically when handed tens of thousands of inputs.
+    Bound both the copy size and input count while preserving the original
+    tensor order. A single tensor larger than max_bytes is kept in its own
+    bucket.
+    """
+    if max_bytes <= 0 or max_tensors <= 0:
+        raise ValueError("LoRA flat-bucket limits must be positive")
+
+    buckets: list[list[tuple[str, torch.Tensor]]] = []
+    current: list[tuple[str, torch.Tensor]] = []
+    current_bytes = 0
+    for item in named_tensors:
+        tensor_bytes = item[1].numel() * item[1].element_size()
+        if current and (len(current) >= max_tensors or current_bytes + tensor_bytes > max_bytes):
+            buckets.append(current)
+            current = []
+            current_bytes = 0
+        current.append(item)
+        current_bytes += tensor_bytes
+    if current:
+        buckets.append(current)
+    return buckets
+
+
+@contextmanager
+def _bounded_lora_flatten_threads(enabled: bool):
+    """Bound per-rank intra-op contention only while constructing flat buffers."""
+    previous_threads = None
+    if enabled:
+        current_threads = torch.get_num_threads()
+        if current_threads > _LORA_FLAT_BUCKET_MAX_THREADS:
+            previous_threads = current_threads
+            logger.info(
+                "Limiting LoRA flatten intra-op threads from %d to %d",
+                current_threads,
+                _LORA_FLAT_BUCKET_MAX_THREADS,
+            )
+            torch.set_num_threads(_LORA_FLAT_BUCKET_MAX_THREADS)
+    try:
+        yield
+    finally:
+        if previous_threads is not None:
+            torch.set_num_threads(previous_threads)
 
 
 class UpdateWeightFromTensor:
@@ -344,30 +402,56 @@ def _send_to_colocated_engine(
     is_gather_src = dist.get_rank() == ipc_gather_src
     long_live_tensors = []
 
-    if getattr(FlattenedTensorBucket, "supports_multi_dtypes", False):
+    if is_lora:
+        # Keep every flat buffer single-dtype. Besides making bucket sizes
+        # predictable, this avoids unaligned storage offsets when SGLang
+        # reconstructs heterogeneous tensors from a uint8 backing buffer.
+        converted_named_tensors_by_dtypes = {}
+        for name, tensor in hf_named_tensors:
+            converted_named_tensors_by_dtypes.setdefault(tensor.dtype, []).append((name, tensor))
+    elif getattr(FlattenedTensorBucket, "supports_multi_dtypes", False):
         converted_named_tensors_by_dtypes = {"dtype": hf_named_tensors}
     else:
         converted_named_tensors_by_dtypes = {}
         for name, tensor in hf_named_tensors:
-            dtype = tensor.dtype
-            if dtype not in converted_named_tensors_by_dtypes:
-                converted_named_tensors_by_dtypes[dtype] = []
-            converted_named_tensors_by_dtypes[dtype].append((name, tensor))
+            converted_named_tensors_by_dtypes.setdefault(tensor.dtype, []).append((name, tensor))
 
     serialized_tensors: list = []
-    for _dtype, named_tensors in converted_named_tensors_by_dtypes.items():
-        flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
-        flattened_tensor = flattened_tensor_bucket.get_flattened_tensor()
-        if is_lora and not flattened_tensor.is_cuda:
-            # Use an independent CUDA allocation for IPC rather than a CPU fd or
-            # storage tied to the trainer's offload lifecycle.
-            flattened_tensor = flattened_tensor.cuda()
-        flattened_tensor_data = {
-            "flattened_tensor": flattened_tensor,
-            "metadata": flattened_tensor_bucket.get_metadata(),
-        }
-        long_live_tensors.append(flattened_tensor_data)
-        serialized_tensors.append(MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True))
+    flattened_tensor_payloads: list[dict[str, Any]] = []
+    with _bounded_lora_flatten_threads(is_lora):
+        for _dtype, named_tensors in converted_named_tensors_by_dtypes.items():
+            tensor_buckets = _partition_lora_tensors(named_tensors) if is_lora else [named_tensors]
+            for tensor_bucket in tensor_buckets:
+                flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=tensor_bucket)
+                flattened_tensor = flattened_tensor_bucket.get_flattened_tensor()
+                if is_lora and not flattened_tensor.is_cuda:
+                    # Use independent CUDA allocations for IPC rather than CPU
+                    # fds or storage tied to the trainer's offload lifecycle.
+                    flattened_tensor = flattened_tensor.cuda()
+                flattened_tensor_data = {
+                    "flattened_tensor": flattened_tensor,
+                    "metadata": flattened_tensor_bucket.get_metadata(),
+                }
+                long_live_tensors.append(flattened_tensor_data)
+                if is_lora:
+                    flattened_tensor_payloads.append(flattened_tensor_data)
+                else:
+                    serialized_tensors.append(
+                        MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True)
+                    )
+
+    if is_lora:
+        # One HTTP field per TP rank remains the public contract. The serialized
+        # object inside that field carries multiple bounded flat buffers.
+        serialized_tensors.append(MultiprocessingSerializer.serialize(flattened_tensor_payloads, output_str=True))
+        logger.info(
+            "Packed %d LoRA tensors (%d bytes) into %d flattened buckets " "(max %d bytes/%d tensors)",
+            len(hf_named_tensors),
+            sum(t.numel() * t.element_size() for _, t in hf_named_tensors),
+            len(flattened_tensor_payloads),
+            _LORA_FLAT_BUCKET_MAX_BYTES,
+            _LORA_FLAT_BUCKET_MAX_TENSORS,
+        )
 
     serialized_named_tensors = [None] * dist.get_world_size(ipc_gather_group) if is_gather_src else None
     dist.gather_object(
@@ -382,11 +466,6 @@ def _send_to_colocated_engine(
         if is_lora:
             if lora_loaded:
                 ray.get(ipc_engine.unload_lora_adapter.remote(lora_name=lora_name))
-
-            # (Yusheng) to-do-1: update lora weights from tensors should support multiple dtypes (bf16, fp8, fp16, fp32)
-            # currently, we only support 1 type. If there are multiple dtypes, we need to serialize the tensors for each dtype.
-            # Thus, we need to apply the same way as `ipc_engine.update_weights_from_tensor` in future
-            # (Yusheng) to-do-2: need to add ci test acc here - now it will pass but fail to update lora weights
 
             expected_checksums = None
             if check_equal:
@@ -404,7 +483,7 @@ def _send_to_colocated_engine(
                     serialized_named_tensors=[
                         per_rank[0] if per_rank else None for per_rank in serialized_named_tensors
                     ],
-                    load_format="flattened_bucket",
+                    load_format="flattened_buckets",
                     expected_checksums=expected_checksums,
                 )
             )

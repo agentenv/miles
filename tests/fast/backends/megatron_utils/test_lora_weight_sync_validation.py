@@ -26,6 +26,8 @@ from miles.backends.megatron_utils.update_weight.update_weight_from_distributed.
 )
 from miles.backends.megatron_utils.update_weight.update_weight_from_tensor import (
     UpdateWeightFromTensor,
+    _bounded_lora_flatten_threads,
+    _partition_lora_tensors,
     _send_to_colocated_engine,
 )
 from miles.utils.lora import LORA_ADAPTER_NAME
@@ -208,7 +210,163 @@ def test_colocated_lora_uses_fresh_cuda_storage_for_ipc(mock_dist, mock_bucket_c
 
     cpu_flat.cuda.assert_called_once_with()
     assert long_lived[0]["flattened_tensor"] is cuda_flat
-    assert mock_serializer.serialize.call_args.args[0]["flattened_tensor"] is cuda_flat
+    serialized_buckets = mock_serializer.serialize.call_args.args[0]
+    assert len(serialized_buckets) == 1
+    assert serialized_buckets[0]["flattened_tensor"] is cuda_flat
+    load_call = engine.load_lora_adapter_from_tensors.remote.call_args
+    assert load_call.kwargs["load_format"] == "flattened_buckets"
+
+
+@patch(f"{_UW_MODULE}.MultiprocessingSerializer")
+@patch(f"{_UW_MODULE}.FlattenedTensorBucket")
+@patch(f"{_UW_MODULE}.dist")
+def test_colocated_lora_serializes_many_buckets_in_one_per_rank_payload(mock_dist, mock_bucket_cls, mock_serializer):
+    tensor = MagicMock()
+    tensor.dtype = torch.bfloat16
+    tensor.numel.return_value = 1
+    tensor.element_size.return_value = 2
+    named_tensors = [(f"expert.{i}.lora_A.weight", tensor) for i in range(2 * 1024 + 2)]
+
+    flat = MagicMock()
+    flat.is_cuda = True
+    bucket = mock_bucket_cls.return_value
+    bucket.get_flattened_tensor.return_value = flat
+    bucket.get_metadata.return_value = []
+    mock_serializer.serialize.return_value = "aggregate-payload"
+    mock_dist.get_rank.return_value = 0
+    mock_dist.get_world_size.return_value = 1
+
+    def gather(value, *, object_gather_list, **_kwargs):
+        object_gather_list[0] = value
+
+    mock_dist.gather_object.side_effect = gather
+    engine = MagicMock()
+
+    _send_to_colocated_engine(
+        named_tensors,
+        ipc_engine=engine,
+        ipc_gather_src=0,
+        ipc_gather_group=object(),
+        lora_config={"r": 8},
+        lora_name="miles_lora",
+    )
+
+    assert mock_bucket_cls.call_count == 3
+    assert [len(call.kwargs["named_tensors"]) for call in mock_bucket_cls.call_args_list] == [1024, 1024, 2]
+    mock_serializer.serialize.assert_called_once()
+    assert len(mock_serializer.serialize.call_args.args[0]) == 3
+    load_call = engine.load_lora_adapter_from_tensors.remote.call_args
+    assert load_call.kwargs["serialized_named_tensors"] == ["aggregate-payload"]
+    assert load_call.kwargs["load_format"] == "flattened_buckets"
+
+
+def test_lora_flatten_thread_limit_is_restored_after_error():
+    with (
+        patch(f"{_UW_MODULE}.torch.get_num_threads", return_value=112),
+        patch(f"{_UW_MODULE}.torch.set_num_threads") as set_num_threads,
+        pytest.raises(RuntimeError, match="flatten failed"),
+    ):
+        with _bounded_lora_flatten_threads(True):
+            raise RuntimeError("flatten failed")
+
+    assert set_num_threads.call_args_list == [
+        ((16,), {}),
+        ((112,), {}),
+    ]
+
+
+def test_lora_multi_bucket_http_wire_roundtrip_preserves_exact_values():
+    from typing import Annotated
+
+    from fastapi import Body
+    from pydantic import TypeAdapter
+    from miles.backends.megatron_utils.sglang import (
+        FlattenedTensorBucket,
+        MultiprocessingSerializer,
+    )
+    from sglang.srt.managers.io_struct import LoadLoRAAdapterFromTensorsReqInput
+    from sglang.srt.managers.tp_worker import _reconstruct_flattened_tensor_buckets
+
+    originals = [
+        (
+            f"layer.{i}.lora_A.weight",
+            torch.arange(i * 6, i * 6 + 6, dtype=torch.bfloat16).reshape(2, 3),
+        )
+        for i in range(6)
+    ]
+    payload = []
+    for named_tensors in _partition_lora_tensors(
+        originals,
+        max_bytes=1 << 20,
+        max_tensors=2,
+    ):
+        bucket = FlattenedTensorBucket(named_tensors=named_tensors)
+        payload.append(
+            {
+                "flattened_tensor": bucket.get_flattened_tensor(),
+                "metadata": bucket.get_metadata(),
+            }
+        )
+
+    serialized = MultiprocessingSerializer.serialize(payload, output_str=True)
+    request = TypeAdapter(Annotated[LoadLoRAAdapterFromTensorsReqInput, Body()]).validate_python(
+        {
+            "lora_name": "miles_lora",
+            "config_dict": {"r": 8},
+            "serialized_named_tensors": [serialized],
+            "load_format": "flattened_buckets",
+        }
+    )
+    received = MultiprocessingSerializer.deserialize(request.serialized_named_tensors[0])
+    reconstructed = _reconstruct_flattened_tensor_buckets(received)
+
+    assert list(reconstructed) == [name for name, _ in originals]
+    for name, tensor in originals:
+        assert torch.equal(reconstructed[name], tensor)
+
+
+class TestLoraTensorPartitioning:
+    def test_e288_tensor_count_never_reaches_one_flatten_call(self):
+        named_tensors = [
+            (f"model.layers.0.mlp.experts.{i}.lora_A.weight", torch.empty(1, dtype=torch.bfloat16))
+            for i in range(74_518)
+        ]
+
+        buckets = _partition_lora_tensors(
+            named_tensors,
+            max_bytes=256 * 1024 * 1024,
+            max_tensors=1024,
+        )
+
+        assert len(buckets) == 73
+        assert max(map(len, buckets)) == 1024
+        assert [name for bucket in buckets for name, _ in bucket] == [name for name, _ in named_tensors]
+
+    def test_partitions_on_bytes_and_keeps_oversized_tensor_alone(self):
+        named_tensors = [
+            ("a.lora_A.weight", torch.empty(6, dtype=torch.uint8)),
+            ("b.lora_A.weight", torch.empty(6, dtype=torch.uint8)),
+            ("large.lora_B.weight", torch.empty(20, dtype=torch.uint8)),
+            ("c.lora_B.weight", torch.empty(4, dtype=torch.uint8)),
+        ]
+
+        buckets = _partition_lora_tensors(named_tensors, max_bytes=10, max_tensors=10)
+
+        assert [[name for name, _ in bucket] for bucket in buckets] == [
+            ["a.lora_A.weight"],
+            ["b.lora_A.weight"],
+            ["large.lora_B.weight"],
+            ["c.lora_B.weight"],
+        ]
+
+    @pytest.mark.parametrize(("max_bytes", "max_tensors"), [(0, 1), (1, 0), (-1, 1), (1, -1)])
+    def test_rejects_nonpositive_limits(self, max_bytes, max_tensors):
+        with pytest.raises(ValueError, match="must be positive"):
+            _partition_lora_tensors(
+                [("a.lora_A.weight", torch.empty(1))],
+                max_bytes=max_bytes,
+                max_tensors=max_tensors,
+            )
 
 
 def test_prepared_lora_weights_are_consumed_after_model_offload(monkeypatch):
@@ -226,9 +384,7 @@ def test_prepared_lora_weights_are_consumed_after_model_offload(monkeypatch):
     updater._lora_base_synced = False
     updater.weights_getter = MagicMock(return_value={})
     updater._hf_weight_iterator = MagicMock()
-    updater._hf_weight_iterator.get_hf_weight_chunks.return_value = [
-        [("layer.lora_A.weight", torch.ones(1))]
-    ]
+    updater._hf_weight_iterator.get_hf_weight_chunks.return_value = [[("layer.lora_A.weight", torch.ones(1))]]
     updater._send_lora_params = MagicMock(return_value=([], []))
 
     monkeypatch.setattr(update_module, "lora_base_cpu_backup_enabled", lambda _args: True)
