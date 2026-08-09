@@ -45,7 +45,7 @@ def add_sglang_arguments(parser):
     Add arguments to the parser for the SGLang server.
     """
     parser = add_sglang_router_arguments(parser)
-    parser.add_argument("--sglang-server-concurrency", type=int, default=512)
+    parser.add_argument("--sglang-server-concurrency", type=int, default=8)
 
     old_add_argument = parser.add_argument
 

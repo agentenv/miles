@@ -364,6 +364,9 @@ async def generate_and_rm_group(
 
     # for the rm that need the whole group, we will do the rm here
     if not state.aborted and args.group_rm:
+        flattened_group = [turn for sample in group for turn in (sample if isinstance(sample, list) else [sample])]
+        if any(sample.status == Sample.Status.ABORTED for sample in flattened_group):
+            return group
         rewards = await batched_async_rm(args, group)
         for sample, reward in zip(group, rewards, strict=False):
             sample.reward = reward
