@@ -8,6 +8,53 @@ from miles.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
 from miles.utils.environ import default_fp8_block_scaling_fp32_scales
 from miles.utils.ft_utils.heartbeat_utils import HeartbeatStatus
 
+TMS_TRAIN_DISK_BACKUP_DIR_ENV = "MILES_TMS_TRAIN_DISK_BACKUP_DIR"
+TMS_TRAIN_DISK_BACKUP_CHUNK_MB_ENV = "MILES_TMS_TRAIN_DISK_BACKUP_CHUNK_MB"
+TMS_TRAIN_DISK_BACKUP_DEFAULT_CHUNK_MB = 256
+
+
+def _configure_train_tms_env(env_vars: dict[str, str], dynlib_path: str) -> None:
+    """Configure the trainer-only TMS region without affecting rollout actors."""
+
+    env_vars["LD_PRELOAD"] = dynlib_path
+    env_vars["TMS_INIT_ENABLE"] = "1"
+
+    # Do not allow train_env_vars to leave the mutually-exclusive backup modes
+    # enabled together. The Miles-specific inputs below are the sole selector.
+    for name in (
+        "TMS_INIT_ENABLE_CPU_BACKUP",
+        "TMS_INIT_ENABLE_DISK_BACKUP",
+        "TMS_DISK_BACKUP_DIR",
+        "TMS_DISK_BACKUP_CHUNK_MB",
+    ):
+        env_vars.pop(name, None)
+
+    disk_backup_dir = os.environ.get(TMS_TRAIN_DISK_BACKUP_DIR_ENV)
+    raw_chunk_mb = os.environ.get(TMS_TRAIN_DISK_BACKUP_CHUNK_MB_ENV)
+    if not disk_backup_dir:
+        if raw_chunk_mb:
+            raise ValueError(
+                f"{TMS_TRAIN_DISK_BACKUP_CHUNK_MB_ENV} requires "
+                f"{TMS_TRAIN_DISK_BACKUP_DIR_ENV}"
+            )
+        env_vars["TMS_INIT_ENABLE_CPU_BACKUP"] = "1"
+        return
+
+    if not os.path.isabs(disk_backup_dir):
+        raise ValueError(f"{TMS_TRAIN_DISK_BACKUP_DIR_ENV} must be absolute")
+    chunk_mb = (
+        TMS_TRAIN_DISK_BACKUP_DEFAULT_CHUNK_MB
+        if raw_chunk_mb is None
+        else int(raw_chunk_mb)
+    )
+    if chunk_mb <= 0:
+        raise ValueError(f"{TMS_TRAIN_DISK_BACKUP_CHUNK_MB_ENV} must be positive")
+
+    env_vars["TMS_INIT_ENABLE_CPU_BACKUP"] = "0"
+    env_vars["TMS_INIT_ENABLE_DISK_BACKUP"] = "1"
+    env_vars["TMS_DISK_BACKUP_DIR"] = disk_backup_dir
+    env_vars["TMS_DISK_BACKUP_CHUNK_MB"] = str(chunk_mb)
+
 
 def allocate_gpus_for_actor(
     args,
@@ -44,10 +91,7 @@ def allocate_gpus_for_actor(
         from torch_memory_saver.utils import get_binary_path_from_package
 
         dynlib_path = str(get_binary_path_from_package("torch_memory_saver_hook_mode_preload"))
-
-        env_vars["LD_PRELOAD"] = dynlib_path
-        env_vars["TMS_INIT_ENABLE"] = "1"
-        env_vars["TMS_INIT_ENABLE_CPU_BACKUP"] = "1"
+        _configure_train_tms_env(env_vars, dynlib_path)
 
     backend = args.train_backend
     if backend == "megatron":
