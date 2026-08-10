@@ -5,6 +5,7 @@
 
 import asyncio
 
+import ray
 from ray.util.placement_group import PlacementGroup
 
 from miles.backends.megatron_utils.trainable_state import TrainableState
@@ -94,10 +95,16 @@ class RayTrainGroup:
         return exported[0]
 
     async def apply_trainable_state(self, state: TrainableState, *, reset_optimizer: bool) -> int:
-        """Apply trainable state to every Megatron rank."""
+        """Apply one object-store copy of trainable state to every Megatron rank."""
+        # Passing a large state directly to each ``.remote`` call makes Ray
+        # serialize one independent copy per actor.  A rank-64 E288 adapter is
+        # roughly 55 GiB, so the per-rank copies exhaust host memory before the
+        # first rollout.  Top-level ObjectRefs are resolved for the actor, while
+        # all calls share the same plasma object.
+        shared_state = ray.put(state)
         results = await self._broadcast(
             "apply_trainable_state",
-            state,
+            shared_state,
             reset_optimizer=reset_optimizer,
         )
         if not results or any(result != results[0] for result in results[1:]):
