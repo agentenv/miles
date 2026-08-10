@@ -249,18 +249,17 @@ def test_apply_trainable_state_rejects_scheduler_rewind(monkeypatch):
 
 def _tiny_clone_policy():
     tensors = {NAME: torch.tensor([[9.0, 10.0]])}
-    for expert in range(4):
+    for expert in range(2, 4):
         for projection in ("gate_proj", "up_proj", "down_proj"):
             for side in ("A", "B"):
                 if projection in {"gate_proj", "up_proj"}:
                     shape = (2, 3) if side == "A" else (4, 2)
                 else:
                     shape = (2, 4) if side == "A" else (3, 2)
-                value = 0.0 if expert < 2 else float(expert + 1)
                 tensors[
                     "base_model.model.model.layers.0.mlp.experts."
                     f"{expert}.{projection}.lora_{side}.weight"
-                ] = torch.full(shape, value)
+                ] = torch.full(shape, float(expert + 1))
     return tensors
 
 
@@ -274,7 +273,7 @@ def _packed_side(name, shape):
     )
 
 
-def test_clone_only_apply_packs_full_canonical_experts_and_resets_optimizer(
+def test_clone_only_apply_packs_sparse_clone_experts_and_resets_optimizer(
     monkeypatch,
 ):
     monkeypatch.setattr(trainable_state, "_CLONE_LAYERS", 1)
@@ -352,7 +351,7 @@ def test_clone_only_apply_packs_full_canonical_experts_and_resets_optimizer(
     assert backups == ["actor"]
 
 
-def test_clone_only_policy_rejects_nonzero_originals_and_split_fc1_a(monkeypatch):
+def test_clone_only_policy_rejects_originals_and_split_fc1_a(monkeypatch):
     monkeypatch.setattr(trainable_state, "_CLONE_ORIGINAL_EXPERTS", 2)
     monkeypatch.setattr(trainable_state, "_CLONE_TOTAL_EXPERTS", 4)
     tensors = _tiny_clone_policy()
@@ -360,8 +359,8 @@ def test_clone_only_policy_rejects_nonzero_originals_and_split_fc1_a(monkeypatch
         "base_model.model.model.layers.0.mlp.experts.0."
         "gate_proj.lora_A.weight"
     )
-    tensors[original].fill_(1)
-    with pytest.raises(RuntimeError, match="original expert adapter is nonzero"):
+    tensors[original] = torch.zeros(2, 3)
+    with pytest.raises(RuntimeError, match="original expert adapter is present"):
         trainable_state._validate_clone_canonical_tensors(tensors)
 
     tensors = _tiny_clone_policy()
@@ -386,12 +385,22 @@ def test_clone_only_policy_rejects_nonzero_originals_and_split_fc1_a(monkeypatch
 def test_clone_only_collective_export_accepts_expanded_logical_experts(
     monkeypatch,
 ):
-    """Packed Bridge representatives must export the full canonical E288 policy."""
+    """Packed Bridge originals are checked, then omitted from sparse policy."""
 
     monkeypatch.setattr(trainable_state, "_CLONE_LAYERS", 1)
     monkeypatch.setattr(trainable_state, "_CLONE_ORIGINAL_EXPERTS", 2)
     monkeypatch.setattr(trainable_state, "_CLONE_TOTAL_EXPERTS", 4)
     tensors = _tiny_clone_policy()
+    exported_by_bridge = dict(tensors)
+    for expert in range(2):
+        for projection in ("gate_proj", "up_proj", "down_proj"):
+            for side in ("A", "B"):
+                clone_name = (
+                    "base_model.model.model.layers.0.mlp.experts.2."
+                    f"{projection}.lora_{side}.weight"
+                )
+                original_name = clone_name.replace(".experts.2.", f".experts.{expert}.")
+                exported_by_bridge[original_name] = torch.zeros_like(tensors[clone_name])
     attention = _packed_side(NAME, (1, 2))
     representative_name = (
         "base_model.model.model.layers.0.mlp.experts.0."
@@ -417,7 +426,7 @@ def test_clone_only_collective_export_accepts_expanded_logical_experts(
 
     class _Bridge:
         def export_adapter_weights(self, *_args, **_kwargs):
-            for name, value in sorted(tensors.items()):
+            for name, value in sorted(exported_by_bridge.items()):
                 yield name, value, "synthetic"
 
     from megatron.bridge import AutoBridge
@@ -438,3 +447,33 @@ def test_clone_only_collective_export_accepts_expanded_logical_experts(
     assert set(exported) == set(tensors)
     assert torch.equal(exported[NAME], tensors[NAME])
     trainable_state._validate_clone_canonical_tensors(exported)
+
+    original = (
+        "base_model.model.model.layers.0.mlp.experts.0."
+        "gate_proj.lora_A.weight"
+    )
+    exported_by_bridge[original].fill_(1)
+    with pytest.raises(RuntimeError, match="nonzero during collective export"):
+        trainable_state._collective_adapter_tensors(actor)
+
+
+def test_clone_only_pack_reconstructs_original_slots_as_exact_zeros(monkeypatch):
+    monkeypatch.setattr(trainable_state, "_CLONE_ORIGINAL_EXPERTS", 2)
+    monkeypatch.setattr(trainable_state, "_CLONE_TOTAL_EXPERTS", 4)
+    tensors = _tiny_clone_policy()
+    name = (
+        "base_model.model.model.layers.0.mlp.experts.0."
+        "gate_proj.lora_B.weight"
+    )
+    side = _packed_side(name, (2, 8, 2))
+
+    packed = trainable_state._pack_expert_side(
+        name,
+        side,
+        tensors,
+        expert_parallel_rank=0,
+        expert_parallel_size=2,
+    )
+
+    assert packed.shape == side.param_weight.shape
+    assert torch.count_nonzero(packed).item() == 0

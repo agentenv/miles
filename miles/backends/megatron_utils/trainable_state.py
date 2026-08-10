@@ -175,8 +175,10 @@ def _expected_adapter_names(
     """Return the external canonical policy names for this actor.
 
     A standard grouped-expert LoRA parameter has one representative Bridge
-    side but exports 288 logical expert tensors.  Yeto therefore passes the
-    synthesized canonical name set explicitly for the E288 clone recipe.
+    side but exports 288 logical expert tensors.  The external policy only
+    carries the 32 trainable clones; frozen original-expert adapters are
+    reconstructed as exact zeros when the packed Megatron parameters are
+    applied.
     """
 
     if not _clone_only_lora(actor):
@@ -212,7 +214,7 @@ def _expected_adapter_names(
     required_keys = {
         (layer, expert, projection, side)
         for layer in range(_CLONE_LAYERS)
-        for expert in range(_CLONE_TOTAL_EXPERTS)
+        for expert in range(_CLONE_ORIGINAL_EXPERTS, _CLONE_TOTAL_EXPERTS)
         for projection in _CLONE_PROJECTIONS
         for side in _CLONE_SIDES
     }
@@ -225,7 +227,11 @@ def _expected_adapter_names(
         )
 
     local_sides = sides or _adapter_sides(actor)
-    missing_local = [name for name, _side in local_sides if name not in expected]
+    missing_local = [
+        name
+        for name, _side in local_sides
+        if _EXPERT_LORA.fullmatch(name) is None and name not in expected
+    ]
     if missing_local:
         raise RuntimeError(
             "local Bridge sides are absent from the canonical policy: "
@@ -236,7 +242,7 @@ def _expected_adapter_names(
 
 
 def _validate_clone_canonical_tensors(tensors: Mapping[str, torch.Tensor]) -> None:
-    """Enforce exact-zero originals at every external policy boundary."""
+    """Require a sparse external policy containing clone experts only."""
 
     found = 0
     for name, value in tensors.items():
@@ -249,9 +255,9 @@ def _validate_clone_canonical_tensors(tensors: Mapping[str, torch.Tensor]) -> No
         expert = int(match.group("expert"))
         if expert < 0 or expert >= _CLONE_TOTAL_EXPERTS:
             raise RuntimeError(f"clone-only expert ID is out of range in {name!r}")
-        if expert < _CLONE_ORIGINAL_EXPERTS and torch.count_nonzero(value).item():
+        if expert < _CLONE_ORIGINAL_EXPERTS:
             raise RuntimeError(
-                f"original expert adapter is nonzero at policy boundary: {name!r}"
+                f"original expert adapter is present at policy boundary: {name!r}"
             )
     if not found:
         raise RuntimeError("clone-only canonical policy contains no expert tensors")
@@ -319,7 +325,9 @@ def _pack_expert_side(
 
     packed = []
     for expert in range(start, start + local_count):
-        if projection == "down_proj":
+        if expert < _CLONE_ORIGINAL_EXPERTS:
+            value = torch.zeros(tuple(parameter.shape[1:]), dtype=torch.float32)
+        elif projection == "down_proj":
             value = tensors[
                 _expert_name(match, expert, "down_proj", adapter_side)
             ]
@@ -417,6 +425,18 @@ def _collective_adapter_tensors(actor) -> dict[str, torch.Tensor]:
                     else _CANONICAL_PREFIX + raw_name
                 )
                 value = weight.detach().to(dtype=torch.float32).contiguous()
+                match = _EXPERT_LORA.fullmatch(name)
+                if (
+                    _clone_only_lora(actor)
+                    and match is not None
+                    and int(match.group("expert")) < _CLONE_ORIGINAL_EXPERTS
+                ):
+                    if torch.count_nonzero(value).item():
+                        raise RuntimeError(
+                            "original expert adapter is nonzero during collective "
+                            f"export: {name!r}"
+                        )
+                    continue
                 names.add(name)
                 if retain_tensors:
                     previous = tensors.get(name)
