@@ -130,6 +130,35 @@ def test_collective_conversion_reads_f32_master_and_restores_model_parameter(mon
     assert side.param_weight.data.data_ptr() == original.data_ptr()
 
 
+def test_collective_export_nonzero_rank_does_not_retain_canonical_tensors(monkeypatch):
+    actor, side, *_ = _actor()
+    actor.args.hf_checkpoint = "/synthetic/model"
+    actor.model = []
+    monkeypatch.setattr(trainable_state, "_adapter_sides", lambda _actor: [(NAME, side)])
+
+    class _Bridge:
+        def export_adapter_weights(self, *_args, **_kwargs):
+            yield NAME, torch.tensor([[1.0, 2.0]]), "synthetic"
+
+    from megatron.bridge import AutoBridge
+    from miles.utils import megatron_bridge_utils
+
+    monkeypatch.setattr(
+        AutoBridge,
+        "from_hf_pretrained",
+        lambda *_args, **_kwargs: _Bridge(),
+    )
+    monkeypatch.setattr(
+        megatron_bridge_utils,
+        "patch_megatron_model",
+        lambda _model: nullcontext(),
+    )
+    monkeypatch.setattr(trainable_state.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(trainable_state.dist, "get_rank", lambda: 1)
+
+    assert trainable_state._collective_adapter_tensors(actor) == {}
+
+
 def test_external_train_metric_capture_is_rank_zero_only(monkeypatch):
     args = SimpleNamespace(external_policy_sync_path="project.sync.create")
     metrics = {

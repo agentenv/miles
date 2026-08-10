@@ -391,7 +391,7 @@ def _optimizer_masters_as_model_parameters(actor):
 
 
 def _collective_adapter_tensors(actor) -> dict[str, torch.Tensor]:
-    """Collect a complete canonical f32 PEFT state across TP and PP ranks."""
+    """Collect canonical f32 PEFT state, retaining it only on global rank zero."""
 
     from megatron.bridge import AutoBridge
 
@@ -401,7 +401,9 @@ def _collective_adapter_tensors(actor) -> dict[str, torch.Tensor]:
         actor.args.hf_checkpoint,
         trust_remote_code=True,
     )
+    retain_tensors = not dist.is_initialized() or dist.get_rank() == 0
     tensors: dict[str, torch.Tensor] = {}
+    names: set[str] = set()
     with _optimizer_masters_as_model_parameters(actor):
         with megatron_bridge_utils.patch_megatron_model(actor.model):
             for raw_name, weight, _megatron_name in bridge.export_adapter_weights(
@@ -415,19 +417,23 @@ def _collective_adapter_tensors(actor) -> dict[str, torch.Tensor]:
                     else _CANONICAL_PREFIX + raw_name
                 )
                 value = weight.detach().to(dtype=torch.float32).contiguous()
-                previous = tensors.get(name)
-                if previous is not None and not torch.equal(previous, value):
-                    raise RuntimeError(f"conflicting collective LoRA tensor {name!r}")
-                tensors[name] = value
+                names.add(name)
+                if retain_tensors:
+                    previous = tensors.get(name)
+                    if previous is not None and not torch.equal(previous, value):
+                        raise RuntimeError(
+                            f"conflicting collective LoRA tensor {name!r}"
+                        )
+                    tensors[name] = value
     sides = _adapter_sides(actor)
     expected = _expected_adapter_names(actor, sides)
-    if set(tensors) != expected:
-        missing = sorted(expected - set(tensors))
-        extra = sorted(set(tensors) - expected)
+    if names != expected:
+        missing = sorted(expected - names)
+        extra = sorted(names - expected)
         raise RuntimeError(
             f"collective LoRA export mismatch: missing={missing}, extra={extra}"
         )
-    if _clone_only_lora(actor):
+    if retain_tensors and _clone_only_lora(actor):
         _validate_clone_canonical_tensors(tensors)
     return tensors
 
