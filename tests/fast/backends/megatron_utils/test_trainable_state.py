@@ -136,9 +136,13 @@ def test_collective_export_nonzero_rank_does_not_retain_canonical_tensors(monkey
     actor.model = []
     monkeypatch.setattr(trainable_state, "_adapter_sides", lambda _actor: [(NAME, side)])
 
+    class _UnmaterializedWeight:
+        def detach(self):
+            raise AssertionError("non-retaining rank materialized an adapter tensor")
+
     class _Bridge:
         def export_adapter_weights(self, *_args, **_kwargs):
-            yield NAME, torch.tensor([[1.0, 2.0]]), "synthetic"
+            yield NAME, _UnmaterializedWeight(), "synthetic"
 
     from megatron.bridge import AutoBridge
     from miles.utils import megatron_bridge_utils
@@ -412,6 +416,8 @@ def test_clone_only_collective_export_accepts_expanded_logical_experts(
             hf_checkpoint="/synthetic/e288",
             yeto_rl_clone_only_lora=True,
             yeto_rl_canonical_lora_names=tuple(sorted(tensors)),
+            yeto_rl_expert_parallel_rank=0,
+            yeto_rl_expert_parallel_size=2,
         ),
         model=[],
     )
@@ -424,8 +430,11 @@ def test_clone_only_collective_export_accepts_expanded_logical_experts(
         ),
     )
 
+    bridge_calls = []
+
     class _Bridge:
-        def export_adapter_weights(self, *_args, **_kwargs):
+        def export_adapter_weights(self, *_args, **kwargs):
+            bridge_calls.append(kwargs)
             for name, value in sorted(exported_by_bridge.items()):
                 yield name, value, "synthetic"
 
@@ -446,14 +455,11 @@ def test_clone_only_collective_export_accepts_expanded_logical_experts(
     exported = trainable_state._collective_adapter_tensors(actor)
     assert set(exported) == set(tensors)
     assert torch.equal(exported[NAME], tensors[NAME])
+    assert bridge_calls == [{"cpu": False, "show_progress": False}]
     trainable_state._validate_clone_canonical_tensors(exported)
 
-    original = (
-        "base_model.model.model.layers.0.mlp.experts.0."
-        "gate_proj.lora_A.weight"
-    )
-    exported_by_bridge[original].fill_(1)
-    with pytest.raises(RuntimeError, match="nonzero during collective export"):
+    representative.param_weight.main_param[0].fill_(1)
+    with pytest.raises(RuntimeError, match="original packed expert LoRA master"):
         trainable_state._collective_adapter_tensors(actor)
 
 

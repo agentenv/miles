@@ -412,11 +412,22 @@ def _collective_adapter_tensors(actor) -> dict[str, torch.Tensor]:
     retain_tensors = not dist.is_initialized() or dist.get_rank() == 0
     tensors: dict[str, torch.Tensor] = {}
     names: set[str] = set()
+    sides = _adapter_sides(actor)
+    if _clone_only_lora(actor):
+        expert_rank, _expert_size = _expert_parallel_coordinates(actor)
+        # Validate frozen originals once in their packed GPU masters.  Checking
+        # every expanded CPU expert tensor made r64 export spend tens of
+        # minutes in torch.count_nonzero despite those tensors being omitted
+        # from the external policy.
+        _assert_original_packed_masters_zero(
+            sides,
+            expert_parallel_rank=expert_rank,
+        )
     with _optimizer_masters_as_model_parameters(actor):
         with megatron_bridge_utils.patch_megatron_model(actor.model):
             for raw_name, weight, _megatron_name in bridge.export_adapter_weights(
                 actor.model,
-                cpu=True,
+                cpu=False,
                 show_progress=False,
             ):
                 name = (
@@ -424,28 +435,26 @@ def _collective_adapter_tensors(actor) -> dict[str, torch.Tensor]:
                     if raw_name.startswith(_CANONICAL_PREFIX)
                     else _CANONICAL_PREFIX + raw_name
                 )
-                value = weight.detach().to(dtype=torch.float32).contiguous()
                 match = _EXPERT_LORA.fullmatch(name)
                 if (
                     _clone_only_lora(actor)
                     and match is not None
                     and int(match.group("expert")) < _CLONE_ORIGINAL_EXPERTS
                 ):
-                    if torch.count_nonzero(value).item():
-                        raise RuntimeError(
-                            "original expert adapter is nonzero during collective "
-                            f"export: {name!r}"
-                        )
                     continue
                 names.add(name)
                 if retain_tensors:
+                    value = (
+                        weight.detach()
+                        .to(device="cpu", dtype=torch.float32)
+                        .contiguous()
+                    )
                     previous = tensors.get(name)
                     if previous is not None and not torch.equal(previous, value):
                         raise RuntimeError(
                             f"conflicting collective LoRA tensor {name!r}"
                         )
                     tensors[name] = value
-    sides = _adapter_sides(actor)
     expected = _expected_adapter_names(actor, sides)
     if names != expected:
         missing = sorted(expected - names)
