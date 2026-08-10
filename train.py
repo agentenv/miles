@@ -55,12 +55,31 @@ async def train(args):
 
     maybe_start_mini_ft_controller(args)
 
+    initial_train_offloaded = False
+    if (
+        external_policy_sync is not None
+        and args.offload_train
+        and args.offload_rollout
+    ):
+        # Match the steady-state publication order below.  The external
+        # policy has already been applied while the trainer is awake, so
+        # retain its prepared LoRA payload before releasing trainer memory.
+        # Resuming rollout weights while the trainer is still resident can
+        # otherwise exceed GPU capacity before the first rollout.
+        await actor_model.prepare_weight_update()
+        await actor_model.offload()
+        initial_train_offloaded = True
+
     if args.offload_rollout:
         await rollout_manager.onload_weights.remote()
 
     # always update weight first so that sglang has the loaded weights from training.
     await actor_model.update_weights()
-    if external_policy_sync is not None and args.offload_train:
+    if (
+        external_policy_sync is not None
+        and args.offload_train
+        and not initial_train_offloaded
+    ):
         await actor_model.offload()
 
     if args.check_weight_update_equal:
