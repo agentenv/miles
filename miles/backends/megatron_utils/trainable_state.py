@@ -87,6 +87,23 @@ def make_trainable_state(
     )
 
 
+def _require_canonical_trainable_state(state: TrainableState) -> TrainableState:
+    """Validate state from ``make_trainable_state`` without copying it again."""
+
+    if state.policy_version < 0:
+        raise ValueError("policy version must be non-negative")
+    if not state.tensors:
+        raise ValueError("trainable state is empty")
+    for name, tensor in state.tensors.items():
+        if not name.startswith(_CANONICAL_PREFIX) or not name.endswith((".lora_A.weight", ".lora_B.weight")):
+            raise ValueError(f"not a canonical PEFT LoRA tensor name: {name!r}")
+        if tensor.device.type != "cpu" or tensor.dtype != torch.float32 or not tensor.is_contiguous():
+            raise ValueError(f"{name!r} is not canonical contiguous CPU float32 state")
+    if _layout_hash(state.tensors) != state.layout_hash:
+        raise RuntimeError("trainable state layout hash mismatch")
+    return state
+
+
 def _capture_external_train_metrics(args, metrics: Mapping[str, Any]) -> None:
     if getattr(args, "external_policy_sync_path", None) is None or dist.get_rank() != 0:
         return
@@ -245,7 +262,7 @@ def _validate_clone_canonical_tensors(tensors: Mapping[str, torch.Tensor]) -> No
     """Require a sparse external policy containing clone experts only."""
 
     found = 0
-    for name, value in tensors.items():
+    for name, _value in tensors.items():
         if ".mlp.experts." not in name:
             continue
         match = _EXPERT_LORA.fullmatch(name)
@@ -352,6 +369,77 @@ def _pack_expert_side(
             f"got {tuple(target.shape)}, expected {tuple(parameter.shape)}"
         )
     return target
+
+
+def _sparse_expert_updates(
+    name: str,
+    side: Any,
+    tensors: Mapping[str, torch.Tensor],
+    *,
+    expert_parallel_rank: int,
+    expert_parallel_size: int,
+) -> tuple[torch.Tensor, int, tuple[tuple[int, torch.Tensor], ...]]:
+    """Prepare clone-only writes without materializing frozen packed slots."""
+
+    match = _EXPERT_LORA.fullmatch(name)
+    if match is None:
+        raise RuntimeError(f"cannot pack non-expert LoRA side {name!r}")
+    parameter = side.param_weight
+    if parameter is None or parameter.ndim != 3:
+        raise RuntimeError(f"packed expert side {name!r} is not a rank-3 parameter")
+    local_count = int(parameter.shape[0])
+    start = expert_parallel_rank * local_count
+    if (
+        local_count <= 0
+        or local_count * expert_parallel_size != _CLONE_TOTAL_EXPERTS
+        or start + local_count > _CLONE_TOTAL_EXPERTS
+    ):
+        raise RuntimeError(
+            "invalid packed expert ownership "
+            f"rank={expert_parallel_rank}, size={expert_parallel_size}, "
+            f"start={start}, count={local_count}"
+        )
+    projection = match.group("projection")
+    adapter_side = match.group("side")
+    if projection == "up_proj":
+        raise RuntimeError("packed fc1 representative unexpectedly uses up_proj")
+
+    updates = []
+    for expert in range(max(start, _CLONE_ORIGINAL_EXPERTS), start + local_count):
+        if projection == "down_proj":
+            value = tensors[_expert_name(match, expert, "down_proj", adapter_side)]
+        elif adapter_side == "A":
+            gate = tensors[_expert_name(match, expert, "gate_proj", "A")]
+            up = tensors[_expert_name(match, expert, "up_proj", "A")]
+            if not torch.equal(gate, up):
+                raise RuntimeError(
+                    f"fused fc1 gate/up LoRA A tensors differ for layer "
+                    f"{match.group('layer')} expert {expert}"
+                )
+            value = gate
+        else:
+            gate = tensors[_expert_name(match, expert, "gate_proj", "B")]
+            up = tensors[_expert_name(match, expert, "up_proj", "B")]
+            value = torch.cat((gate, up), dim=0)
+        if tuple(value.shape) != tuple(parameter.shape[1:]):
+            raise RuntimeError(
+                f"packed expert LoRA slice mismatch for {name!r}: "
+                f"got {tuple(value.shape)}, expected {tuple(parameter.shape[1:])}"
+            )
+        updates.append((expert - start, value))
+
+    original_count = max(0, min(local_count, _CLONE_ORIGINAL_EXPERTS - start))
+    return parameter.main_param.view(parameter.shape), original_count, tuple(updates)
+
+
+def _apply_sparse_expert_updates(
+    prepared: list[tuple[torch.Tensor, int, tuple[tuple[int, torch.Tensor], ...]]],
+) -> None:
+    for master, original_count, updates in prepared:
+        if original_count:
+            master[:original_count].zero_()
+        for local_index, value in updates:
+            master[local_index].copy_(value)
 
 
 def _assert_original_packed_masters_zero(
@@ -555,9 +643,7 @@ def apply_trainable_state(
     *,
     reset_optimizer: bool,
 ) -> int:
-    incoming = make_trainable_state(state.policy_version, state.tensors)
-    if incoming.layout_hash != state.layout_hash:
-        raise RuntimeError("trainable state layout hash mismatch")
+    incoming = _require_canonical_trainable_state(state)
 
     side_items = _adapter_sides(actor)
     sides = dict(side_items)
@@ -568,16 +654,21 @@ def apply_trainable_state(
         raise RuntimeError(f"global LoRA mapping mismatch: missing={missing}, extra={extra}")
     if _clone_only_lora(actor):
         _validate_clone_canonical_tensors(incoming.tensors)
-    current = export_trainable_state(actor, policy_version=state.policy_version)
-    current_layout = current.layout_hash if current is not None else None
-    if dist.is_initialized():
-        values = [current_layout]
-        dist.broadcast_object_list(values, src=0)
-        current_layout = values[0]
+    current_layout = getattr(actor.args, "yeto_rl_layout_hash", None)
+    if current_layout is None:
+        # Standalone Miles fallback. Yeto supplies its synthesized global
+        # contract, avoiding a collective data export for a metadata-only hash.
+        current = export_trainable_state(actor, policy_version=state.policy_version)
+        current_layout = current.layout_hash if current is not None else None
+        if dist.is_initialized():
+            values = [current_layout]
+            dist.broadcast_object_list(values, src=0)
+            current_layout = values[0]
     if incoming.layout_hash != current_layout:
         raise RuntimeError("global LoRA layout hash mismatch")
 
     mapped = {}
+    sparse_expert_updates = []
     expert_coordinates = (
         _expert_parallel_coordinates(actor) if _clone_only_lora(actor) else None
     )
@@ -586,13 +677,16 @@ def apply_trainable_state(
             if side.param_weight is None:
                 continue
             if _clone_only_lora(actor) and _EXPERT_LORA.fullmatch(name):
-                target = _pack_expert_side(
-                    name,
-                    side,
-                    incoming.tensors,
-                    expert_parallel_rank=expert_coordinates[0],
-                    expert_parallel_size=expert_coordinates[1],
+                sparse_expert_updates.append(
+                    _sparse_expert_updates(
+                        name,
+                        side,
+                        incoming.tensors,
+                        expert_parallel_rank=expert_coordinates[0],
+                        expert_parallel_size=expert_coordinates[1],
+                    )
                 )
+                continue
             else:
                 value = incoming.tensors[name]
                 target = side.mapping.hf_to_megatron(value, side.megatron_module)
@@ -601,15 +695,10 @@ def apply_trainable_state(
             mapped[name] = target.reshape(side.param_weight.shape).contiguous()
 
         _align_scheduler(actor, state.policy_version)
+        _apply_sparse_expert_updates(sparse_expert_updates)
         for name, target in mapped.items():
             side = sides[name]
             side.param_weight.main_param.view(side.param_weight.shape).copy_(target)
-
-        if _clone_only_lora(actor):
-            _assert_original_packed_masters_zero(
-                side_items,
-                expert_parallel_rank=expert_coordinates[0],
-            )
 
     _copy_masters_to_model(actor)
     if dist.is_initialized():
@@ -619,7 +708,7 @@ def apply_trainable_state(
         for side in sides.values()
         if side.param_weight is not None
     ]
-    reset_count = (
+    _reset_count = (
         _reset_optimizer_state(
             actor,
             local_parameters,

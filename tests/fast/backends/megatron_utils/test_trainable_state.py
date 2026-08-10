@@ -204,6 +204,27 @@ def test_apply_trainable_state_resets_only_lora_and_preserves_scheduler(monkeypa
     assert backups == ["actor"]
 
 
+def test_apply_uses_canonical_state_and_synthesized_layout_without_reexport(monkeypatch):
+    actor, side, *_ = _actor()
+    monkeypatch.setattr(trainable_state, "_adapter_sides", lambda _actor: [(NAME, side)])
+    state = trainable_state.make_trainable_state(1, {NAME: torch.tensor([[5.0, 7.0]])})
+    actor.args.yeto_rl_layout_hash = state.layout_hash
+    monkeypatch.setattr(
+        trainable_state,
+        "make_trainable_state",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("canonical state was copied again")),
+    )
+    monkeypatch.setattr(
+        trainable_state,
+        "export_trainable_state",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("current state was re-exported")),
+    )
+
+    trainable_state.apply_trainable_state(actor, state, reset_optimizer=False)
+
+    assert torch.equal(side.param_weight.main_param, torch.tensor([[5.0, 7.0]]))
+
+
 def test_partial_trainable_state_applies_preserve_optimizer_and_advance_scheduler(
     monkeypatch,
 ):
@@ -328,6 +349,7 @@ def test_clone_only_apply_packs_sparse_clone_experts_and_resets_optimizer(
             yeto_rl_canonical_lora_names=tuple(sorted(tensors)),
             yeto_rl_expert_parallel_rank=1,
             yeto_rl_expert_parallel_size=2,
+            yeto_rl_layout_hash=state.layout_hash,
         ),
         optimizer=optimizer,
         opt_param_scheduler=Scheduler(),
@@ -336,9 +358,14 @@ def test_clone_only_apply_packs_sparse_clone_experts_and_resets_optimizer(
     monkeypatch.setattr(trainable_state, "_adapter_sides", lambda _actor: tuple(sides))
     monkeypatch.setattr(
         trainable_state,
-        "export_trainable_state",
-        lambda _actor, policy_version: state,
+        "_pack_expert_side",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("sparse apply materialized packed frozen slots")
+        ),
     )
+
+    for side in expert_sides.values():
+        side.param_weight.main_param.fill_(11)
 
     reset_count = trainable_state.apply_trainable_state(
         actor,
@@ -353,6 +380,29 @@ def test_clone_only_apply_packs_sparse_clone_experts_and_resets_optimizer(
         assert torch.all(side.param_weight.main_param[1] == 4)
     assert not inner.state
     assert backups == ["actor"]
+
+
+def test_sparse_expert_updates_omit_frozen_original_slot_materialization(monkeypatch):
+    monkeypatch.setattr(trainable_state, "_CLONE_ORIGINAL_EXPERTS", 2)
+    monkeypatch.setattr(trainable_state, "_CLONE_TOTAL_EXPERTS", 4)
+    tensors = _tiny_clone_policy()
+    name = "base_model.model.model.layers.0.mlp.experts.0.gate_proj.lora_B.weight"
+    side = _packed_side(name, (2, 8, 2))
+    side.param_weight.main_param.fill_(11)
+
+    master, original_count, updates = trainable_state._sparse_expert_updates(
+        name,
+        side,
+        tensors,
+        expert_parallel_rank=0,
+        expert_parallel_size=2,
+    )
+
+    assert master.data_ptr() == side.param_weight.main_param.data_ptr()
+    assert original_count == 2
+    assert updates == ()
+    trainable_state._apply_sparse_expert_updates([(master, original_count, updates)])
+    assert torch.count_nonzero(side.param_weight.main_param).item() == 0
 
 
 def test_clone_only_policy_rejects_originals_and_split_fc1_a(monkeypatch):
