@@ -220,6 +220,13 @@ class RolloutManager:
 
     async def onload_weights(self):
         await self.onload(tags=[GPU_MEMORY_TYPE_WEIGHTS])
+        if getattr(self.args, "lora_base_disk_reload", False):
+            # With CPU backup disabled, resume remaps fresh weight storage but
+            # deliberately restores no bytes.  Reload the frozen base locally;
+            # the trainer publishes only the prepared LoRA adapter afterwards.
+            for server in self.servers.values():
+                if server.update_weights:
+                    await server.reload_weights_from_disk()
 
     async def onload_kv(self):
         await self.onload(tags=[GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH])

@@ -387,7 +387,7 @@ def test_prepared_lora_weights_are_consumed_after_model_offload(monkeypatch):
     updater._hf_weight_iterator.get_hf_weight_chunks.return_value = [[("layer.lora_A.weight", torch.ones(1))]]
     updater._send_lora_params = MagicMock(return_value=([], []))
 
-    monkeypatch.setattr(update_module, "lora_base_cpu_backup_enabled", lambda _args: True)
+    monkeypatch.setattr(update_module, "lora_base_sync_skipped", lambda _args: True)
     monkeypatch.setattr(update_module, "get_gloo_group", MagicMock())
     monkeypatch.setattr(update_module.dist, "get_rank", lambda: 0)
     monkeypatch.setattr(update_module.dist, "barrier", MagicMock())

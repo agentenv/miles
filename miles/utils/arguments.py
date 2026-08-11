@@ -1426,6 +1426,17 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--lora-base-disk-reload",
+                action="store_true",
+                default=False,
+                help=(
+                    "LoRA + colocate: discard SGLang's frozen base weights while "
+                    "training, remap their allocations, and reload the base from "
+                    "--hf-checkpoint before publishing the adapter. Avoids a full "
+                    "host-RAM mirror at the cost of checkpoint read bandwidth."
+                ),
+            )
+            parser.add_argument(
                 "--experts-shared-outer-loras",
                 action="store_true",
                 default=False,
@@ -2793,6 +2804,9 @@ def miles_validate_args(args):
         )
 
     if args.colocate:
+        assert not (args.lora_base_cpu_backup and args.lora_base_disk_reload), (
+            "--lora-base-cpu-backup and --lora-base-disk-reload are mutually exclusive"
+        )
         if args.offload_train is None:
             args.offload_train = True
         if args.offload_rollout is None:

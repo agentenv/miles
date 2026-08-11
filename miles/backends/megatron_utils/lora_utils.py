@@ -115,6 +115,16 @@ def lora_base_cpu_backup_enabled(args: Namespace) -> bool:
     return is_lora_enabled(args) and getattr(args, "colocate", False) and getattr(args, "lora_base_cpu_backup", False)
 
 
+def lora_base_disk_reload_enabled(args: Namespace) -> bool:
+    """LoRA + colocate using a disk reload instead of a host-RAM base mirror."""
+    return is_lora_enabled(args) and getattr(args, "colocate", False) and getattr(args, "lora_base_disk_reload", False)
+
+
+def lora_base_sync_skipped(args: Namespace) -> bool:
+    """Whether the immutable LoRA base already has a rollout-side restore path."""
+    return lora_base_cpu_backup_enabled(args) or lora_base_disk_reload_enabled(args)
+
+
 def is_lora_model(model: Sequence[torch.nn.Module]) -> bool:
     """Check if model has LoRA layers applied."""
     for model_chunk in model:

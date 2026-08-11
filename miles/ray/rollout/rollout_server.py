@@ -213,6 +213,13 @@ class RolloutServer:
             handles.extend(g.onload(tags))
         return await asyncio.gather(*handles)
 
+    async def reload_weights_from_disk(self):
+        """Reload the immutable base checkpoint for offloaded server groups."""
+        handles = []
+        for group in self.server_groups:
+            handles.extend(group.onload_weights_from_disk())
+        return await asyncio.gather(*handles)
+
     async def check_weights(
         self, action: str, allow_quant_error: bool = False, selector: str = "all", skip_list: list[str] | None = None
     ):
