@@ -1,3 +1,5 @@
+import sys
+import types
 from types import SimpleNamespace
 
 import pytest
@@ -6,6 +8,7 @@ import torch
 from miles.backends.megatron_utils import trainable_state
 
 NAME = "base_model.model.layers.0.self_attn.q_proj.lora_A.weight"
+REMOTE_NAME = "base_model.model.layers.1.self_attn.q_proj.lora_A.weight"
 
 
 class _Mapping:
@@ -14,6 +17,28 @@ class _Mapping:
 
     def hf_to_megatron(self, value, _module):
         return value
+
+
+class _RemoteMapping:
+    def __init__(self, value):
+        self.value = value
+
+    def megatron_to_hf(self, value, module):
+        assert value is None
+        assert module is None
+        return {REMOTE_NAME: self.value}
+
+    def hf_to_megatron(self, *_args):
+        raise AssertionError("remote pipeline tensor must not be applied locally")
+
+
+def _remote_side(value):
+    return SimpleNamespace(
+        mapping=_RemoteMapping(value),
+        megatron_module=None,
+        param_name="remote.adapter.linear_in.weight",
+        param_weight=None,
+    )
 
 
 def _actor():
@@ -94,22 +119,107 @@ def test_export_trainable_state_carries_external_round_stats(monkeypatch):
     assert state.train_seconds == 1.5
 
 
-def test_external_train_metric_capture_is_rank_zero_only(monkeypatch):
+def test_external_train_metric_capture_uses_caller_selected_rank(monkeypatch):
     args = SimpleNamespace(external_policy_sync_path="project.sync.create")
     metrics = {
         "train/train_rollout_kl": 0.1,
         "train/ess_ratio": 0.8,
         "train/pg_clipfrac": 0.25,
     }
-    monkeypatch.setattr(trainable_state.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(trainable_state.dist, "get_rank", lambda: 1)
 
     trainable_state._capture_external_train_metrics(args, metrics)
 
     assert args._external_train_metrics == metrics
-    del args._external_train_metrics
-    monkeypatch.setattr(trainable_state.dist, "get_rank", lambda: 1)
-    trainable_state._capture_external_train_metrics(args, metrics)
-    assert not hasattr(args, "_external_train_metrics")
+
+
+def test_adapter_discovery_accepts_remote_pipeline_tasks(monkeypatch):
+    local_a = torch.nn.Parameter(torch.zeros(1, 2, dtype=torch.bfloat16))
+    local_a.main_param = torch.zeros(1, 2, dtype=torch.float32)
+    local_b = torch.nn.Parameter(torch.zeros(1, 2, dtype=torch.bfloat16))
+    local_b.main_param = torch.zeros(1, 2, dtype=torch.float32)
+    chunk = torch.nn.Module()
+    chunk.register_parameter("local_a", local_a)
+    chunk.register_parameter("local_b", local_b)
+
+    def side(name, parameter):
+        mapping = SimpleNamespace(
+            megatron_to_hf=lambda value, _module: {name: value},
+        )
+        return SimpleNamespace(
+            mapping=mapping,
+            megatron_module=None,
+            param_name=name,
+            param_weight=parameter,
+        )
+
+    tasks = {
+        "local": [
+            SimpleNamespace(
+                adapter_key=None,
+                linear_in_task=side(NAME, local_a),
+                linear_out_task=side(
+                    "base_model.model.layers.0.self_attn.q_proj.lora_B.weight",
+                    local_b,
+                ),
+            )
+        ],
+        "remote": [
+            SimpleNamespace(
+                adapter_key=None,
+                linear_in_task=_remote_side(torch.ones(1, 2)),
+                linear_out_task=SimpleNamespace(
+                    mapping=SimpleNamespace(
+                        megatron_to_hf=lambda value, module: {
+                            "base_model.model.layers.1.self_attn.q_proj.lora_B.weight": torch.ones(1, 2)
+                        }
+                    ),
+                    megatron_module=None,
+                    param_name="remote.adapter.linear_out.weight",
+                    param_weight=None,
+                ),
+            )
+        ],
+    }
+    model_bridge = SimpleNamespace(build_adapter_conversion_tasks=lambda _model: tasks)
+    bridge = SimpleNamespace(_model_bridge=model_bridge)
+    bridge_module = types.ModuleType("megatron.bridge")
+    bridge_module.AutoBridge = SimpleNamespace(
+        from_hf_pretrained=lambda *_args, **_kwargs: bridge
+    )
+    megatron_module = types.ModuleType("megatron")
+    megatron_module.bridge = bridge_module
+    monkeypatch.setitem(sys.modules, "megatron", megatron_module)
+    monkeypatch.setitem(sys.modules, "megatron.bridge", bridge_module)
+    actor = SimpleNamespace(
+        args=SimpleNamespace(hf_checkpoint="/model"),
+        model=[chunk],
+    )
+
+    sides = trainable_state._adapter_sides(actor)
+
+    assert [name for name, _side in sides] == [
+        NAME,
+        "base_model.model.layers.0.self_attn.q_proj.lora_B.weight",
+        REMOTE_NAME,
+        "base_model.model.layers.1.self_attn.q_proj.lora_B.weight",
+    ]
+
+
+def test_export_trainable_state_collects_remote_pipeline_stage(monkeypatch):
+    actor, side, *_ = _actor()
+    side.param_weight.main_param.copy_(torch.tensor([[1.0, 2.0]]))
+    remote = _remote_side(torch.tensor([[3.0, 4.0]]))
+    monkeypatch.setattr(
+        trainable_state,
+        "_adapter_sides",
+        lambda _actor: [(NAME, side), (REMOTE_NAME, remote)],
+    )
+
+    state = trainable_state.export_trainable_state(actor, policy_version=1)
+
+    assert set(state.tensors) == {NAME, REMOTE_NAME}
+    assert torch.equal(state.tensors[REMOTE_NAME], torch.tensor([[3.0, 4.0]]))
 
 
 def test_apply_trainable_state_resets_only_lora_and_preserves_scheduler(monkeypatch):
@@ -132,6 +242,35 @@ def test_apply_trainable_state_resets_only_lora_and_preserves_scheduler(monkeypa
     assert actor.opt_param_scheduler.num_steps == 24
     assert torch.equal(side.param_weight.main_param, torch.tensor([[5.0, 7.0]]))
     assert torch.equal(side.param_weight.float(), torch.tensor([[5.0, 7.0]]))
+    assert backups == ["actor"]
+
+
+def test_apply_trainable_state_updates_only_local_pipeline_stage(monkeypatch):
+    actor, side, unrelated, inner, backups = _actor()
+    remote = _remote_side(torch.tensor([[3.0, 4.0]]))
+    monkeypatch.setattr(
+        trainable_state,
+        "_adapter_sides",
+        lambda _actor: [(NAME, side), (REMOTE_NAME, remote)],
+    )
+    state = trainable_state.make_trainable_state(
+        1,
+        {
+            NAME: torch.tensor([[5.0, 7.0]]),
+            REMOTE_NAME: torch.tensor([[11.0, 13.0]]),
+        },
+    )
+
+    reset_count = trainable_state.apply_trainable_state(
+        actor,
+        state,
+        reset_optimizer=True,
+    )
+
+    assert reset_count == 2
+    assert side.param_weight.main_param not in inner.state
+    assert unrelated in inner.state
+    assert torch.equal(side.param_weight.main_param, torch.tensor([[5.0, 7.0]]))
     assert backups == ["actor"]
 
 

@@ -660,7 +660,7 @@ def train(
     disable_optimizer = args.debug_disable_optimizer or optimizer is None
     capture_external_stats = (
         getattr(args, "external_policy_sync_path", None) is not None
-        and torch.distributed.get_rank() == 0
+        and is_first_replica_megatron_main_rank()
     )
     train_started = time.monotonic() if capture_external_stats else None
     if capture_external_stats:

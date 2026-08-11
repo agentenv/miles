@@ -74,7 +74,7 @@ def make_trainable_state(
 
 
 def _capture_external_train_metrics(args, metrics: Mapping[str, Any]) -> None:
-    if getattr(args, "external_policy_sync_path", None) is None or dist.get_rank() != 0:
+    if getattr(args, "external_policy_sync_path", None) is None:
         return
     args._external_train_metrics = {
         name: float(metrics[name])
@@ -85,6 +85,16 @@ def _capture_external_train_metrics(args, metrics: Mapping[str, Any]) -> None:
         )
         if name in metrics
     }
+
+
+def _optimizer_master(side) -> torch.Tensor | None:
+    parameter = side.param_weight
+    if parameter is None:
+        return None
+    main = getattr(parameter, "main_param", None)
+    if main is None or main.dtype != torch.float32 or main.numel() != parameter.numel():
+        raise RuntimeError(f"LoRA parameter {side.param_name!r} has no complete FP32 optimizer master")
+    return main.view(parameter.shape)
 
 
 def _adapter_sides(actor) -> tuple[tuple[str, Any], ...]:
@@ -109,11 +119,10 @@ def _adapter_sides(actor) -> tuple[tuple[str, Any], ...]:
         )
         for task in tasks:
             for side in (task.linear_in_task, task.linear_out_task):
-                parameter = side.param_weight
-                main = getattr(parameter, "main_param", None)
-                if main is None or main.dtype != torch.float32 or main.numel() != parameter.numel():
-                    raise RuntimeError(f"LoRA parameter {side.param_name!r} has no complete FP32 optimizer master")
-                converted = side.mapping.megatron_to_hf(main.view(parameter.shape), side.megatron_module)
+                converted = side.mapping.megatron_to_hf(
+                    _optimizer_master(side),
+                    side.megatron_module,
+                )
                 if len(converted) != 1:
                     raise RuntimeError(f"ambiguous LoRA mapping for {side.param_name!r}")
                 raw_name = next(iter(converted))
@@ -123,7 +132,11 @@ def _adapter_sides(actor) -> tuple[tuple[str, Any], ...]:
     names = [name for name, _ in sides]
     if not names or len(names) != len(set(names)):
         raise RuntimeError("Megatron produced an empty or duplicate LoRA mapping")
-    mapped = {id(side.param_weight) for _, side in sides}
+    mapped = {
+        id(side.param_weight)
+        for _, side in sides
+        if side.param_weight is not None
+    }
     trainable = {
         id(parameter)
         for model_chunk in actor.model
@@ -141,9 +154,8 @@ def _adapter_sides(actor) -> tuple[tuple[str, Any], ...]:
 def export_trainable_state(actor, *, policy_version: int) -> TrainableState:
     tensors = {}
     for name, side in _adapter_sides(actor):
-        parameter = side.param_weight
         converted = side.mapping.megatron_to_hf(
-            parameter.main_param.view(parameter.shape),
+            _optimizer_master(side),
             side.megatron_module,
         )
         tensors[name] = next(iter(converted.values()))
@@ -207,15 +219,20 @@ def apply_trainable_state(
     if incoming.layout_hash != state.layout_hash:
         raise RuntimeError("trainable state layout hash mismatch")
 
-    sides = dict(_adapter_sides(actor))
-    if set(incoming.tensors) != set(sides):
-        missing = sorted(set(sides) - set(incoming.tensors))
-        extra = sorted(set(incoming.tensors) - set(sides))
+    global_sides = dict(_adapter_sides(actor))
+    if set(incoming.tensors) != set(global_sides):
+        missing = sorted(set(global_sides) - set(incoming.tensors))
+        extra = sorted(set(incoming.tensors) - set(global_sides))
         raise RuntimeError(f"global LoRA mapping mismatch: missing={missing}, extra={extra}")
     current = export_trainable_state(actor, policy_version=state.policy_version)
     if incoming.layout_hash != current.layout_hash:
         raise RuntimeError("global LoRA layout hash mismatch")
 
+    sides = {
+        name: side
+        for name, side in global_sides.items()
+        if side.param_weight is not None
+    }
     mapped = {}
     for name, side in sides.items():
         value = incoming.tensors[name].to(device=side.param_weight.device)
@@ -230,13 +247,13 @@ def apply_trainable_state(
     _copy_masters_to_model(actor)
     if dist.is_initialized():
         dist.barrier()
-    reset_count = (
+    if reset_optimizer:
         _reset_optimizer_state(
             actor,
             [side.param_weight.main_param for side in sides.values()],
         )
-        if reset_optimizer
-        else 0
-    )
+        reset_count = len(incoming.tensors)
+    else:
+        reset_count = 0
     actor.weights_backuper.backup("actor")
     return reset_count
