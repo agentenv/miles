@@ -105,7 +105,7 @@ def _require_canonical_trainable_state(state: TrainableState) -> TrainableState:
 
 
 def _capture_external_train_metrics(args, metrics: Mapping[str, Any]) -> None:
-    if getattr(args, "external_policy_sync_path", None) is None or dist.get_rank() != 0:
+    if getattr(args, "external_policy_sync_path", None) is None:
         return
     args._external_train_metrics = {
         name: float(metrics[name])
@@ -116,6 +116,22 @@ def _capture_external_train_metrics(args, metrics: Mapping[str, Any]) -> None:
         )
         if name in metrics
     }
+
+
+def _optimizer_master(side) -> torch.Tensor | None:
+    parameter = side.param_weight
+    if parameter is None:
+        return None
+    main = getattr(parameter, "main_param", None)
+    if (
+        main is None
+        or main.dtype != torch.float32
+        or main.numel() != parameter.numel()
+    ):
+        raise RuntimeError(
+            f"LoRA parameter {side.param_name!r} has no complete FP32 optimizer master"
+        )
+    return main.view(parameter.shape)
 
 
 def _adapter_sides(actor) -> tuple[tuple[str, Any], ...]:
@@ -132,6 +148,7 @@ def _adapter_sides(actor) -> tuple[tuple[str, Any], ...]:
         raise RuntimeError("Megatron-Bridge lacks adapter conversion tasks")
 
     tasks_by_base = build_tasks(actor.model)
+    clone_only = _clone_only_lora(actor)
     sides = []
     for base_name in sorted(tasks_by_base):
         tasks = sorted(
@@ -140,28 +157,32 @@ def _adapter_sides(actor) -> tuple[tuple[str, Any], ...]:
         )
         for task in tasks:
             for side in (task.linear_in_task, task.linear_out_task):
-                parameter = side.param_weight
-                hf_param = side.mapping.hf_param
-                if isinstance(hf_param, str):
-                    raw_name = hf_param
-                elif isinstance(hf_param, dict) and len(set(hf_param.values())) == 1:
-                    raw_name = next(iter(hf_param.values()))
-                else:
-                    raise RuntimeError(
-                        f"ambiguous canonical LoRA mapping for {side.param_name!r}"
-                    )
-                name = raw_name if raw_name.startswith(_CANONICAL_PREFIX) else _CANONICAL_PREFIX + raw_name
-                if parameter is not None:
-                    main = getattr(parameter, "main_param", None)
-                    if (
-                        main is None
-                        or main.dtype != torch.float32
-                        or main.numel() != parameter.numel()
+                if clone_only:
+                    hf_param = side.mapping.hf_param
+                    if isinstance(hf_param, str):
+                        raw_name = hf_param
+                    elif (
+                        isinstance(hf_param, dict)
+                        and len(set(hf_param.values())) == 1
                     ):
+                        raw_name = next(iter(hf_param.values()))
+                    else:
                         raise RuntimeError(
-                            f"LoRA parameter {side.param_name!r} has no complete "
-                            "FP32 optimizer master"
+                            "ambiguous canonical LoRA mapping for "
+                            f"{side.param_name!r}"
                         )
+                    _optimizer_master(side)
+                else:
+                    converted = side.mapping.megatron_to_hf(
+                        _optimizer_master(side),
+                        side.megatron_module,
+                    )
+                    if len(converted) != 1:
+                        raise RuntimeError(
+                            f"ambiguous LoRA mapping for {side.param_name!r}"
+                        )
+                    raw_name = next(iter(converted))
+                name = raw_name if raw_name.startswith(_CANONICAL_PREFIX) else _CANONICAL_PREFIX + raw_name
                 sides.append((name, side))
 
     names = [name for name, _ in sides]
@@ -487,7 +508,7 @@ def _optimizer_masters_as_model_parameters(actor):
 
 
 def _collective_adapter_tensors(actor) -> dict[str, torch.Tensor]:
-    """Collect canonical f32 PEFT state, retaining it only on global rank zero."""
+    """Collect canonical f32 PEFT state, retaining one replicated main-rank copy."""
 
     from megatron.bridge import AutoBridge
 
@@ -497,7 +518,10 @@ def _collective_adapter_tensors(actor) -> dict[str, torch.Tensor]:
         actor.args.hf_checkpoint,
         trust_remote_code=True,
     )
-    retain_tensors = not dist.is_initialized() or dist.get_rank() == 0
+    retain_tensors = (
+        not dist.is_initialized()
+        or actor._is_first_replica_megatron_main_rank
+    )
     tensors: dict[str, torch.Tensor] = {}
     names: set[str] = set()
     sides = _adapter_sides(actor)
@@ -571,15 +595,15 @@ def export_trainable_state(actor, *, policy_version: int) -> TrainableState | No
     else:
         tensors = {}
         for name, side in _adapter_sides(actor):
-            parameter = side.param_weight
-            if parameter is None:
-                raise RuntimeError(f"single-rank LoRA side {name!r} is absent")
             converted = side.mapping.megatron_to_hf(
-                parameter.main_param.view(parameter.shape),
+                _optimizer_master(side),
                 side.megatron_module,
             )
             tensors[name] = next(iter(converted.values()))
-    if dist.is_initialized() and dist.get_rank() != 0:
+    if (
+        dist.is_initialized()
+        and not actor._is_first_replica_megatron_main_rank
+    ):
         return None
     metrics = (
         getattr(actor.args, "_external_train_metrics", {})

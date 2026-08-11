@@ -1,3 +1,5 @@
+import sys
+import types
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -7,6 +9,7 @@ import torch
 from miles.backends.megatron_utils import trainable_state
 
 NAME = "base_model.model.layers.0.self_attn.q_proj.lora_A.weight"
+REMOTE_NAME = "base_model.model.layers.1.self_attn.q_proj.lora_A.weight"
 
 
 class _Mapping:
@@ -15,6 +18,39 @@ class _Mapping:
 
     def hf_to_megatron(self, value, _module):
         return value
+
+
+class _RemoteMapping:
+    def __init__(self, value):
+        self.value = value
+
+    def megatron_to_hf(self, value, module):
+        assert value is None
+        assert module is None
+        return {REMOTE_NAME: self.value}
+
+    def hf_to_megatron(self, *_args):
+        raise AssertionError("remote pipeline tensor must not be applied locally")
+
+
+def _remote_side(value):
+    return SimpleNamespace(
+        mapping=_RemoteMapping(value),
+        megatron_module=None,
+        param_name="remote.adapter.linear_in.weight",
+        param_weight=None,
+    )
+
+
+def _install_bridge(monkeypatch, bridge):
+    bridge_module = types.ModuleType("megatron.bridge")
+    bridge_module.AutoBridge = SimpleNamespace(
+        from_hf_pretrained=lambda *_args, **_kwargs: bridge
+    )
+    megatron_module = types.ModuleType("megatron")
+    megatron_module.bridge = bridge_module
+    monkeypatch.setitem(sys.modules, "megatron", megatron_module)
+    monkeypatch.setitem(sys.modules, "megatron.bridge", bridge_module)
 
 
 def _actor():
@@ -57,6 +93,7 @@ def _actor():
         optimizer=optimizer,
         opt_param_scheduler=Scheduler(),
         weights_backuper=SimpleNamespace(backup=backups.append),
+        _is_first_replica_megatron_main_rank=True,
     )
     return actor, side, unrelated, inner, backups
 
@@ -95,7 +132,9 @@ def test_export_trainable_state_carries_external_round_stats(monkeypatch):
     assert state.train_seconds == 1.5
 
 
-def test_model_parallel_export_is_collective_and_only_rank_zero_returns(monkeypatch):
+def test_model_parallel_export_is_collective_and_only_megatron_main_rank_returns(
+    monkeypatch,
+):
     actor, side, *_ = _actor()
     actor.args.tensor_model_parallel_size = 2
     actor.args.pipeline_model_parallel_size = 2
@@ -107,13 +146,14 @@ def test_model_parallel_export_is_collective_and_only_rank_zero_returns(monkeypa
     monkeypatch.setattr(trainable_state.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(trainable_state.dist, "get_rank", lambda: 1)
 
-    assert trainable_state.export_trainable_state(actor, policy_version=4) is None
-
-    monkeypatch.setattr(trainable_state.dist, "get_rank", lambda: 0)
     state = trainable_state.export_trainable_state(actor, policy_version=4)
     assert state is not None
     assert state.policy_version == 4
     assert torch.equal(state.tensors[NAME], torch.tensor([[1.0, 2.0]]))
+
+    actor._is_first_replica_megatron_main_rank = False
+    monkeypatch.setattr(trainable_state.dist, "get_rank", lambda: 0)
+    assert trainable_state.export_trainable_state(actor, policy_version=4) is None
 
 
 def test_collective_conversion_reads_f32_master_and_restores_model_parameter(monkeypatch):
@@ -130,7 +170,7 @@ def test_collective_conversion_reads_f32_master_and_restores_model_parameter(mon
     assert side.param_weight.data.data_ptr() == original.data_ptr()
 
 
-def test_collective_export_nonzero_rank_does_not_retain_canonical_tensors(monkeypatch):
+def test_collective_export_non_owner_does_not_retain_canonical_tensors(monkeypatch):
     actor, side, *_ = _actor()
     actor.args.hf_checkpoint = "/synthetic/model"
     actor.model = []
@@ -144,14 +184,36 @@ def test_collective_export_nonzero_rank_does_not_retain_canonical_tensors(monkey
         def export_adapter_weights(self, *_args, **_kwargs):
             yield NAME, _UnmaterializedWeight(), "synthetic"
 
-    from megatron.bridge import AutoBridge
     from miles.utils import megatron_bridge_utils
 
+    _install_bridge(monkeypatch, _Bridge())
     monkeypatch.setattr(
-        AutoBridge,
-        "from_hf_pretrained",
-        lambda *_args, **_kwargs: _Bridge(),
+        megatron_bridge_utils,
+        "patch_megatron_model",
+        lambda _model: nullcontext(),
     )
+    monkeypatch.setattr(trainable_state.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(trainable_state.dist, "get_rank", lambda: 0)
+    actor._is_first_replica_megatron_main_rank = False
+
+    assert trainable_state._collective_adapter_tensors(actor) == {}
+
+
+def test_collective_export_megatron_main_rank_retains_canonical_tensors(monkeypatch):
+    actor, side, *_ = _actor()
+    actor.args.hf_checkpoint = "/synthetic/model"
+    actor.model = []
+    monkeypatch.setattr(trainable_state, "_adapter_sides", lambda _actor: [(NAME, side)])
+
+    expected = torch.tensor([[1.0, 2.0]])
+
+    class _Bridge:
+        def export_adapter_weights(self, *_args, **_kwargs):
+            yield NAME, expected, "synthetic"
+
+    from miles.utils import megatron_bridge_utils
+
+    _install_bridge(monkeypatch, _Bridge())
     monkeypatch.setattr(
         megatron_bridge_utils,
         "patch_megatron_model",
@@ -160,25 +222,142 @@ def test_collective_export_nonzero_rank_does_not_retain_canonical_tensors(monkey
     monkeypatch.setattr(trainable_state.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(trainable_state.dist, "get_rank", lambda: 1)
 
-    assert trainable_state._collective_adapter_tensors(actor) == {}
+    assert torch.equal(trainable_state._collective_adapter_tensors(actor)[NAME], expected)
 
 
-def test_external_train_metric_capture_is_rank_zero_only(monkeypatch):
+def test_external_train_metric_capture_uses_caller_selected_rank(monkeypatch):
     args = SimpleNamespace(external_policy_sync_path="project.sync.create")
     metrics = {
         "train/train_rollout_kl": 0.1,
         "train/ess_ratio": 0.8,
         "train/pg_clipfrac": 0.25,
     }
-    monkeypatch.setattr(trainable_state.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(trainable_state.dist, "get_rank", lambda: 1)
 
     trainable_state._capture_external_train_metrics(args, metrics)
 
     assert args._external_train_metrics == metrics
-    del args._external_train_metrics
-    monkeypatch.setattr(trainable_state.dist, "get_rank", lambda: 1)
-    trainable_state._capture_external_train_metrics(args, metrics)
-    assert not hasattr(args, "_external_train_metrics")
+
+
+def test_adapter_discovery_accepts_remote_pipeline_tasks(monkeypatch):
+    local_a = torch.nn.Parameter(torch.zeros(1, 2, dtype=torch.bfloat16))
+    local_a.main_param = torch.zeros(1, 2, dtype=torch.float32)
+    local_b = torch.nn.Parameter(torch.zeros(1, 2, dtype=torch.bfloat16))
+    local_b.main_param = torch.zeros(1, 2, dtype=torch.float32)
+    chunk = torch.nn.Module()
+    chunk.register_parameter("local_a", local_a)
+    chunk.register_parameter("local_b", local_b)
+
+    def side(name, parameter):
+        mapping = SimpleNamespace(
+            megatron_to_hf=lambda value, _module: {name: value},
+        )
+        return SimpleNamespace(
+            mapping=mapping,
+            megatron_module=None,
+            param_name=name,
+            param_weight=parameter,
+        )
+
+    tasks = {
+        "local": [
+            SimpleNamespace(
+                adapter_key=None,
+                linear_in_task=side(NAME, local_a),
+                linear_out_task=side(
+                    "base_model.model.layers.0.self_attn.q_proj.lora_B.weight",
+                    local_b,
+                ),
+            )
+        ],
+        "remote": [
+            SimpleNamespace(
+                adapter_key=None,
+                linear_in_task=_remote_side(torch.ones(1, 2)),
+                linear_out_task=SimpleNamespace(
+                    mapping=SimpleNamespace(
+                        megatron_to_hf=lambda value, module: {
+                            "base_model.model.layers.1.self_attn.q_proj.lora_B.weight": torch.ones(1, 2)
+                        }
+                    ),
+                    megatron_module=None,
+                    param_name="remote.adapter.linear_out.weight",
+                    param_weight=None,
+                ),
+            )
+        ],
+    }
+    bridge = SimpleNamespace(
+        _model_bridge=SimpleNamespace(
+            build_adapter_conversion_tasks=lambda _model: tasks
+        )
+    )
+    _install_bridge(monkeypatch, bridge)
+    actor = SimpleNamespace(
+        args=SimpleNamespace(hf_checkpoint="/model"),
+        model=[chunk],
+    )
+
+    sides = trainable_state._adapter_sides(actor)
+
+    assert [name for name, _side in sides] == [
+        NAME,
+        "base_model.model.layers.0.self_attn.q_proj.lora_B.weight",
+        REMOTE_NAME,
+        "base_model.model.layers.1.self_attn.q_proj.lora_B.weight",
+    ]
+
+
+def test_clone_only_adapter_discovery_keeps_packed_representative(monkeypatch):
+    parameter_a = torch.nn.Parameter(torch.zeros(2, 2, 3, dtype=torch.bfloat16))
+    parameter_a.main_param = torch.zeros(2, 2, 3, dtype=torch.float32)
+    parameter_b = torch.nn.Parameter(torch.zeros(2, 8, 2, dtype=torch.bfloat16))
+    parameter_b.main_param = torch.zeros(2, 8, 2, dtype=torch.float32)
+    chunk = torch.nn.Module()
+    chunk.register_parameter("packed_a", parameter_a)
+    chunk.register_parameter("packed_b", parameter_b)
+    names = (
+        "base_model.model.model.layers.0.mlp.experts.0.gate_proj.lora_A.weight",
+        "base_model.model.model.layers.0.mlp.experts.0.gate_proj.lora_B.weight",
+    )
+
+    def packed_side(name, parameter):
+        return SimpleNamespace(
+            mapping=SimpleNamespace(
+                hf_param=name,
+                megatron_to_hf=lambda *_args: (_ for _ in ()).throw(
+                    AssertionError("packed clone mapping must use its representative")
+                ),
+            ),
+            megatron_module=None,
+            param_name=name,
+            param_weight=parameter,
+        )
+
+    tasks = {
+        "expert": [
+            SimpleNamespace(
+                adapter_key=None,
+                linear_in_task=packed_side(names[0], parameter_a),
+                linear_out_task=packed_side(names[1], parameter_b),
+            )
+        ]
+    }
+    bridge = SimpleNamespace(
+        _model_bridge=SimpleNamespace(
+            build_adapter_conversion_tasks=lambda _model: tasks
+        )
+    )
+    _install_bridge(monkeypatch, bridge)
+    actor = SimpleNamespace(
+        args=SimpleNamespace(
+            hf_checkpoint="/model",
+            yeto_rl_clone_only_lora=True,
+        ),
+        model=[chunk],
+    )
+
+    assert [name for name, _side in trainable_state._adapter_sides(actor)] == list(names)
 
 
 def test_apply_trainable_state_resets_only_lora_and_preserves_scheduler(monkeypatch):
@@ -488,14 +667,9 @@ def test_clone_only_collective_export_accepts_expanded_logical_experts(
             for name, value in sorted(exported_by_bridge.items()):
                 yield name, value, "synthetic"
 
-    from megatron.bridge import AutoBridge
     from miles.utils import megatron_bridge_utils
 
-    monkeypatch.setattr(
-        AutoBridge,
-        "from_hf_pretrained",
-        lambda *_args, **_kwargs: _Bridge(),
-    )
+    _install_bridge(monkeypatch, _Bridge())
     monkeypatch.setattr(
         megatron_bridge_utils,
         "patch_megatron_model",

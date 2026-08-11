@@ -87,7 +87,7 @@ class RayTrainGroup:
         )
 
     async def export_trainable_state(self) -> TrainableState:
-        """Export replicated trainable state from Megatron global rank zero."""
+        """Export replicated trainable state from the Megatron main rank."""
         results = await self._broadcast("export_trainable_state")
         exported = [result for result in results if result is not None]
         if len(exported) != 1:

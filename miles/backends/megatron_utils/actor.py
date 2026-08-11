@@ -267,7 +267,7 @@ class MegatronTrainRayActor(TrainRayActor):
         return start_rollout_id
 
     def export_trainable_state(self) -> TrainableState | None:
-        """Collectively export one complete LoRA state; rank zero returns it."""
+        """Collectively export one complete LoRA state from the Megatron main rank."""
         return export_external_trainable_state(
             self,
             policy_version=getattr(self, "_external_policy_version", 0),
