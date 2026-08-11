@@ -777,6 +777,15 @@ def _compute_server_args(
                 "LoRA + colocate: enabling SGLang enable_weights_cpu_backup=True; "
                 "the trainer will skip per-step base weight sync."
             )
+        elif getattr(args, "lora_base_disk_reload", False):
+            # Preserve the exact post-processed, LoRA-wrapped base allocation
+            # without retaining a full host-RAM mirror.  TMS restores these
+            # bytes before the prepared adapter is published.
+            kwargs["enable_weights_disk_backup"] = True
+            logger.info(
+                "LoRA + colocate: enabling SGLang enable_weights_disk_backup=True; "
+                "the trainer will skip per-step base weight sync."
+            )
 
     unused_keys = set(kwargs.keys())
     for attr in dataclasses.fields(ServerArgs):

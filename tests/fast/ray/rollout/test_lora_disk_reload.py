@@ -14,12 +14,8 @@ class _Server:
     async def onload(self, tags=None):
         self.events.append(f"{self.name}:onload:{','.join(tags or [])}")
 
-    async def reload_weights_from_disk(self):
-        self.events.append(f"{self.name}:reload")
-
-
 @pytest.mark.asyncio
-async def test_lora_disk_reload_happens_after_weight_storage_is_remapped():
+async def test_lora_disk_backup_is_restored_by_weight_onload():
     events = []
     manager = object.__new__(RolloutManager.__ray_actor_class__)
     manager.args = SimpleNamespace(lora_base_disk_reload=True)
@@ -33,7 +29,6 @@ async def test_lora_disk_reload_happens_after_weight_storage_is_remapped():
     assert events == [
         "actor:onload:weights",
         "reference:onload:weights",
-        "actor:reload",
     ]
 
 
