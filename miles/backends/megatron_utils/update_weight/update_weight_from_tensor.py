@@ -1,3 +1,4 @@
+import gc
 import hashlib
 import logging
 from argparse import Namespace
@@ -325,7 +326,19 @@ class UpdateWeightFromTensor:
             refs, long_lived_tensors = self._send_lora_params(accumulated_named_tensors)
             results = ray.get(refs)
             _check_weight_sync_results(results, is_lora=True)
+
+            # Only the gather rank waits for SGLang's HTTP response; other
+            # ranks receive no Ray refs. Keep every producer allocation alive
+            # until the receiver has copied all CUDA IPC tensors to CPU, then
+            # explicitly return the staging storage to CUDA before training.
+            dist.barrier(group=get_gloo_group())
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
             del long_lived_tensors
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.ipc_collect()
+                torch.cuda.empty_cache()
 
             if not self._lora_base_synced:
                 self._lora_base_synced = True

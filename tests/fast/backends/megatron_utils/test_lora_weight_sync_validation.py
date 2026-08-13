@@ -8,6 +8,7 @@ Verifies that silent failures are caught:
 - Distributed (disaggregate) sync broadcasts the adapter over NCCL (no CUDA IPC)
 """
 
+import gc
 from argparse import Namespace
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -399,6 +400,76 @@ def test_prepared_lora_weights_are_consumed_after_model_offload(monkeypatch):
 
     updater._hf_weight_iterator.get_hf_weight_chunks.assert_called_once_with({}, weight_type="lora")
     updater._send_lora_params.assert_called_once()
+
+
+def test_lora_cuda_ipc_staging_is_reclaimed_after_receiver_barrier(monkeypatch):
+    from miles.backends.megatron_utils.update_weight import update_weight_from_tensor as update_module
+
+    events = []
+
+    class ReleaseProbe:
+        def __del__(self):
+            events.append("released")
+
+    updater = object.__new__(UpdateWeightFromTensor)
+    updater.args = SimpleNamespace(
+        check_weight_update_equal=False,
+        pause_generation_mode="retract",
+    )
+    updater.is_lora = True
+    updater.use_distribute = False
+    updater.rollout_engines = []
+    updater.weight_version = 0
+    updater._lora_base_synced = False
+    updater._prepared_lora_weights = [("layer.lora_A.weight", torch.ones(1))]
+    updater.weights_getter = MagicMock(side_effect=AssertionError("prepared weights must be used"))
+    updater._send_lora_params = lambda _weights: ([], [ReleaseProbe()])
+
+    monkeypatch.setattr(update_module, "lora_base_sync_skipped", lambda _args: True)
+    monkeypatch.setattr(update_module, "get_gloo_group", MagicMock())
+    monkeypatch.setattr(update_module.dist, "get_rank", lambda: 1)
+    monkeypatch.setattr(
+        update_module.dist,
+        "barrier",
+        lambda **_kwargs: events.append("barrier"),
+    )
+    monkeypatch.setattr(
+        update_module.ray,
+        "get",
+        lambda _refs: events.append("receiver_done") or [],
+    )
+    monkeypatch.setattr(update_module.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        update_module.torch.cuda,
+        "synchronize",
+        lambda: events.append("synchronize"),
+    )
+    monkeypatch.setattr(
+        update_module.torch.cuda,
+        "ipc_collect",
+        lambda: events.append("ipc_collect"),
+    )
+    monkeypatch.setattr(
+        update_module.torch.cuda,
+        "empty_cache",
+        lambda: events.append("empty_cache"),
+    )
+    monkeypatch.setattr(gc, "collect", lambda: events.append("gc_collect"))
+
+    updater.update_weights()
+
+    assert events == [
+        "barrier",
+        "receiver_done",
+        "barrier",
+        "synchronize",
+        "released",
+        "gc_collect",
+        "ipc_collect",
+        "empty_cache",
+        "barrier",
+        "barrier",
+    ]
 
 
 # ---------------------------------------------------------------------------
