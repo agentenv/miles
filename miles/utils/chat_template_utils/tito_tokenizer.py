@@ -38,6 +38,7 @@ TEMPLATE_DIR = Path(__file__).parent / "templates"
 _VALID_ROLES = frozenset({"tool", "user", "system"})
 
 _DUMMY_SYSTEM: dict[str, Any] = {"role": "system", "content": "dummy system"}
+_DUMMY_USER: dict[str, Any] = {"role": "user", "content": "dummy user query"}
 
 
 @dataclass(frozen=True)
@@ -156,6 +157,14 @@ class TITOTokenizer:
             raise ValueError(f"rendered suffix diff failed for {roles}")
         return self._encode_text(text_with[len(text_without) :])
 
+    def _synthetic_base_messages(
+        self,
+        old_messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Minimal valid history used only to render the appended suffix."""
+
+        return [_DUMMY_SYSTEM, _build_dummy_assistant(old_messages[-1])]
+
     def tokenize_additional_non_assistant(
         self,
         old_messages: list[dict[str, Any]],
@@ -184,7 +193,7 @@ class TITOTokenizer:
         assert_messages_append_only_with_allowed_role(old_messages, new_messages, self.allowed_append_roles)
         appended_messages = new_messages[len(old_messages) :]
         return self._tokenize_rendered_suffix(
-            [_DUMMY_SYSTEM, _build_dummy_assistant(old_messages[-1])],
+            self._synthetic_base_messages(old_messages),
             appended_messages,
             tools=tools,
             add_generation_prompt=True,
@@ -326,6 +335,19 @@ class Qwen38TITOTokenizer(Qwen3TITOTokenizer):
             extra_kwargs=_NATIVE_XHIGH_KWARGS,
         ),
     )
+
+    def _synthetic_base_messages(
+        self,
+        old_messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        # The native Qwen3.8 template rejects an assistant turn with no prior
+        # user query.  This extra dummy turn is outside the returned suffix,
+        # so it satisfies the template grammar without changing model input.
+        return [
+            _DUMMY_SYSTEM,
+            _DUMMY_USER,
+            _build_dummy_assistant(old_messages[-1]),
+        ]
 
 
 class QwenNextTITOTokenizer(Qwen3TITOTokenizer):

@@ -221,6 +221,22 @@ class TestConfig:
         assert qwen3_tito._assistant_start_str == "<|im_start|>assistant"
         assert qwen3_tito._newline_id in qwen3_tito.trailing_token_ids
 
+    def test_qwen38_synthetic_history_contains_a_user_query(self):
+        tokenizer = MagicMock()
+        tokenizer.encode.return_value = [1]
+        tokenizer.convert_tokens_to_ids.return_value = 2
+        tito = Qwen38TITOTokenizer(tokenizer)
+
+        messages = tito._synthetic_base_messages(
+            [{"role": "assistant", "content": "", "tool_calls": []}]
+        )
+
+        assert [message["role"] for message in messages] == [
+            "system",
+            "user",
+            "assistant",
+        ]
+
     def test_glm47(self, glm47_tito: GLM47TITOTokenizer):
         assert glm47_tito._assistant_start_str == "<|assistant|>"
         assert glm47_tito._observation_id in glm47_tito.trailing_token_ids
