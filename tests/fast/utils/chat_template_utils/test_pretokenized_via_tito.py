@@ -56,6 +56,13 @@ _PASS_PARAMS = [
     pytest.param(TITOTokenizerType.QWEN3, "Qwen/Qwen3-0.6B", frozenset({"tool", "user"}), id="qwen3-tool_user"),
     pytest.param(TITOTokenizerType.QWEN35, "Qwen/Qwen3.5-0.8B", frozenset({"tool"}), id="qwen35-tool"),
     pytest.param(TITOTokenizerType.QWEN35, "Qwen/Qwen3.5-0.8B", frozenset({"tool", "user"}), id="qwen35-tool_user"),
+    pytest.param(TITOTokenizerType.QWEN38, "Qwen/Qwen3.8-27B", frozenset({"tool"}), id="qwen38-tool"),
+    pytest.param(
+        TITOTokenizerType.QWEN38,
+        "Qwen/Qwen3.8-27B",
+        frozenset({"tool", "user"}),
+        id="qwen38-tool_user",
+    ),
     pytest.param(TITOTokenizerType.QWENNEXT, "Qwen/Qwen3-4B-Thinking-2507", frozenset({"tool"}), id="qwennext-tool"),
     pytest.param(
         TITOTokenizerType.QWENNEXT,

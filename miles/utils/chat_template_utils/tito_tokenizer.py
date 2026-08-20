@@ -296,6 +296,38 @@ class Qwen35TITOTokenizer(Qwen3TITOTokenizer):
     )
 
 
+class Qwen38TITOTokenizer(Qwen3TITOTokenizer):
+    """Qwen3.8 with native-template, append-only thinking preservation.
+
+    Qwen3.8 retains Qwen3's ``<|im_end|>\n`` boundary behavior, but its
+    native template owns the model-specific thinking controls.  Reusing the
+    bundled Qwen3.5 template would silently discard those controls, so this
+    family deliberately registers ``template=None`` and pins the exact
+    kwargs required by the Codex xhigh rollout contract.
+    """
+
+    tool_call_parser = "qwen3_coder"
+
+    _NATIVE_XHIGH_KWARGS = {
+        "enable_thinking": True,
+        "preserve_thinking": True,
+        "reasoning_effort": "xhigh",
+    }
+
+    SUPPORTED_TEMPLATES = (
+        FixedTemplateRow(
+            allowed_roles=frozenset({"tool"}),
+            template=None,
+            extra_kwargs=_NATIVE_XHIGH_KWARGS,
+        ),
+        FixedTemplateRow(
+            allowed_roles=frozenset({"tool", "user"}),
+            template=None,
+            extra_kwargs=_NATIVE_XHIGH_KWARGS,
+        ),
+    )
+
+
 class QwenNextTITOTokenizer(Qwen3TITOTokenizer):
     """Qwen3-Thinking-2507 / Qwen3-Next-Thinking — same boundary behavior as
     Qwen3, distinct (shared) fixed template."""
@@ -791,6 +823,7 @@ class TITOTokenizerType(StrEnum):
     DEFAULT = "default"
     QWEN3 = "qwen3"
     QWEN35 = "qwen35"
+    QWEN38 = "qwen38"
     QWENNEXT = "qwennext"
     GLM47 = "glm47"
     NEMOTRON3 = "nemotron3"
@@ -811,6 +844,8 @@ class TITOTokenizerType(StrEnum):
                 return Qwen3TITOTokenizer
             case cls.QWEN35:
                 return Qwen35TITOTokenizer
+            case cls.QWEN38:
+                return Qwen38TITOTokenizer
             case cls.QWENNEXT:
                 return QwenNextTITOTokenizer
             case cls.GLM47:

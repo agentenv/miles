@@ -58,6 +58,7 @@ from miles.utils.chat_template_utils.tito_tokenizer import (
     GLM47TITOTokenizer,
     Qwen3TITOTokenizer,
     Qwen35TITOTokenizer,
+    Qwen38TITOTokenizer,
     QwenNextTITOTokenizer,
     TITOTokenizer,
     TITOTokenizerType,
@@ -551,7 +552,11 @@ class TestFactory:
 
     @pytest.mark.parametrize(
         "type_str, cls",
-        [("qwen35", Qwen35TITOTokenizer), ("qwennext", QwenNextTITOTokenizer)],
+        [
+            ("qwen35", Qwen35TITOTokenizer),
+            ("qwen38", Qwen38TITOTokenizer),
+            ("qwennext", QwenNextTITOTokenizer),
+        ],
     )
     def test_qwen_variant_inherits_qwen3_boundary_logic(self, type_str, cls):
         """Qwen3.5 / Qwen3-Next reuse Qwen3's boundary handling via inheritance.
@@ -583,6 +588,7 @@ class TestParserBinding:
         [
             (TITOTokenizerType.QWEN3, "qwen3", "qwen25"),
             (TITOTokenizerType.QWEN35, "qwen3", "qwen3_coder"),
+            (TITOTokenizerType.QWEN38, "qwen3", "qwen3_coder"),
             (TITOTokenizerType.QWENNEXT, "qwen3", "qwen25"),
             (TITOTokenizerType.GLM47, "glm45", "glm47"),
             (TITOTokenizerType.NEMOTRON3, "nemotron_3", "qwen3_coder"),

@@ -53,6 +53,17 @@ def test_deepseek_v4_tool_user_pins_drop_thinking_false():
 
 
 @pytest.mark.parametrize("roles", [["tool"], ["tool", "user"]])
+def test_qwen38_uses_native_template_with_exact_xhigh_kwargs(roles):
+    path, kwargs = resolve_fixed_chat_template(TITOTokenizerType.QWEN38, roles)
+    assert path is None
+    assert kwargs == {
+        "enable_thinking": True,
+        "preserve_thinking": True,
+        "reasoning_effort": "xhigh",
+    }
+
+
+@pytest.mark.parametrize("roles", [["tool"], ["tool", "user"]])
 def test_deepseek_v32_pins_drop_thinking_false_on_every_surface(roles):
     # The vendored encoding_dsv32 honors drop_thinking=False at the render
     # level (unlike upstream, which strips historical thinking whenever a new
@@ -65,7 +76,12 @@ def test_deepseek_v32_pins_drop_thinking_false_on_every_surface(roles):
 
 @pytest.mark.parametrize(
     "tito_model",
-    [TITOTokenizerType.QWEN3, TITOTokenizerType.QWEN35, TITOTokenizerType.QWENNEXT],
+    [
+        TITOTokenizerType.QWEN3,
+        TITOTokenizerType.QWEN35,
+        TITOTokenizerType.QWEN38,
+        TITOTokenizerType.QWENNEXT,
+    ],
 )
 def test_no_superset_raises(tito_model):
     # ``{"tool", "system"}`` has no superset registered for the Qwen fixed
