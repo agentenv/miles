@@ -654,6 +654,17 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--rollout-weight-version-format",
+                choices=["counter", "yeto-policy"],
+                default="counter",
+                help=(
+                    "Version label published with rollout weights. 'counter' preserves Miles' "
+                    "numeric update counter. 'yeto-policy' explicitly maps the initial publication "
+                    "to yeto:<start-rollout-id> and each later publication to the next rollout ID; "
+                    "it is restricted to the reviewed non-colocated full-parameter Bridge/broadcast path."
+                ),
+            )
+            parser.add_argument(
                 "--update-weight-disk-dir",
                 type=str,
                 default=None,
@@ -2790,6 +2801,23 @@ def miles_validate_args(args):
             getattr(args, "prefill_num_servers", None) is None
         ), "P2P weight transfer mode has not been tested when PD is enabled."
         assert args.lora_rank <= 0, "LoRA weight sync is not supported for p2p (RDMA) weight transfer."
+
+    if getattr(args, "rollout_weight_version_format", "counter") == "yeto-policy":
+        assert args.bridge_distributed_weight_sync, (
+            "--rollout-weight-version-format=yeto-policy requires --bridge-distributed-weight-sync"
+        )
+        assert not args.colocate, (
+            "--rollout-weight-version-format=yeto-policy requires non-colocated rollout engines"
+        )
+        assert args.update_weight_transfer_mode == "broadcast", (
+            "--rollout-weight-version-format=yeto-policy requires --update-weight-transfer-mode=broadcast"
+        )
+        assert args.lora_rank <= 0, (
+            "--rollout-weight-version-format=yeto-policy is only supported for full-parameter runs"
+        )
+        assert isinstance(args.start_rollout_id, int) and not isinstance(args.start_rollout_id, bool) and args.start_rollout_id >= 0, (
+            "--rollout-weight-version-format=yeto-policy requires a non-negative integer start rollout ID"
+        )
 
     if args.update_weight_transfer_mode == "disk-delta":
         assert not args.colocate, (

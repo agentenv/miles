@@ -255,7 +255,7 @@ def disconnect_rollout_engines_from_distributed(args, group_name, model_update_g
 def update_weights_from_distributed(
     group_name: str,
     group: dist.ProcessGroup,
-    weight_version: int,
+    weight_version: int | str,
     rollout_engines: Sequence[ActorHandle],
     converted_named_tensors: Sequence[tuple[str, torch.Tensor]],
 ) -> list[ObjectRef]:

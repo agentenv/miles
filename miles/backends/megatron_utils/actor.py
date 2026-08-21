@@ -731,9 +731,14 @@ class MegatronTrainRayActor(TrainRayActor):
             if self.args.ci_test and len(rollout_engines) > 0 and not is_lora_enabled(self.args):
                 engine = random.choice(rollout_engines)
                 engine_version = ray.get(engine.get_weight_version.remote())
-                if str(engine_version) != str(self.weight_updater.weight_version):
+                expected_engine_version = (
+                    self.weight_updater.published_weight_version()
+                    if isinstance(self.weight_updater, UpdateWeightFromTensor)
+                    else str(self.weight_updater.weight_version)
+                )
+                if str(engine_version) != expected_engine_version:
                     raise RuntimeError(
-                        f"Weight version mismatch! Engine: {engine_version}, Updater: {self.weight_updater.weight_version}"
+                        f"Weight version mismatch! Engine: {engine_version}, Updater: {expected_engine_version}"
                     )
 
             if getattr(self.args, "keep_old_actor", False):

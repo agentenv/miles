@@ -143,6 +143,20 @@ class UpdateWeightFromTensor:
         self.rollout_engines: Sequence[ActorHandle] | None = None
         self._connection_stale: bool = False
 
+    def published_weight_version(self) -> str:
+        """Return the exact version label attached to the current weights."""
+        version_format = getattr(self.args, "rollout_weight_version_format", "counter")
+        if version_format == "counter":
+            return str(self.weight_version)
+        if version_format != "yeto-policy":
+            raise RuntimeError(f"unsupported rollout weight version format: {version_format!r}")
+        if self.weight_version < 1:
+            raise RuntimeError("cannot publish a Yeto policy token before the first weight update")
+        start_rollout_id = getattr(self.args, "start_rollout_id", None)
+        if not isinstance(start_rollout_id, int) or isinstance(start_rollout_id, bool) or start_rollout_id < 0:
+            raise RuntimeError("Yeto policy token publication requires a non-negative integer start_rollout_id")
+        return f"yeto:{start_rollout_id + self.weight_version - 1}"
+
     # TODO: avoid dup code during yueming's refactor (temp write this to avoid introducing potentially conflicting base class)
     def is_rollout_engines_fresh(self) -> bool:
         return self.rollout_engines is not None and not self._connection_stale
@@ -353,18 +367,19 @@ class UpdateWeightFromTensor:
         dist.barrier(group=get_gloo_group())
 
     def _send_base_params(self, hf_named_tensors) -> tuple[list[ObjectRef], Any]:
+        published_weight_version = self.published_weight_version()
         refs, long_lived_tensors = _send_to_colocated_engine(
             hf_named_tensors=hf_named_tensors,
             ipc_engine=self._ipc_engine,
             ipc_gather_src=self._ipc_gather_src,
             ipc_gather_group=self._ipc_gather_group,
-            weight_version=self.weight_version,
+            weight_version=published_weight_version,
         )
         if self.use_distribute and self._is_distributed_src_rank:
             refs_distributed = update_weights_from_distributed(
                 self._group_name,
                 self._model_update_groups,
-                self.weight_version,
+                published_weight_version,
                 self.distributed_rollout_engines,
                 hf_named_tensors,
             )
