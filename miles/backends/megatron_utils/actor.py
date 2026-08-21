@@ -70,6 +70,32 @@ logging.getLogger("megatron").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
+def _select_update_weight_cls(args: Namespace, *, is_lora: bool):
+    bridge_distributed_weight_sync = getattr(args, "bridge_distributed_weight_sync", False)
+    if bridge_distributed_weight_sync:
+        assert not args.colocate, "--bridge-distributed-weight-sync is only for non-colocated engines"
+        assert args.megatron_to_hf_mode == "bridge", (
+            "--bridge-distributed-weight-sync requires --megatron-to-hf-mode bridge"
+        )
+        assert args.update_weight_transfer_mode == "broadcast", (
+            "--bridge-distributed-weight-sync requires --update-weight-transfer-mode broadcast"
+        )
+        assert not is_lora, "--bridge-distributed-weight-sync is only for full-parameter runs"
+        return UpdateWeightFromTensor
+    if args.colocate:
+        return UpdateWeightFromTensor
+    if args.update_weight_transfer_mode == "broadcast":
+        return UpdateWeightFromDistributed
+    if args.update_weight_transfer_mode == "disk-delta":
+        from .update_weight.update_weight_from_distributed.delta import UpdateWeightFromDiskDelta
+
+        return UpdateWeightFromDiskDelta
+
+    from .update_weight.update_weight_from_distributed.p2p import UpdateWeightP2P
+
+    return UpdateWeightP2P
+
+
 class MegatronTrainRayActor(TrainRayActor):
     @with_logs
     @with_defer(lambda: Timer().start("train_wait"))
@@ -220,20 +246,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.vocab_size is None:
             self.args.vocab_size = self.tokenizer.vocab_size
 
-        if self.args.colocate:
-            update_weight_cls = UpdateWeightFromTensor
-        else:
-            if self.args.update_weight_transfer_mode == "broadcast":
-                update_weight_cls = UpdateWeightFromDistributed
-            elif self.args.update_weight_transfer_mode == "disk-delta":
-                # Lazy import: keeps the delta deps (numpy/zstandard/xxhash) off the other paths.
-                from .update_weight.update_weight_from_distributed.delta import UpdateWeightFromDiskDelta
-
-                update_weight_cls = UpdateWeightFromDiskDelta
-            else:
-                from .update_weight.update_weight_from_distributed.p2p import UpdateWeightP2P
-
-                update_weight_cls = UpdateWeightP2P
+        update_weight_cls = _select_update_weight_cls(self.args, is_lora=is_lora_enabled(args))
         self.weight_updater = update_weight_cls(
             self.args,
             self.model,

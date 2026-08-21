@@ -643,6 +643,17 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--bridge-distributed-weight-sync",
+                action="store_true",
+                default=False,
+                help=(
+                    "For a non-colocated full-parameter run in Megatron-Bridge mode, export weights "
+                    "through the bridge and broadcast the resulting HF tensors to the rollout engine. "
+                    "This preserves model-specific bridge mappings (including multimodal parameters) "
+                    "instead of using the legacy name converter."
+                ),
+            )
+            parser.add_argument(
                 "--update-weight-disk-dir",
                 type=str,
                 default=None,
