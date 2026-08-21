@@ -219,6 +219,13 @@ class SGLangEngine(RayActor):
         self.node_rank = server_args_dict["node_rank"]
         self.server_host = server_args_dict["host"]  # with [] if ipv6
         self.server_port = server_args_dict["port"]
+        self._allow_missing_unquantized_weight_update_hooks = (
+            os.environ.get("MILES_ALLOW_MISSING_UNQUANTIZED_WEIGHT_UPDATE_HOOKS") == "1"
+            and self.args.update_weight_transfer_mode == "broadcast"
+            and server_args_dict.get("quantization") is None
+            and server_args_dict.get("modelopt_quant") is None
+            and not server_args_dict.get("torchao_config")
+        )
 
         if self.args.rollout_external:
             self._init_external(server_args_dict, external_engine_need_check_fields=external_engine_need_check_fields)
@@ -621,11 +628,41 @@ class SGLangEngine(RayActor):
 
     def begin_weight_update(self):
         """Open a weight-update session on the engine (restores packed weights for loading)."""
-        return self._make_request("begin_weight_update", {})
+        return self._make_weight_update_hook_request("begin_weight_update")
 
     def end_weight_update(self):
         """Close the weight-update session (post-load + quant post-process on the full model)."""
-        return self._make_request("end_weight_update", {})
+        return self._make_weight_update_hook_request("end_weight_update")
+
+    def _make_weight_update_hook_request(self, endpoint: str):
+        """Call a modern weight-update hook, with a closed legacy BF16 fallback.
+
+        Older SGLang servers apply unquantized distributed updates directly and do
+        not expose the begin/end hooks. Missing hooks are accepted only when the
+        operator explicitly opts in, broadcast mode is selected, and no
+        quantization backend is configured. Every other HTTP failure remains
+        fatal.
+        """
+        try:
+            return self._make_request(endpoint, {})
+        except requests.exceptions.HTTPError as exc:
+            response = exc.response
+            if (
+                getattr(self, "_allow_missing_unquantized_weight_update_hooks", False)
+                and response is not None
+                and response.status_code == 404
+            ):
+                logger.warning(
+                    "SGLang does not expose /%s; using the explicit legacy "
+                    "unquantized broadcast compatibility path.",
+                    endpoint,
+                )
+                return {
+                    "success": True,
+                    "skipped": True,
+                    "reason": "legacy_unquantized_broadcast_server",
+                }
+            raise
 
     def update_weight_version(self, weight_version: str):
         return self._make_request(

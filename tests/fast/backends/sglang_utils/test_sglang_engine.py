@@ -75,3 +75,65 @@ def test_flush_cache_sleeps_between_pending_request_retries(monkeypatch):
         f"expected the loop to back off on every one of its 60 attempts, got {len(sleep_calls)} sleeps "
         "-- a 400 response (pending requests) must not skip the retry delay"
     )
+
+
+def _http_error(status_code):
+    response = requests.Response()
+    response.status_code = status_code
+    response.url = "http://fake-host/weight-hook"
+    return requests.HTTPError(response=response)
+
+
+def test_unquantized_broadcast_legacy_weight_hooks_accept_only_404(monkeypatch):
+    pytest.importorskip("sglang")
+    from miles.backends.sglang_utils.sglang_engine import SGLangEngine
+
+    engine = SGLangEngine.__new__(SGLangEngine)
+    engine._allow_missing_unquantized_weight_update_hooks = True
+    monkeypatch.setattr(
+        engine,
+        "_make_request",
+        lambda *_: (_ for _ in ()).throw(_http_error(404)),
+    )
+
+    assert engine.begin_weight_update() == {
+        "success": True,
+        "skipped": True,
+        "reason": "legacy_unquantized_broadcast_server",
+    }
+    assert engine.end_weight_update()["success"] is True
+
+
+@pytest.mark.parametrize("status_code", [400, 401, 403, 409, 500])
+def test_unquantized_broadcast_legacy_weight_hooks_reject_other_http_errors(
+    monkeypatch, status_code
+):
+    pytest.importorskip("sglang")
+    from miles.backends.sglang_utils.sglang_engine import SGLangEngine
+
+    engine = SGLangEngine.__new__(SGLangEngine)
+    engine._allow_missing_unquantized_weight_update_hooks = True
+    monkeypatch.setattr(
+        engine,
+        "_make_request",
+        lambda *_: (_ for _ in ()).throw(_http_error(status_code)),
+    )
+
+    with pytest.raises(requests.HTTPError):
+        engine.begin_weight_update()
+
+
+def test_missing_weight_hooks_fail_closed_without_explicit_compatibility(monkeypatch):
+    pytest.importorskip("sglang")
+    from miles.backends.sglang_utils.sglang_engine import SGLangEngine
+
+    engine = SGLangEngine.__new__(SGLangEngine)
+    engine._allow_missing_unquantized_weight_update_hooks = False
+    monkeypatch.setattr(
+        engine,
+        "_make_request",
+        lambda *_: (_ for _ in ()).throw(_http_error(404)),
+    )
+
+    with pytest.raises(requests.HTTPError):
+        engine.end_weight_update()
