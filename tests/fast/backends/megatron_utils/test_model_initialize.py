@@ -187,3 +187,37 @@ def test_initialize_steps_scheduler_when_checkpoint_did_not_restore_it():
 
     assert result == (model, optimizer, opt_param_scheduler, 100)
     opt_param_scheduler.step.assert_called_once_with(increment=800)
+
+
+def test_auto_scheduler_horizon_extends_past_critic_warmup():
+    from miles.backends.megatron_utils.model import get_optimizer_param_scheduler
+
+    args = Namespace(
+        num_rollout=1,
+        rollout_batch_size=1,
+        n_samples_per_prompt=1,
+        num_critic_epochs=2,
+        global_batch_size=1,
+        lr_decay_iters=None,
+        lr_wsd_decay_iters=None,
+        lr_warmup_fraction=None,
+        lr_warmup_iters=10,
+        lr_warmup_init=0.0,
+        lr=5e-6,
+        min_lr=0.0,
+        lr_decay_style="constant",
+        start_weight_decay=0.0,
+        end_weight_decay=0.0,
+        weight_decay_incr_style="constant",
+        use_checkpoint_opt_param_scheduler=False,
+        override_opt_param_scheduler=False,
+        lr_wsd_decay_style="linear",
+    )
+
+    with patch("miles.backends.megatron_utils.model.OptimizerParamScheduler") as scheduler:
+        get_optimizer_param_scheduler(args, MagicMock(), role="critic")
+
+    assert args.train_iters == 2
+    assert args.lr_decay_iters == 11
+    assert scheduler.call_args.kwargs["lr_warmup_steps"] == 10
+    assert scheduler.call_args.kwargs["lr_decay_steps"] == 11

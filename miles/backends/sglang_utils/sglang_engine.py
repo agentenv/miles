@@ -23,6 +23,18 @@ from miles.utils.multi_lora import is_multi_lora_enabled
 logger = logging.getLogger(__name__)
 
 
+def _allow_missing_unquantized_weight_update_hooks(args, server_args: dict) -> bool:
+    """Return the explicit, runtime-checked legacy BF16 hook decision."""
+
+    return (
+        bool(getattr(args, "allow_missing_unquantized_weight_update_hooks", False))
+        and args.update_weight_transfer_mode == "broadcast"
+        and server_args.get("quantization") is None
+        and server_args.get("modelopt_quant") is None
+        and not server_args.get("torchao_config")
+    )
+
+
 def get_base_gpu_id(args, rank):
     num_gpus = min(args.num_gpus_per_node, args.rollout_num_gpus_per_engine)
     if args.colocate:
@@ -220,11 +232,10 @@ class SGLangEngine(RayActor):
         self.server_host = server_args_dict["host"]  # with [] if ipv6
         self.server_port = server_args_dict["port"]
         self._allow_missing_unquantized_weight_update_hooks = (
-            os.environ.get("MILES_ALLOW_MISSING_UNQUANTIZED_WEIGHT_UPDATE_HOOKS") == "1"
-            and self.args.update_weight_transfer_mode == "broadcast"
-            and server_args_dict.get("quantization") is None
-            and server_args_dict.get("modelopt_quant") is None
-            and not server_args_dict.get("torchao_config")
+            _allow_missing_unquantized_weight_update_hooks(
+                self.args,
+                server_args_dict,
+            )
         )
 
         if self.args.rollout_external:

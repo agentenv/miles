@@ -84,6 +84,36 @@ def _http_error(status_code):
     return requests.HTTPError(response=response)
 
 
+def test_legacy_weight_hook_opt_in_is_explicit_and_unquantized():
+    pytest.importorskip("sglang")
+    from miles.backends.sglang_utils.sglang_engine import (
+        _allow_missing_unquantized_weight_update_hooks,
+    )
+
+    args = SimpleNamespace(
+        allow_missing_unquantized_weight_update_hooks=True,
+        update_weight_transfer_mode="broadcast",
+    )
+    unquantized = {
+        "quantization": None,
+        "modelopt_quant": None,
+        "torchao_config": None,
+    }
+    assert _allow_missing_unquantized_weight_update_hooks(args, unquantized)
+
+    args.allow_missing_unquantized_weight_update_hooks = False
+    assert not _allow_missing_unquantized_weight_update_hooks(args, unquantized)
+    args.allow_missing_unquantized_weight_update_hooks = True
+    for field, value in (
+        ("quantization", "fp8"),
+        ("modelopt_quant", "modelopt"),
+        ("torchao_config", "int4"),
+    ):
+        configured = dict(unquantized)
+        configured[field] = value
+        assert not _allow_missing_unquantized_weight_update_hooks(args, configured)
+
+
 def test_unquantized_broadcast_legacy_weight_hooks_accept_only_404(monkeypatch):
     pytest.importorskip("sglang")
     from miles.backends.sglang_utils.sglang_engine import SGLangEngine

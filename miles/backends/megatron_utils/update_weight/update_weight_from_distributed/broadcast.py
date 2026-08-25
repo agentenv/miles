@@ -14,7 +14,7 @@ from miles.backends.training_utils.parallel import get_parallel_state
 from miles.utils.distributed_utils import init_process_group
 
 from miles.utils.lora import LORA_ADAPTER_NAME
-from ..common import _check_weight_sync_results
+from ..common import _check_weight_sync_results, format_published_weight_version
 from .mixin import DistBucketedWeightUpdateMixin
 
 
@@ -52,6 +52,10 @@ class UpdateWeightFromDistributed(DistBucketedWeightUpdateMixin):
             quantization_config=quantization_config,
             is_lora=is_lora,
         )
+
+    def published_weight_version(self) -> str:
+        """Return the exact version label attached to the current weights."""
+        return format_published_weight_version(self.args, self.weight_version)
 
     # TODO: avoid dup code during yueming's refactor (temp write this to avoid introducing potentially conflicting base class)
     def is_rollout_engines_fresh(self) -> bool:
@@ -112,7 +116,7 @@ class UpdateWeightFromDistributed(DistBucketedWeightUpdateMixin):
         refs = update_weights_from_distributed(
             self._group_name,
             self._model_update_groups,
-            self.weight_version,
+            self.published_weight_version(),
             self.rollout_engines,
             converted_named_tensors,
         )

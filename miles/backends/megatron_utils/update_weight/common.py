@@ -18,6 +18,21 @@ from miles.utils.types import ParamInfo
 logger = logging.getLogger(__name__)
 
 
+def format_published_weight_version(args: Namespace, weight_version: int) -> str:
+    """Format the version label attached to one completed weight publication."""
+    version_format = getattr(args, "rollout_weight_version_format", "counter")
+    if version_format == "counter":
+        return str(weight_version)
+    if version_format != "yeto-policy":
+        raise RuntimeError(f"unsupported rollout weight version format: {version_format!r}")
+    if weight_version < 1:
+        raise RuntimeError("cannot publish a Yeto policy token before the first weight update")
+    start_rollout_id = getattr(args, "start_rollout_id", None)
+    if not isinstance(start_rollout_id, int) or isinstance(start_rollout_id, bool) or start_rollout_id < 0:
+        raise RuntimeError("Yeto policy token publication requires a non-negative integer start_rollout_id")
+    return f"yeto:{start_rollout_id + weight_version - 1}"
+
+
 @dataclasses.dataclass(frozen=True)
 class AtomicUpdateGroup:
     key: str

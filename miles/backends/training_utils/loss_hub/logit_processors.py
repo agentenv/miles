@@ -8,6 +8,19 @@ from miles.backends.training_utils.loss_hub.math_utils import calculate_log_prob
 from miles.backends.training_utils.parallel import get_parallel_state
 
 
+def _value_support(args: Namespace, device: torch.device) -> torch.Tensor:
+    """Return the scalar support represented by a categorical value head."""
+    low, high = args.value_reward_range
+    return torch.linspace(low, high, args.value_num_bins, dtype=torch.float32, device=device)
+
+
+def predict_values_from_logits(logits: torch.Tensor, args: Namespace) -> torch.Tensor:
+    """Convert scalar or categorical value-head output to scalar predictions."""
+    if getattr(args, "value_loss_type", "mse") == "classification":
+        return logits.float().softmax(dim=-1) @ _value_support(args, logits.device)
+    return logits.squeeze(-1).float()
+
+
 def get_responses(
     logits: torch.Tensor,
     *,
@@ -16,6 +29,7 @@ def get_responses(
     total_lengths: list[int],
     response_lengths: list[int],
     max_seq_lens: list[int] | None = None,
+    apply_temperature: bool = True,
 ) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
     """Yield response-aligned `(logits_chunk, tokens_chunk)` pairs per sample.
 
@@ -41,7 +55,7 @@ def get_responses(
     qkv_format = args.qkv_format
 
     if not args.true_on_policy_mode:
-        assert logits.dtype == torch.float32, f"{logits.dtype}"
+        assert logits.dtype in (torch.float32, torch.bfloat16), f"{logits.dtype}"
     assert len(logits.shape) == 3, f"{logits.shape}"
 
     if qkv_format == "thd":
@@ -51,7 +65,7 @@ def get_responses(
         assert max_seq_lens is not None
         logits = logits.view(-1, logits.size(-1))
 
-    if logits.size(-1) > 1 and args.rollout_temperature > 0 and args.rollout_temperature != 1.0:
+    if apply_temperature and logits.size(-1) > 1 and args.rollout_temperature > 0 and args.rollout_temperature != 1.0:
         logits = logits.div(args.rollout_temperature)
     if args.true_on_policy_mode:
         if getattr(args, "bf16", False):
@@ -247,9 +261,9 @@ def get_values(
         total_lengths=total_lengths,
         response_lengths=response_lengths,
         max_seq_lens=max_seq_lens,
+        apply_temperature=False,
     ):
-        assert logits_chunk.size(-1) == 1, f"{logits_chunk.shape}"
-        value_list.append(logits_chunk.squeeze(-1))
+        value_list.append(predict_values_from_logits(logits_chunk, args))
 
     res = {
         "values": value_list,

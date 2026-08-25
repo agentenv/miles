@@ -3,6 +3,7 @@ from argparse import Namespace
 import torch
 
 from miles.backends.training_utils.cp_utils import get_logits_and_tokens_offset_with_cp
+from miles.backends.training_utils.loss_hub.gae_adaptive import get_gae_adaptive_advantages
 from miles.backends.training_utils.loss_hub.math_utils import (
     get_advantages_and_returns_batch,
     get_grpo_returns,
@@ -22,12 +23,15 @@ def compute_advantages(
     total_lengths: list[int],
     response_lengths: list[int],
     values: list[torch.Tensor] | None = None,
+    max_seq_lens: list[int] | None = None,
+    lambd_override: float | None = None,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
     """Dispatch to the configured advantage estimator.
 
     Returns:
         (advantages, returns) — both lists of tensors, one per sample.
     """
+    lambd = args.lambd if lambd_override is None else lambd_override
     if args.advantage_estimator in ["grpo", "gspo"]:
         rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
         returns = get_grpo_returns(rewards, kl)
@@ -45,7 +49,30 @@ def compute_advantages(
                 k[-1] += reward
             rewards.append(k)
         advantages, returns = get_advantages_and_returns_batch(
-            total_lengths, response_lengths, values, rewards, args.gamma, args.lambd
+            total_lengths, response_lengths, values, rewards, args.gamma, lambd
+        )
+
+    elif args.advantage_estimator == "gae_adaptive":
+        # Critic targets deliberately use a fixed lambda (normally 1.0), while
+        # actor advantages use the length-adaptive policy lambda.
+        mode = "fixed" if lambd_override is not None else args.gae_adaptive_mode
+        advantages, returns = get_gae_adaptive_advantages(
+            rewards=rewards,
+            kl=kl,
+            loss_masks=loss_masks,
+            values=values,
+            response_lengths=response_lengths,
+            total_lengths=total_lengths,
+            kl_coef=args.kl_coef,
+            gamma=args.gamma,
+            lambd=lambd,
+            mode=mode,
+            alpha=args.gae_adaptive_alpha,
+            min_length=args.gae_adaptive_min_length,
+            chunked_threshold=args.gae_adaptive_chunked_threshold,
+            chunk_size=args.gae_adaptive_chunk_size,
+            qkv_format=args.qkv_format,
+            max_seq_lens=max_seq_lens,
         )
 
     elif args.advantage_estimator == "reinforce_plus_plus":

@@ -211,3 +211,19 @@ def create_rollout_manager(args, pg):
         ray.get(rollout_manager.offload.remote())
 
     return rollout_manager, num_rollout_per_epoch
+
+
+def create_value_pretraining_group(args):
+    """Allocate only the critic GPUs needed by offline value pretraining."""
+    total_gpus = args.critic_num_nodes * args.critic_num_gpus_per_node
+    logger.info("Creating value-pretraining placement group with %d GPUs...", total_gpus)
+    pg, bundle_indices, gpu_ids = _create_placement_group(total_gpus)
+    return allocate_train_group(
+        args=args,
+        num_nodes=args.critic_num_nodes,
+        num_gpus_per_node=args.critic_num_gpus_per_node,
+        pg=(pg, bundle_indices, gpu_ids),
+        role="critic",
+        with_ref=False,
+        rollout_manager=None,
+    )

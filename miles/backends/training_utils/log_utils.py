@@ -405,7 +405,48 @@ def aggregate_train_losses(
     for key, value in zip(keys, values[1:], strict=False):
         loss_reduced[key] = value * parallel_state.cp.size / num_samples_or_tokens
 
+    _compute_explained_variance_from_stats(
+        loss_reduced,
+        num_samples_or_tokens=num_samples_or_tokens,
+        cp_size=parallel_state.cp.size,
+    )
+
     return loss_reduced
+
+
+def _compute_explained_variance_from_stats(
+    loss_reduced: dict[str, float],
+    *,
+    num_samples_or_tokens: float,
+    cp_size: int,
+) -> None:
+    """Replace distributed sufficient statistics with explained variance."""
+    keys = (
+        "_ev_n",
+        "_ev_returns_sum",
+        "_ev_returns_sq_sum",
+        "_ev_residual_sum",
+        "_ev_residual_sq_sum",
+    )
+    if not all(key in loss_reduced for key in keys):
+        return
+    inverse_normalization = num_samples_or_tokens / cp_size
+    n = loss_reduced["_ev_n"] * inverse_normalization
+    returns_sum = loss_reduced["_ev_returns_sum"] * inverse_normalization
+    returns_sq_sum = loss_reduced["_ev_returns_sq_sum"] * inverse_normalization
+    residual_sum = loss_reduced["_ev_residual_sum"] * inverse_normalization
+    residual_sq_sum = loss_reduced["_ev_residual_sq_sum"] * inverse_normalization
+    for key in keys:
+        del loss_reduced[key]
+
+    if n <= 1:
+        loss_reduced["value_explained_variance"] = 0.0
+        return
+    returns_var = returns_sq_sum / n - (returns_sum / n) ** 2
+    residual_var = residual_sq_sum / n - (residual_sum / n) ** 2
+    loss_reduced["value_explained_variance"] = (
+        1.0 - residual_var / returns_var if returns_var > 1e-8 else 0.0
+    )
 
 
 def log_train_step(

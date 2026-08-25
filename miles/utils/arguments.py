@@ -654,6 +654,17 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--allow-missing-unquantized-weight-update-hooks",
+                action="store_true",
+                default=False,
+                help=(
+                    "Allow an older unquantized SGLang broadcast server to omit "
+                    "the optional begin/end weight-update endpoints. This is "
+                    "restricted to the reviewed non-colocated full-parameter "
+                    "Bridge/broadcast path; all non-404 failures remain fatal."
+                ),
+            )
+            parser.add_argument(
                 "--rollout-weight-version-format",
                 choices=["counter", "yeto-policy"],
                 default="counter",
@@ -661,7 +672,8 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "Version label published with rollout weights. 'counter' preserves Miles' "
                     "numeric update counter. 'yeto-policy' explicitly maps the initial publication "
                     "to yeto:<start-rollout-id> and each later publication to the next rollout ID; "
-                    "it is restricted to the reviewed non-colocated full-parameter Bridge/broadcast path."
+                    "it is restricted to the reviewed non-colocated full-parameter raw/broadcast "
+                    "or Bridge/broadcast paths."
                 ),
             )
             parser.add_argument(
@@ -901,7 +913,7 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--rollout-batch-size",
                 type=int,
-                required=True,
+                default=None,
                 help=(
                     "The number of prompts in each rollout step. "
                     "The total data returned should be rollout_batch_size * n_samples_per_prompt. "
@@ -1032,6 +1044,15 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
 
         def add_algo_arguments(parser):
             parser.add_argument(
+                "--sao-online-recipe",
+                choices=["coding", "reasoning"],
+                default=None,
+                help=(
+                    "Apply the paper-backed single-rollout actor-critic settings. "
+                    "The domain chooses the published DIS trust-region band."
+                ),
+            )
+            parser.add_argument(
                 "--ref-load",
                 type=str,
                 default=None,
@@ -1100,9 +1121,39 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 default=0,
                 help="number of iterations to linearly warmup for critic model.",
             )
+            parser.add_argument(
+                "--num-critic-epochs",
+                type=int,
+                default=1,
+                help="Number of critic optimizer updates per rollout batch.",
+            )
+            parser.add_argument(
+                "--critic-freeze-attention",
+                action="store_true",
+                default=False,
+                help="Freeze critic attention modules while keeping its value head and non-attention blocks trainable.",
+            )
 
             parser.add_argument("--eps-clip", type=float, default=0.2, help="PPO clip range")
             parser.add_argument("--eps-clip-high", type=float, default=None, help="PPO clip upper range")
+            parser.add_argument(
+                "--policy-objective",
+                choices=["ppo", "sao_dis"],
+                default="ppo",
+                help="Policy-gradient objective. sao_dis uses current/rollout ratios and strict rejection.",
+            )
+            parser.add_argument(
+                "--sao-dis-eps-low",
+                type=float,
+                default=0.3,
+                help="SAO DIS lower deviation; the strict lower ratio bound is 1-eps-low.",
+            )
+            parser.add_argument(
+                "--sao-dis-eps-high",
+                type=float,
+                default=5.0,
+                help="SAO DIS upper deviation; the strict upper ratio bound is 1+eps-high.",
+            )
             parser.add_argument(
                 "--eps-clip-c",
                 type=float,
@@ -1110,6 +1161,67 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help="lower bound of the value for Dual-clip PPO from https://arxiv.org/pdf/1912.09729",
             )
             parser.add_argument("--value-clip", type=float, default=0.2, help="the clip for value loss")
+            parser.add_argument(
+                "--value-loss-type",
+                type=str,
+                default="mse",
+                choices=["mse", "classification"],
+                help="Scalar MSE or categorical value prediction.",
+            )
+            parser.add_argument(
+                "--value-num-bins",
+                type=int,
+                default=51,
+                help="Number of support bins for classification value prediction.",
+            )
+            parser.add_argument(
+                "--value-reward-range",
+                type=float,
+                nargs=2,
+                default=[0.0, 1.0],
+                metavar=("LOW", "HIGH"),
+                help="Categorical value support range.",
+            )
+            parser.add_argument(
+                "--value-target-type",
+                type=str,
+                default="hl_gauss",
+                choices=["two_hot", "hl_gauss"],
+                help="Projection from scalar returns to categorical targets.",
+            )
+            parser.add_argument(
+                "--hl-gauss-sigma-ratio",
+                type=float,
+                default=0.75,
+                help="HL-Gauss sigma divided by categorical bin width.",
+            )
+            parser.add_argument(
+                "--value-pretrain-manifest",
+                type=str,
+                default=None,
+                help="Strict offline value-pretraining manifest used by train_value.py.",
+            )
+            parser.add_argument(
+                "--value-pretrain-manifest-sha256",
+                type=str,
+                default=None,
+                help="Optional expected SHA-256 of --value-pretrain-manifest.",
+            )
+            parser.add_argument(
+                "--value-pretrain-epochs",
+                type=int,
+                default=1,
+                help="Number of deterministic passes over the offline value dataset.",
+            )
+            parser.add_argument(
+                "--critic-value-pretrain-contract-sha256",
+                type=str,
+                default=None,
+                help=(
+                    "Require --critic-load to contain a value-pretraining contract with this SHA-256. "
+                    "The contract also configures the critic value-head objective."
+                ),
+            )
             parser.add_argument(
                 "--kl-coef",
                 type=float,
@@ -1151,6 +1263,7 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "reinforce_plus_plus",
                     "reinforce_plus_plus_baseline",
                     "ppo",
+                    "gae_adaptive",
                 ],
                 default="grpo",
                 help=(
@@ -1192,6 +1305,42 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--entropy-coef", type=float, default=0.0, help="Entropy loss coef")
             parser.add_argument("--gamma", type=float, default=1.0, help="PPO GAE gamma")
             parser.add_argument("--lambd", type=float, default=1.0, help="PPO GAE lambd")
+            parser.add_argument(
+                "--critic-lambd",
+                type=float,
+                default=1.0,
+                help="Fixed GAE lambda used to build critic targets.",
+            )
+            parser.add_argument(
+                "--gae-adaptive-mode",
+                choices=["fixed", "adaptive"],
+                default="adaptive",
+                help="Use fixed --lambd or length-adaptive lambda for policy advantages.",
+            )
+            parser.add_argument(
+                "--gae-adaptive-alpha",
+                type=float,
+                default=1.5,
+                help="Alpha in lambda = 1 - 1/(alpha * active_action_tokens).",
+            )
+            parser.add_argument(
+                "--gae-adaptive-min-length",
+                type=int,
+                default=1,
+                help="Use lambda=1 below this many active action tokens.",
+            )
+            parser.add_argument(
+                "--gae-adaptive-chunked-threshold",
+                type=int,
+                default=8192,
+                help="Use the parallel GAE scan at this active-token length.",
+            )
+            parser.add_argument(
+                "--gae-adaptive-chunk-size",
+                type=int,
+                default=128,
+                help="Chunk size for long adaptive-GAE scans.",
+            )
             parser.add_argument("--normalize-advantages", action="store_true", default=False)
             parser.add_argument(
                 "--disable-grpo-std-normalization",
@@ -2447,8 +2596,54 @@ def _resolve_ft_components(args: argparse.Namespace) -> list[str]:
     return list(args.ft_components)
 
 
+def _validate_rollout_weight_version_format(args: argparse.Namespace) -> None:
+    if getattr(args, "rollout_weight_version_format", "counter") != "yeto-policy":
+        return
+
+    uses_bridge_broadcast = (
+        args.bridge_distributed_weight_sync and args.megatron_to_hf_mode == "bridge"
+    )
+    uses_raw_broadcast = (
+        not args.bridge_distributed_weight_sync and args.megatron_to_hf_mode == "raw"
+    )
+    assert uses_bridge_broadcast or uses_raw_broadcast, (
+        "--rollout-weight-version-format=yeto-policy requires either "
+        "--megatron-to-hf-mode=raw or --bridge-distributed-weight-sync with "
+        "--megatron-to-hf-mode=bridge"
+    )
+    assert not args.colocate, (
+        "--rollout-weight-version-format=yeto-policy requires non-colocated rollout engines"
+    )
+    assert args.update_weight_transfer_mode == "broadcast", (
+        "--rollout-weight-version-format=yeto-policy requires --update-weight-transfer-mode=broadcast"
+    )
+    assert args.lora_rank <= 0, (
+        "--rollout-weight-version-format=yeto-policy is only supported for full-parameter runs"
+    )
+    assert (
+        isinstance(args.start_rollout_id, int)
+        and not isinstance(args.start_rollout_id, bool)
+        and args.start_rollout_id >= 0
+    ), "--rollout-weight-version-format=yeto-policy requires a non-negative integer start rollout ID"
+
+
 def miles_validate_args(args):
     validate_dashboard_args(args)
+
+    value_pretrain = args.value_pretrain_manifest is not None
+    from miles.backends.training_utils.sao import apply_sao_online_recipe
+
+    apply_sao_online_recipe(args)
+    if args.rollout_batch_size is None and not value_pretrain:
+        raise ValueError("--rollout-batch-size is required for online training")
+    # Offline value pretraining has no rollout actor.  Its exact batch size and
+    # save/load targets are derived from the critic flags below, but the shared
+    # validation path needs the aliases before its generic checkpoint handling.
+    if value_pretrain:
+        if args.load is None:
+            args.load = args.critic_load
+        if args.save is None:
+            args.save = args.critic_save
 
     args.ft_components = _resolve_ft_components(args)
     args.eval_datasets = _resolve_eval_datasets(args)
@@ -2709,6 +2904,33 @@ def miles_validate_args(args):
     if args.use_rollout_logprobs:
         assert not args.use_tis, "use_rollout_logprobs and use_tis cannot be set at the same time."
 
+    if args.policy_objective == "sao_dis":
+        if not 0 <= args.sao_dis_eps_low < 1:
+            raise ValueError("--sao-dis-eps-low must be in [0, 1)")
+        if args.sao_dis_eps_high <= 0:
+            raise ValueError("--sao-dis-eps-high must be positive")
+        if args.use_tis or args.get_mismatch_metrics or args.use_opsm:
+            raise ValueError("SAO DIS cannot be combined with TIS, mismatch correction, or OPSM")
+        # DIS directly compares the current learner with the policy that
+        # generated each token. Avoid the redundant old-policy scoring pass.
+        args.use_rollout_logprobs = True
+
+    if args.advantage_estimator == "gae_adaptive":
+        if not 0 <= args.critic_lambd <= 1:
+            raise ValueError("--critic-lambd must be in [0, 1]")
+        if args.gae_adaptive_alpha <= 0:
+            raise ValueError("--gae-adaptive-alpha must be positive")
+        if args.gae_adaptive_min_length < 0:
+            raise ValueError("--gae-adaptive-min-length must be non-negative")
+        if args.gae_adaptive_chunked_threshold < 1 or args.gae_adaptive_chunk_size < 1:
+            raise ValueError("adaptive GAE chunk sizes must be positive")
+    if args.num_critic_epochs < 1:
+        raise ValueError("--num-critic-epochs must be positive")
+    if args.critic_freeze_attention and not (
+        args.advantage_estimator in {"ppo", "gae_adaptive"} or value_pretrain
+    ):
+        raise ValueError("--critic-freeze-attention requires a critic")
+
     if args.get_mismatch_metrics:
         assert (
             args.custom_tis_function_path is not None
@@ -2752,7 +2974,18 @@ def miles_validate_args(args):
             "stay alive; it cannot be combined with --load-debug-rollout-data (debug_train_only)."
         )
 
-    args.use_critic = args.advantage_estimator == "ppo"
+    if args.value_pretrain_manifest_sha256 is not None and not value_pretrain:
+        raise ValueError("--value-pretrain-manifest-sha256 requires --value-pretrain-manifest")
+    if args.value_pretrain_epochs < 1:
+        raise ValueError("--value-pretrain-epochs must be positive")
+    if args.value_loss_type == "classification":
+        if args.value_num_bins < 2:
+            raise ValueError("classification value loss requires --value-num-bins >= 2")
+        if len(args.value_reward_range) != 2 or args.value_reward_range[0] >= args.value_reward_range[1]:
+            raise ValueError("--value-reward-range must satisfy LOW < HIGH")
+        if args.hl_gauss_sigma_ratio <= 0:
+            raise ValueError("--hl-gauss-sigma-ratio must be positive")
+    args.use_critic = args.advantage_estimator in {"ppo", "gae_adaptive"} or value_pretrain
     if args.critic_num_gpus_per_node is None:
         args.critic_num_gpus_per_node = args.actor_num_gpus_per_node
     if args.critic_num_nodes is None:
@@ -2761,6 +2994,53 @@ def miles_validate_args(args):
         args.critic_load = args.load
     if args.critic_lr is None:
         args.critic_lr = args.lr
+
+    if value_pretrain:
+        from miles.value_pretraining import (
+            apply_objective_to_args,
+            load_value_pretrain_manifest,
+            value_pretrain_num_steps,
+        )
+
+        if args.critic_save is None:
+            raise ValueError("--critic-save is required for offline value pretraining")
+        if args.global_batch_size is None:
+            raise ValueError("--global-batch-size is required for offline value pretraining")
+        manifest = load_value_pretrain_manifest(
+            args.value_pretrain_manifest,
+            expected_sha256=args.value_pretrain_manifest_sha256,
+        )
+        apply_objective_to_args(args, manifest.objective)
+        args.num_rollout = value_pretrain_num_steps(
+            num_samples=manifest.train.num_samples,
+            global_batch_size=args.global_batch_size,
+            epochs=args.value_pretrain_epochs,
+        )
+        # One exact global batch is one critic optimizer step.  These values
+        # keep Miles' existing LR scheduler and logging step math correct.
+        args.rollout_batch_size = args.global_batch_size
+        args.n_samples_per_prompt = 1
+        args.num_steps_per_rollout = 1
+        args.num_epoch = None
+        args.debug_train_only = True
+        args.critic_train_only = True
+        args.compute_advantages_and_returns = False
+        args.world_size = args.critic_num_nodes * args.critic_num_gpus_per_node
+
+    if args.critic_value_pretrain_contract_sha256 is not None:
+        from miles.value_pretraining import (
+            ValueObjective,
+            apply_objective_to_args,
+            load_value_pretrain_contract,
+        )
+
+        if args.critic_load is None:
+            raise ValueError("--critic-value-pretrain-contract-sha256 requires --critic-load")
+        contract = load_value_pretrain_contract(
+            args.critic_load,
+            expected_sha256=args.critic_value_pretrain_contract_sha256,
+        )
+        apply_objective_to_args(args, ValueObjective.from_dict(contract["objective"]))
 
     if args.offload:
         args.offload_train = True
@@ -2802,21 +3082,24 @@ def miles_validate_args(args):
         ), "P2P weight transfer mode has not been tested when PD is enabled."
         assert args.lora_rank <= 0, "LoRA weight sync is not supported for p2p (RDMA) weight transfer."
 
-    if getattr(args, "rollout_weight_version_format", "counter") == "yeto-policy":
+    _validate_rollout_weight_version_format(args)
+
+    if getattr(args, "allow_missing_unquantized_weight_update_hooks", False):
         assert args.bridge_distributed_weight_sync, (
-            "--rollout-weight-version-format=yeto-policy requires --bridge-distributed-weight-sync"
+            "--allow-missing-unquantized-weight-update-hooks requires "
+            "--bridge-distributed-weight-sync"
         )
         assert not args.colocate, (
-            "--rollout-weight-version-format=yeto-policy requires non-colocated rollout engines"
+            "--allow-missing-unquantized-weight-update-hooks requires "
+            "non-colocated rollout engines"
         )
         assert args.update_weight_transfer_mode == "broadcast", (
-            "--rollout-weight-version-format=yeto-policy requires --update-weight-transfer-mode=broadcast"
+            "--allow-missing-unquantized-weight-update-hooks requires "
+            "--update-weight-transfer-mode=broadcast"
         )
         assert args.lora_rank <= 0, (
-            "--rollout-weight-version-format=yeto-policy is only supported for full-parameter runs"
-        )
-        assert isinstance(args.start_rollout_id, int) and not isinstance(args.start_rollout_id, bool) and args.start_rollout_id >= 0, (
-            "--rollout-weight-version-format=yeto-policy requires a non-negative integer start rollout ID"
+            "--allow-missing-unquantized-weight-update-hooks is only supported "
+            "for full-parameter runs"
         )
 
     if args.update_weight_transfer_mode == "disk-delta":

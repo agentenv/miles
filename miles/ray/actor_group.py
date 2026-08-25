@@ -9,6 +9,22 @@ import ray
 from ray.util.placement_group import PlacementGroup
 
 from miles.backends.megatron_utils.trainable_state import TrainableState
+from miles.backends.megatron_utils.full_parameter_state import (
+    FULL_PARAMETER_DEFAULT_CHUNK_BYTES,
+    FullParameterLocalStepReceipt,
+    FullParameterOptimizerState,
+    FullParameterOwnerFragmentPlan,
+    FullParameterShardManifest,
+    FullParameterShardState,
+)
+from miles.ray.full_parameter_transport import (
+    FullParameterChunkedCut,
+    abort_prepared_chunked_cut,
+    apply_chunked_cut,
+    export_chunked_cut,
+    install_fragment_plans,
+    shard_manifests,
+)
 from miles.ray.train.actor_factory import allocate_gpus_for_actor
 from miles.utils.ft_utils.indep_dp import IndepDPInfo
 
@@ -111,6 +127,187 @@ class RayTrainGroup:
             raise RuntimeError("Megatron ranks disagree after applying trainable state")
         return results[0]
 
+    async def export_full_parameter_shards(
+        self,
+        policy_version: int,
+        local_step_generation: int = 0,
+    ) -> tuple[FullParameterShardState, ...]:
+        """Export one deterministic FP32 shard from every Megatron rank."""
+        results = await self._broadcast(
+            "export_full_parameter_shard",
+            policy_version,
+            local_step_generation,
+        )
+        if len(results) != len(self._actor_handles) or any(not isinstance(state, FullParameterShardState) for state in results):
+            raise RuntimeError("Megatron returned an incomplete full-parameter cut")
+        topologies = [state.topology for state in results]
+        if len(set(topologies)) != len(topologies):
+            raise RuntimeError("Megatron returned duplicate full-parameter shards")
+        return tuple(sorted(results, key=lambda state: state.topology))
+
+    async def full_parameter_shard_manifests(
+        self,
+    ) -> tuple[FullParameterShardManifest, ...]:
+        """Return topology/spec metadata without copying parameter payloads."""
+        return await shard_manifests(self)
+
+    async def install_full_parameter_fragment_plans(
+        self,
+        plans: tuple[FullParameterOwnerFragmentPlan, ...],
+    ) -> int:
+        """Install one exact-coverage fragment plan on every owner rank."""
+        return await install_fragment_plans(self, plans)
+
+    async def export_full_parameter_chunked_cut(
+        self,
+        policy_version: int,
+        local_step_generation: int = 0,
+        *,
+        max_chunk_bytes: int = FULL_PARAMETER_DEFAULT_CHUNK_BYTES,
+    ) -> FullParameterChunkedCut:
+        """Export only small descriptors and nested Ray ObjectRefs."""
+        return await export_chunked_cut(
+            self,
+            policy_version,
+            local_step_generation,
+            max_chunk_bytes=max_chunk_bytes,
+        )
+
+    async def apply_full_parameter_chunked_cut(
+        self,
+        cut: FullParameterChunkedCut,
+        *,
+        commit_token: str | None = None,
+        max_commit_attempts: int = 3,
+    ) -> int:
+        """Prepare, idempotently converge, then finalize every rank."""
+        return await apply_chunked_cut(
+            self,
+            cut,
+            commit_token=commit_token,
+            max_commit_attempts=max_commit_attempts,
+        )
+
+    async def abort_full_parameter_chunked_cut(
+        self,
+        commit_token: str,
+    ) -> tuple[object, ...]:
+        """Abort actor-local prepare contexts without deleting shared refs."""
+        return await abort_prepared_chunked_cut(self, commit_token)
+
+    async def record_full_parameter_local_step(
+        self,
+        *,
+        base_policy_version: int,
+        rollout_id: int,
+        max_receipt_attempts: int = 3,
+    ) -> tuple[FullParameterLocalStepReceipt, ...]:
+        """Record exact successful scheduler progress on every rank."""
+
+        if isinstance(max_receipt_attempts, bool) or not isinstance(max_receipt_attempts, int) or not 1 <= max_receipt_attempts <= 8:
+            raise ValueError("full-parameter receipt retry budget is invalid")
+        results = []
+        for _attempt in range(max_receipt_attempts):
+            results = list(
+                await asyncio.gather(
+                    *(
+                        actor.record_full_parameter_local_step.remote(
+                            base_policy_version,
+                            rollout_id,
+                        )
+                        for actor in self._actor_handles
+                    ),
+                    return_exceptions=True,
+                )
+            )
+            if all(isinstance(receipt, FullParameterLocalStepReceipt) for receipt in results):
+                break
+        else:
+            raise RuntimeError("Megatron local-step receipt is in doubt; learner must fail stop")
+        if len(results) != len(self._actor_handles) or any(not isinstance(receipt, FullParameterLocalStepReceipt) for receipt in results):
+            raise RuntimeError("Megatron returned incomplete local-step receipts")
+        topologies = [receipt.topology for receipt in results]
+        if len(set(topologies)) != len(topologies):
+            raise RuntimeError("Megatron returned duplicate local-step receipts")
+        progress = {
+            (
+                receipt.role,
+                receipt.base_policy_version,
+                receipt.local_step_generation,
+                receipt.rollout_id,
+                receipt.optimizer_steps,
+                receipt.scheduler_start_steps,
+                receipt.scheduler_end_steps,
+            )
+            for receipt in results
+        }
+        if len(progress) != 1:
+            raise RuntimeError("Megatron ranks disagree on local optimizer progress")
+        return tuple(sorted(results, key=lambda receipt: receipt.topology))
+
+    async def apply_full_parameter_shards(
+        self,
+        states: tuple[FullParameterShardState, ...],
+    ) -> int:
+        """Route a complete topology cut back to its owning Megatron ranks."""
+        if not states or len(states) != len(self._actor_handles):
+            raise RuntimeError("full-parameter cut does not cover every Megatron rank")
+        by_topology = {state.topology: state for state in states}
+        if len(by_topology) != len(states):
+            raise RuntimeError("full-parameter cut contains duplicate topologies")
+        topologies = await self._broadcast("full_parameter_topology")
+        if len(topologies) != len(self._actor_handles) or set(topologies) != set(by_topology):
+            raise RuntimeError("full-parameter cut topology does not match the actor group")
+        references = {topology: ray.put(by_topology[topology]) for topology in topologies}
+        validations = await asyncio.gather(
+            *(
+                actor.validate_full_parameter_shard.remote(references[topology])
+                for actor, topology in zip(
+                    self._actor_handles,
+                    topologies,
+                    strict=True,
+                )
+            )
+        )
+        if not validations or any(isinstance(value, bool) or not isinstance(value, int) or value < 1 for value in validations):
+            raise RuntimeError("Megatron ranks rejected full-parameter prevalidation")
+        results = await asyncio.gather(
+            *(
+                actor.apply_full_parameter_shard.remote(references[topology])
+                for actor, topology in zip(
+                    self._actor_handles,
+                    topologies,
+                    strict=True,
+                )
+            )
+        )
+        if not results or any(isinstance(value, bool) or not isinstance(value, int) or value < 1 for value in results):
+            raise RuntimeError("Megatron ranks rejected the full-parameter cut")
+        return sum(results)
+
+    async def full_parameter_optimizer_states(
+        self,
+    ) -> tuple[FullParameterOptimizerState, ...]:
+        """Return one bounded optimizer-progress proof from every rank."""
+
+        results = await self._broadcast("full_parameter_optimizer_state")
+        if len(results) != len(self._actor_handles) or any(not isinstance(state, FullParameterOptimizerState) for state in results):
+            raise RuntimeError("Megatron returned incomplete optimizer-state proofs")
+        topologies = [state.topology for state in results]
+        if len(set(topologies)) != len(topologies):
+            raise RuntimeError("Megatron returned duplicate optimizer-state proofs")
+        progress = {
+            (
+                state.installed_policy_version,
+                state.last_rollout_id,
+                state.scheduler_num_steps,
+            )
+            for state in results
+        }
+        if len(progress) != 1:
+            raise RuntimeError("Megatron ranks disagree on optimizer progress")
+        return tuple(sorted(results, key=lambda state: state.topology))
+
     async def save_model(self, rollout_id, force_sync=False):
         """Save actor model"""
         await self._broadcast("save_model", rollout_id, force_sync=force_sync)
@@ -146,10 +343,7 @@ class RayTrainGroup:
         await self._broadcast("clear_memory")
 
     async def connect(self, critic_group):
-        refs = [
-            actor.connect_actor_critic.remote(critic)
-            for actor, critic in zip(self._actor_handles, critic_group._actor_handles, strict=False)
-        ]
+        refs = [actor.connect_actor_critic.remote(critic) for actor, critic in zip(self._actor_handles, critic_group._actor_handles, strict=False)]
         await asyncio.gather(*refs)
 
     async def set_rollout_manager(self):

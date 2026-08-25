@@ -19,6 +19,55 @@ from miles.utils.tracking_utils.tracking import finish_tracking, init_tracking
 logger = logging.getLogger(__name__)
 
 
+async def _notify_external_policy_publication(
+    external_policy_sync,
+    *,
+    rollout_id,
+    actor_model,
+):
+    if external_policy_sync is None:
+        return
+    callback = getattr(external_policy_sync, "after_inference_publication", None)
+    if callback is not None:
+        await callback(rollout_id=rollout_id, actor_model=actor_model)
+
+
+def _load_external_policy_sync(args, *, critic_model):
+    """Construct a policy-sync backend and enforce its declared role support."""
+    if args.external_policy_sync_path is None:
+        return None
+    synchronizer = load_function(args.external_policy_sync_path)(args)
+    if critic_model is not None and not getattr(synchronizer, "supports_critic", False):
+        raise ValueError(
+            "the configured external policy synchronizer does not declare critic support"
+        )
+    return synchronizer
+
+
+async def _train_actor_and_critic(
+    actor_model,
+    critic_model,
+    rollout_id,
+    rollout_data_ref,
+):
+    """Train both roles concurrently and stop either one when its peer fails."""
+    critic_task = await eager_create_task(
+        critic_model.train(rollout_id, rollout_data_ref)
+    )
+    actor_task = await eager_create_task(
+        actor_model.train(rollout_id, rollout_data_ref)
+    )
+    tasks = (critic_task, actor_task)
+    try:
+        await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+
 async def train(args):
     configure_logger(args, source=MainProcessIdentity())
     maybe_start_periodic_pyspy_dump()
@@ -33,11 +82,8 @@ async def train(args):
     # create the actor and critic models
     actor_model, critic_model = await create_training_models(args, pgs, rollout_manager)
 
-    external_policy_sync = None
-    if args.external_policy_sync_path is not None:
-        if critic_model is not None:
-            raise ValueError("external policy synchronization does not support a critic")
-        external_policy_sync = load_function(args.external_policy_sync_path)(args)
+    external_policy_sync = _load_external_policy_sync(args, critic_model=critic_model)
+    if external_policy_sync is not None:
         if args.offload_train:
             await actor_model.onload()
         await external_policy_sync.initialize(
@@ -75,6 +121,11 @@ async def train(args):
 
     # always update weight first so that sglang has the loaded weights from training.
     await actor_model.update_weights()
+    await _notify_external_policy_publication(
+        external_policy_sync,
+        rollout_id=None,
+        actor_model=actor_model,
+    )
     if (
         external_policy_sync is not None
         and args.offload_train
@@ -139,10 +190,18 @@ async def train(args):
             await rollout_manager.offload.remote(tags=offload_tags)
 
         if args.use_critic:
-            critic_task = await eager_create_task(critic_model.train(rollout_id, rollout_data_ref))
             if rollout_id >= args.num_critic_only_steps:
-                await actor_model.train(rollout_id, rollout_data_ref)
-            await critic_task
+                await _train_actor_and_critic(
+                    actor_model,
+                    critic_model,
+                    rollout_id,
+                    rollout_data_ref,
+                )
+            else:
+                critic_task = await eager_create_task(
+                    critic_model.train(rollout_id, rollout_data_ref)
+                )
+                await critic_task
         else:
             await actor_model.train(rollout_id, rollout_data_ref)
 
@@ -170,6 +229,11 @@ async def train(args):
         if args.offload_rollout:
             await rollout_manager.onload_weights.remote()
         await actor_model.update_weights(rollout_id=rollout_id)
+        await _notify_external_policy_publication(
+            external_policy_sync,
+            rollout_id=rollout_id,
+            actor_model=actor_model,
+        )
         if args.offload_rollout:
             await rollout_manager.onload_kv.remote()
         if should_stop:

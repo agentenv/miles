@@ -1,6 +1,7 @@
 import gc
 import hashlib
 import logging
+import time
 from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
@@ -22,7 +23,12 @@ from miles.utils.distributed_utils import get_gloo_group
 from miles.utils.lora import LORA_ADAPTER_NAME
 
 from ..sglang import FlattenedTensorBucket, MultiprocessingSerializer
-from .common import _check_weight_sync_results, begin_weight_update, end_weight_update
+from .common import (
+    _check_weight_sync_results,
+    begin_weight_update,
+    end_weight_update,
+    format_published_weight_version,
+)
 from .hf_weight_iterator_base import HfWeightIteratorBase
 from .update_weight_from_distributed.broadcast import (
     connect_rollout_engines_from_distributed,
@@ -35,6 +41,32 @@ logger = logging.getLogger(__name__)
 _LORA_FLAT_BUCKET_MAX_BYTES = 256 * 1024 * 1024
 _LORA_FLAT_BUCKET_MAX_TENSORS = 1024
 _LORA_FLAT_BUCKET_MAX_THREADS = 16
+
+
+def _colocated_engine_count(
+    args: Namespace,
+    engine_gpu_offsets: Sequence[int],
+    engine_gpu_counts: Sequence[int],
+) -> int:
+    """Classify only true colocated engines; rollout offsets may be PG-relative."""
+
+    if getattr(args, "bridge_distributed_weight_sync", False):
+        if getattr(args, "colocate", False):
+            raise RuntimeError(
+                "Bridge distributed weight sync cannot use colocated engines"
+            )
+        return 0
+    total_actor_gpus = args.actor_num_nodes * args.actor_num_gpus_per_node
+    count = 0
+    for gpu_offset, gpu_count in zip(
+        engine_gpu_offsets,
+        engine_gpu_counts,
+        strict=True,
+    ):
+        if gpu_offset + gpu_count > total_actor_gpus:
+            break
+        count += 1
+    return count
 
 
 def _partition_lora_tensors(
@@ -145,17 +177,7 @@ class UpdateWeightFromTensor:
 
     def published_weight_version(self) -> str:
         """Return the exact version label attached to the current weights."""
-        version_format = getattr(self.args, "rollout_weight_version_format", "counter")
-        if version_format == "counter":
-            return str(self.weight_version)
-        if version_format != "yeto-policy":
-            raise RuntimeError(f"unsupported rollout weight version format: {version_format!r}")
-        if self.weight_version < 1:
-            raise RuntimeError("cannot publish a Yeto policy token before the first weight update")
-        start_rollout_id = getattr(self.args, "start_rollout_id", None)
-        if not isinstance(start_rollout_id, int) or isinstance(start_rollout_id, bool) or start_rollout_id < 0:
-            raise RuntimeError("Yeto policy token publication requires a non-negative integer start_rollout_id")
-        return f"yeto:{start_rollout_id + self.weight_version - 1}"
+        return format_published_weight_version(self.args, self.weight_version)
 
     # TODO: avoid dup code during yueming's refactor (temp write this to avoid introducing potentially conflicting base class)
     def is_rollout_engines_fresh(self) -> bool:
@@ -176,6 +198,8 @@ class UpdateWeightFromTensor:
         for distributed. Map ranks to colocated IPC engines.
         """
         self.rollout_engines = rollout_engines
+        self.all_rollout_engines = tuple(rollout_engines)
+        self.rollout_engine_lock = rollout_engine_lock
         self._connection_stale = False
 
         if engine_gpu_counts is None:
@@ -188,13 +212,14 @@ class UpdateWeightFromTensor:
                 engine_gpu_offsets.append(offset)
                 offset += c
 
-        # Compute colocated engine count: engines whose GPUs fall within actor GPU range.
-        total_actor_gpus = self.args.actor_num_nodes * self.args.actor_num_gpus_per_node
-        colocate_engine_nums = 0
-        for gpu_offset, gpu_count in zip(engine_gpu_offsets, engine_gpu_counts, strict=True):
-            if gpu_offset + gpu_count > total_actor_gpus:
-                break
-            colocate_engine_nums += 1
+        # RolloutServer offsets are relative to the rollout placement-group
+        # slice.  The explicit Bridge path is always non-colocated, so do not
+        # compare those relative offsets to actor-world ranks.
+        colocate_engine_nums = _colocated_engine_count(
+            self.args,
+            engine_gpu_offsets,
+            engine_gpu_counts,
+        )
 
         self.use_distribute = len(rollout_engines) > colocate_engine_nums
 
@@ -301,10 +326,17 @@ class UpdateWeightFromTensor:
 
         if rank == 0:
             mode = self.args.pause_generation_mode
-            ray.get([engine.pause_generation.remote(mode=mode) for engine in self.rollout_engines])
-            ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
+            ray.get(
+                [
+                    engine.pause_generation.remote(mode=mode)
+                    for engine in self.all_rollout_engines
+                ]
+            )
+            ray.get(
+                [engine.flush_cache.remote() for engine in self.all_rollout_engines]
+            )
             if not skip_base_sync:
-                begin_weight_update(self.rollout_engines)
+                begin_weight_update(self.all_rollout_engines)
         dist.barrier(group=get_gloo_group())
 
         megatron_local_weights = None
@@ -315,10 +347,15 @@ class UpdateWeightFromTensor:
             for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(
                 megatron_local_weights, weight_type="base"
             ):
-                refs, long_lived_tensors = self._send_base_params(hf_named_tensors)
-                results = ray.get(refs)
-                _check_weight_sync_results(results, is_lora=False)
-                del long_lived_tensors
+                try:
+                    refs, long_lived_tensors = self._send_base_params(
+                        hf_named_tensors
+                    )
+                    results = ray.get(refs)
+                    _check_weight_sync_results(results, is_lora=False)
+                    del long_lived_tensors
+                finally:
+                    self._release_distributed_engine_lock()
 
         if self.is_lora:
             # SGLang's load_lora_adapter_from_tensors expects the full adapter in
@@ -362,8 +399,13 @@ class UpdateWeightFromTensor:
         if rank == 0:
             # Skip when no fresh base bytes landed (skip_base_sync).
             if not skip_base_sync:
-                end_weight_update(self.rollout_engines)
-            ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
+                end_weight_update(self.all_rollout_engines)
+            ray.get(
+                [
+                    engine.continue_generation.remote()
+                    for engine in self.all_rollout_engines
+                ]
+            )
         dist.barrier(group=get_gloo_group())
 
     def _send_base_params(self, hf_named_tensors) -> tuple[list[ObjectRef], Any]:
@@ -376,16 +418,35 @@ class UpdateWeightFromTensor:
             weight_version=published_weight_version,
         )
         if self.use_distribute and self._is_distributed_src_rank:
-            refs_distributed = update_weights_from_distributed(
-                self._group_name,
-                self._model_update_groups,
-                published_weight_version,
-                self.distributed_rollout_engines,
-                hf_named_tensors,
-            )
+            self._acquire_distributed_engine_lock()
+            try:
+                refs_distributed = update_weights_from_distributed(
+                    self._group_name,
+                    self._model_update_groups,
+                    published_weight_version,
+                    self.distributed_rollout_engines,
+                    hf_named_tensors,
+                )
+            except BaseException:
+                self._release_distributed_engine_lock()
+                raise
             if refs_distributed:
                 refs = (refs or []) + refs_distributed
         return refs or [], long_lived_tensors
+
+    def _acquire_distributed_engine_lock(self) -> None:
+        if self.__dict__.get("_distributed_engine_lock_held", False):
+            raise RuntimeError("distributed rollout-engine lock is already held")
+        while not ray.get(self.rollout_engine_lock.acquire.remote()):
+            time.sleep(0.1)
+        self._distributed_engine_lock_held = True
+
+    def _release_distributed_engine_lock(self) -> None:
+        if not self.__dict__.pop("_distributed_engine_lock_held", False):
+            return
+        released = ray.get(self.rollout_engine_lock.release.remote())
+        if released is False:
+            raise RuntimeError("distributed rollout-engine lock release failed")
 
     def _send_lora_params(self, hf_named_tensors) -> tuple[list[ObjectRef], Any]:
         if not any(is_lora_weight_name(n) for n, _ in hf_named_tensors):

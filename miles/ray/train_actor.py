@@ -26,6 +26,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_TRAIN_MASTER_ROLE_PORT_OFFSET = {"actor": 0, "critic": 1000}
+_TRAIN_MASTER_CELL_PORT_STRIDE = 100
+
 
 def get_local_gpu_id():
     cvd = os.environ.get("CUDA_VISIBLE_DEVICES") or os.environ.get("HIP_VISIBLE_DEVICES")
@@ -62,6 +65,13 @@ class TrainRayActor(RayActor):
             start_port = getattr(args, "train_master_base_port", None)
             if start_port is None:
                 start_port = random.randint(20000, 21000)
+            else:
+                start_port += (
+                    _TRAIN_MASTER_ROLE_PORT_OFFSET[role]
+                    + cell_index * _TRAIN_MASTER_CELL_PORT_STRIDE
+                )
+                if start_port > 65535:
+                    raise ValueError("train master port range exceeds 65535")
             self.master_addr, self.master_port = self._get_current_node_ip_and_free_port(
                 start_port=start_port
             )

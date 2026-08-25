@@ -84,6 +84,29 @@ def get_rollout_data(
 
         rollout_data["max_seq_lens"] = [max_seq_len] * len(rollout_data["tokens"])
 
+    if "returns" in rollout_data:
+        rollout_data["returns"] = [
+            torch.as_tensor(
+                slice_log_prob_with_cp(
+                    value,
+                    total_length,
+                    response_length,
+                    args.qkv_format,
+                    rollout_data["max_seq_lens"][i] if args.qkv_format == "bshd" else None,
+                ),
+                device=torch.cuda.current_device(),
+                dtype=torch.float32,
+            )
+            for i, (value, total_length, response_length) in enumerate(
+                zip(
+                    rollout_data["returns"],
+                    rollout_data["total_lengths"],
+                    rollout_data["response_lengths"],
+                    strict=True,
+                )
+            )
+        ]
+
     # Full-response SGLang OPD fields share rollout CP slicing but retain float32 precision.
     for key in ("rollout_log_probs", "teacher_log_probs", "opd_reverse_kl"):
         if key in rollout_data:

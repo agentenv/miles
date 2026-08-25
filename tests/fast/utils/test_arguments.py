@@ -11,6 +11,7 @@ from miles.backends.sglang_utils.arguments import validate_args as validate_sgla
 from miles.utils.arguments import (
     _maybe_apply_dumper_overrides,
     _resolve_ft_components,
+    _validate_rollout_weight_version_format,
     get_miles_extra_args_provider,
     miles_validate_args,
 )
@@ -158,6 +159,98 @@ def test_custom_megatron_post_save_hook_path_is_parsed():
     args = parser.parse_args(["--custom-megatron-post-save-hook-path", "pkg.module.hook"] + REQUIRED_ARGS)
 
     assert args.custom_megatron_post_save_hook_path == "pkg.module.hook"
+
+
+def test_sao_online_algorithm_flags_are_parsed():
+    parser = argparse.ArgumentParser()
+    get_miles_extra_args_provider()(parser)
+
+    args = parser.parse_args(
+        [
+            "--advantage-estimator",
+            "gae_adaptive",
+            "--sao-online-recipe",
+            "coding",
+            "--policy-objective",
+            "sao_dis",
+            "--sao-dis-eps-low",
+            "0.8",
+            "--sao-dis-eps-high",
+            "3.0",
+            "--gae-adaptive-alpha",
+            "1.5",
+            "--num-critic-epochs",
+            "2",
+            "--critic-freeze-attention",
+        ]
+        + REQUIRED_ARGS
+    )
+
+    assert args.advantage_estimator == "gae_adaptive"
+    assert args.sao_online_recipe == "coding"
+    assert args.policy_objective == "sao_dis"
+    assert args.sao_dis_eps_low == 0.8
+    assert args.sao_dis_eps_high == 3.0
+    assert args.gae_adaptive_alpha == 1.5
+    assert args.gae_adaptive_min_length == 1
+    assert args.num_critic_epochs == 2
+    assert args.critic_freeze_attention is True
+
+
+def test_legacy_unquantized_weight_hook_compatibility_flag_is_parsed():
+    parser = argparse.ArgumentParser()
+    get_miles_extra_args_provider()(parser)
+
+    args = parser.parse_args(
+        ["--allow-missing-unquantized-weight-update-hooks"] + REQUIRED_ARGS
+    )
+
+    assert args.allow_missing_unquantized_weight_update_hooks is True
+
+
+def _yeto_policy_args(**overrides):
+    values = {
+        "rollout_weight_version_format": "yeto-policy",
+        "bridge_distributed_weight_sync": False,
+        "megatron_to_hf_mode": "raw",
+        "colocate": False,
+        "update_weight_transfer_mode": "broadcast",
+        "lora_rank": 0,
+        "start_rollout_id": 0,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        _yeto_policy_args(),
+        _yeto_policy_args(
+            bridge_distributed_weight_sync=True,
+            megatron_to_hf_mode="bridge",
+        ),
+    ],
+)
+def test_yeto_policy_version_format_accepts_reviewed_broadcast_paths(args):
+    _validate_rollout_weight_version_format(args)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"megatron_to_hf_mode": "bridge"}, "requires either"),
+        ({"bridge_distributed_weight_sync": True}, "requires either"),
+        ({"colocate": True}, "non-colocated"),
+        ({"update_weight_transfer_mode": "p2p"}, "broadcast"),
+        ({"lora_rank": 8}, "full-parameter"),
+        ({"start_rollout_id": -1}, "non-negative integer"),
+        ({"start_rollout_id": True}, "non-negative integer"),
+    ],
+)
+def test_yeto_policy_version_format_rejects_unsafe_modes(overrides, message):
+    with pytest.raises(AssertionError, match=message):
+        _validate_rollout_weight_version_format(_yeto_policy_args(**overrides))
 
 
 def test_custom_megatron_post_save_hook_path_requires_save():

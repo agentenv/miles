@@ -104,6 +104,30 @@ class RolloutManager:
     def get_router_address(self) -> tuple[str, int]:
         return self.args.sglang_router_ip, self.args.sglang_router_port
 
+    def set_external_policy_identity(
+        self,
+        policy_version: int,
+        policy_hash: str,
+    ) -> tuple[int, str]:
+        """Install the exact published-policy identity in this rollout process."""
+
+        setter_path = getattr(
+            self.args,
+            "external_policy_identity_setter_path",
+            None,
+        )
+        if not isinstance(setter_path, str) or not setter_path:
+            raise RuntimeError("external policy identity setter is not configured")
+        setter = load_function(setter_path)
+        identity = setter(
+            self.args,
+            policy_version=policy_version,
+            policy_hash=policy_hash,
+        )
+        if identity != (policy_version, policy_hash):
+            raise RuntimeError("external policy identity setter returned the wrong value")
+        return identity
+
     def dispose(self):
         if (close := getattr(self.data_source, "close", None)) is not None:
             close()

@@ -9,6 +9,12 @@ from miles.utils.timer import Timer
 from miles.utils.types import Sample
 
 
+def _validate_sao_train_data(args, data):
+    from miles.backends.training_utils.sao import validate_sao_train_data
+
+    validate_sao_train_data(args, data)
+
+
 def convert_samples_to_train_data(
     args,
     samples: list[Sample] | list[list[Sample]],
@@ -20,7 +26,9 @@ def convert_samples_to_train_data(
     Convert inference generated samples to training data.
     """
     if (f := custom_convert_samples_to_train_data_func) is not None:
-        return f(args, samples)
+        train_data = f(args, samples)
+        _validate_sao_train_data(args, train_data)
+        return train_data
 
     raw_rewards, rewards = _post_process_rewards(
         args,
@@ -115,6 +123,7 @@ def convert_samples_to_train_data(
     if x is not None:
         train_data["dynamic_global_batch_size"] = x
 
+    _validate_sao_train_data(args, train_data)
     return train_data
 
 
@@ -198,10 +207,13 @@ def split_train_data_by_dp_raw(args, data: dict[str, Any], *, dp_size: int) -> l
             "multimodal_train_inputs",
             "response_lengths",
             "rewards",
+            "returns",
+            "values",
             "truncated",
             "loss_masks",
             "round_number",
             "sample_indices",
+            "sample_ids",
             "rollout_log_probs",
             "rollout_routed_experts",
             "rollout_indexer_topk",
