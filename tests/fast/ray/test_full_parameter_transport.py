@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 import pytest
+import torch
 
 from miles.backends.megatron_utils.full_parameter_state import (
     FullParameterChunkDescriptor,
@@ -18,10 +19,14 @@ from miles.ray.full_parameter_transport import (
     FullParameterChunkedCut,
     apply_chunked_cut,
     assemble_full_parameter_chunked_target,
+    full_parameter_chunked_cut_content_identity,
+    full_parameter_chunked_cut_identity,
     full_parameter_commit_token,
     install_fragment_plans,
+    iter_full_parameter_authoritative_fragment_delta_parts,
     promote_full_parameter_chunked_cut,
     release_full_parameter_chunked_cut,
+    store_full_parameter_fragment_payload,
 )
 
 pytestmark = pytest.mark.asyncio
@@ -86,6 +91,67 @@ def _cut(*, policy_version: int, local_step_generation: int) -> FullParameterChu
                 local_step_generation=local_step_generation,
             ),
         ),
+    )
+
+
+class _FakeRay:
+    def __init__(self):
+        self.objects = {}
+
+    def put(self, value):
+        reference = object()
+        self.objects[reference] = value.detach().clone()
+        return reference
+
+    def get(self, reference):
+        return self.objects[reference]
+
+
+def _replace_fragment_row(
+    cut: FullParameterChunkedCut,
+    fragment_id: int,
+    descriptor: FullParameterFragmentDescriptor,
+    refs,
+) -> FullParameterChunkedCut:
+    shards = []
+    replaced = False
+    for shard in cut.shards:
+        fragments = list(shard.fragments)
+        chunk_refs = [list(row) for row in shard.chunk_refs]
+        for index, current in enumerate(fragments):
+            if current.fragment_id == fragment_id:
+                fragments[index] = descriptor
+                chunk_refs[index] = list(refs)
+                replaced = True
+        shards.append(
+            replace(
+                shard,
+                fragments=tuple(fragments),
+                chunk_refs=chunk_refs,
+            )
+        )
+    assert replaced
+    return replace(cut, shards=tuple(shards))
+
+
+def _split_fragment_template(
+    cut: FullParameterChunkedCut,
+    fragment_id: int,
+) -> FullParameterChunkedCut:
+    descriptor = FullParameterFragmentDescriptor(
+        fragment_id=fragment_id,
+        numel=4,
+        payload_hash="a" * 64,
+        chunks=(
+            FullParameterChunkDescriptor(0, 0, 2, "b" * 64),
+            FullParameterChunkDescriptor(1, 2, 2, "c" * 64),
+        ),
+    )
+    return _replace_fragment_row(
+        cut,
+        fragment_id,
+        descriptor,
+        (object(), object()),
     )
 
 
@@ -426,6 +492,192 @@ async def test_promote_reuses_refs_and_release_is_caller_local():
     assert all(reference is not None for shard in local.shards for references in shard.chunk_refs for reference in references)
     assert release_full_parameter_chunked_cut(promoted) == 0
     assert release_full_parameter_chunked_cut(local) == 2
+
+
+async def test_cut_content_identity_ignores_only_version_labels():
+    original = _cut(policy_version=7, local_step_generation=3)
+    relabeled = replace(
+        original,
+        policy_version=41,
+        local_step_generation=9,
+        shards=tuple(
+            replace(
+                shard,
+                policy_version=41,
+                local_step_generation=9,
+                chunk_refs=[list(refs) for refs in shard.chunk_refs],
+            )
+            for shard in original.shards
+        ),
+    )
+
+    assert (
+        full_parameter_chunked_cut_content_identity(original)
+        == full_parameter_chunked_cut_content_identity(relabeled)
+    )
+    assert full_parameter_chunked_cut_identity(original) != full_parameter_chunked_cut_identity(
+        relabeled
+    )
+
+    changed_descriptor = replace(
+        relabeled.shards[0].fragments[0],
+        payload_hash="e" * 64,
+    )
+    changed = _replace_fragment_row(
+        relabeled,
+        0,
+        changed_descriptor,
+        relabeled.shards[0].chunk_refs[0],
+    )
+    assert (
+        full_parameter_chunked_cut_content_identity(changed)
+        != full_parameter_chunked_cut_content_identity(original)
+    )
+
+
+async def test_authoritative_fragment_delta_supports_arbitrary_local_round():
+    ray = _FakeRay()
+    template = _split_fragment_template(
+        _cut(policy_version=17, local_step_generation=4),
+        0,
+    )
+    local_descriptor, local_refs = store_full_parameter_fragment_payload(
+        template,
+        0,
+        torch.tensor([5.0, 8.0, 13.0, 21.0], dtype=torch.float32)
+        .numpy()
+        .tobytes(),
+        ray_module=ray,
+    )
+    local = _replace_fragment_row(
+        template,
+        0,
+        local_descriptor,
+        local_refs,
+    )
+    authoritative_descriptor, authoritative_refs = (
+        store_full_parameter_fragment_payload(
+            template,
+            0,
+            torch.tensor([2.0, 3.0, 5.0, 8.0], dtype=torch.float32)
+            .numpy()
+            .tobytes(),
+            ray_module=ray,
+        )
+    )
+    owner = local.shards[0]
+
+    parts = list(
+        iter_full_parameter_authoritative_fragment_delta_parts(
+            local,
+            0,
+            authoritative_parameter_layout_hash=owner.parameter_layout_hash,
+            authoritative_topology=owner.topology,
+            authoritative_plan_hash=owner.plan_hash,
+            authoritative_descriptor=authoritative_descriptor,
+            authoritative_refs=authoritative_refs,
+            ray_module=ray,
+        )
+    )
+
+    assert len(parts) == 2
+    result = torch.frombuffer(
+        bytearray(b"".join(bytes(part) for part in parts)),
+        dtype=torch.float32,
+    ).clone()
+    assert torch.equal(result, torch.tensor([3.0, 5.0, 8.0, 13.0]))
+
+
+async def test_authoritative_fragment_delta_validates_every_identity_and_value():
+    ray = _FakeRay()
+    template = _split_fragment_template(
+        _cut(policy_version=23, local_step_generation=2),
+        0,
+    )
+    payload = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.float32)
+    descriptor, refs = store_full_parameter_fragment_payload(
+        template,
+        0,
+        payload.numpy().tobytes(),
+        ray_module=ray,
+    )
+    local = _replace_fragment_row(template, 0, descriptor, refs)
+    owner = local.shards[0]
+    kwargs = dict(
+        authoritative_parameter_layout_hash=owner.parameter_layout_hash,
+        authoritative_topology=owner.topology,
+        authoritative_plan_hash=owner.plan_hash,
+        authoritative_descriptor=descriptor,
+        authoritative_refs=refs,
+        ray_module=ray,
+    )
+
+    def consume(cut=local, **changes):
+        return list(
+            iter_full_parameter_authoritative_fragment_delta_parts(
+                cut,
+                0,
+                **(kwargs | changes),
+            )
+        )
+
+    with pytest.raises(ValueError, match="layout identity"):
+        consume(authoritative_parameter_layout_hash="8" * 64)
+    with pytest.raises(ValueError, match="topology identity"):
+        consume(authoritative_topology=_topology(1))
+    with pytest.raises(ValueError, match="plan identity"):
+        consume(authoritative_plan_hash="7" * 64)
+    with pytest.raises(ValueError, match="fragment identity"):
+        consume(authoritative_descriptor=local.shards[1].fragments[0])
+
+    changed_chunks = FullParameterFragmentDescriptor(
+        fragment_id=0,
+        numel=4,
+        payload_hash="d" * 64,
+        chunks=(
+            FullParameterChunkDescriptor(0, 0, 1, "e" * 64),
+            FullParameterChunkDescriptor(1, 1, 3, "f" * 64),
+        ),
+    )
+    with pytest.raises(ValueError, match="chunk identity"):
+        consume(
+            authoritative_descriptor=changed_chunks,
+            authoritative_refs=(object(), object()),
+        )
+    with pytest.raises(ValueError, match="refs are incomplete"):
+        consume(authoritative_refs=(refs[0], None))
+
+    no_progress = replace(
+        local,
+        local_step_generation=0,
+        shards=tuple(
+            replace(shard, local_step_generation=0)
+            for shard in local.shards
+        ),
+    )
+    with pytest.raises(ValueError, match="no optimizer progress"):
+        consume(no_progress)
+
+    nonfinite_refs = list(refs)
+    nonfinite_refs[0] = ray.put(
+        torch.tensor([float("nan"), 2.0], dtype=torch.float32)
+    )
+    with pytest.raises(ValueError, match="NaN or Inf"):
+        consume(authoritative_refs=nonfinite_refs)
+
+    changed_chunk_hash = replace(
+        descriptor,
+        chunks=(
+            replace(descriptor.chunks[0], payload_hash="0" * 64),
+            descriptor.chunks[1],
+        ),
+    )
+    with pytest.raises(ValueError, match="chunk hash changed"):
+        consume(authoritative_descriptor=changed_chunk_hash)
+
+    changed_fragment_hash = replace(descriptor, payload_hash="0" * 64)
+    with pytest.raises(ValueError, match="fragment hash changed"):
+        consume(authoritative_descriptor=changed_fragment_hash)
 
 
 async def test_assemble_target_maps_authoritative_refs_to_fragment_owners():

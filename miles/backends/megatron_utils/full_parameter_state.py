@@ -1028,7 +1028,11 @@ def _scheduler_num_steps(actor) -> int:
     return value
 
 
-def _optimizer_steps_per_local_round(actor) -> tuple[int, int]:
+def _optimizer_steps_per_local_round(
+    actor,
+    *,
+    role: str = "actor",
+) -> tuple[int, int]:
     optimizer_steps = getattr(actor.args, "num_steps_per_rollout", None)
     global_batch_size = getattr(actor.args, "global_batch_size", None)
     for name, value in (
@@ -1037,11 +1041,27 @@ def _optimizer_steps_per_local_round(actor) -> tuple[int, int]:
     ):
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise RuntimeError(f"full-parameter {name} is invalid")
+    if role == "critic":
+        critic_epochs = getattr(actor.args, "num_critic_epochs", 1)
+        if (
+            isinstance(critic_epochs, bool)
+            or not isinstance(critic_epochs, int)
+            or critic_epochs < 1
+        ):
+            raise RuntimeError("full-parameter critic epochs is invalid")
+        optimizer_steps *= critic_epochs
     return optimizer_steps, optimizer_steps * global_batch_size
 
 
-def _validate_scheduler_tracking_congruence(actor) -> None:
-    _optimizer_steps, scheduler_increment = _optimizer_steps_per_local_round(actor)
+def _validate_scheduler_tracking_congruence(
+    actor,
+    *,
+    role: str = "actor",
+) -> None:
+    _optimizer_steps, scheduler_increment = _optimizer_steps_per_local_round(
+        actor,
+        role=role,
+    )
     _installed, generation, _exported, anchor = _require_full_parameter_tracking(actor)
     if _scheduler_num_steps(actor) != anchor + generation * scheduler_increment:
         raise RuntimeError("full-parameter scheduler progress has no local-step receipt")
@@ -1155,7 +1175,10 @@ def record_full_parameter_local_step(
             return previous_receipt
     if isinstance(rollout_id, bool) or not isinstance(rollout_id, int) or rollout_id < 0 or getattr(actor, "_last_rollout_id", None) != rollout_id or (previous_rollout is not None and rollout_id <= previous_rollout):
         raise RuntimeError("full-parameter local step has invalid rollout progress")
-    optimizer_steps, scheduler_increment = _optimizer_steps_per_local_round(actor)
+    optimizer_steps, scheduler_increment = _optimizer_steps_per_local_round(
+        actor,
+        role=role,
+    )
     start = anchor + generation * scheduler_increment
     end = _scheduler_num_steps(actor)
     if end != start + scheduler_increment:
@@ -1194,7 +1217,7 @@ def export_full_parameter_shard(
     if is_lora_enabled(actor.args):
         raise RuntimeError("full-parameter DiLoCo cannot export a LoRA actor")
     assert_full_parameter_boundary_clear(actor)
-    _validate_scheduler_tracking_congruence(actor)
+    _validate_scheduler_tracking_congruence(actor, role=role)
     installed, generation, _exported, _anchor = _require_full_parameter_tracking(actor)
     if policy_version != installed:
         raise RuntimeError("full-parameter export policy version is not installed")
@@ -1224,7 +1247,7 @@ def validate_full_parameter_shard(
     if is_lora_enabled(actor.args):
         raise RuntimeError("full-parameter DiLoCo cannot validate a LoRA actor")
     assert_full_parameter_boundary_clear(actor)
-    _validate_scheduler_tracking_congruence(actor)
+    _validate_scheduler_tracking_congruence(actor, role=role)
     if state.local_step_generation != 0:
         raise RuntimeError("a global full-parameter cut cannot contain local steps")
     installed = getattr(actor, "_external_full_policy_version", -1)
@@ -1429,7 +1452,7 @@ def export_full_parameter_chunked_shard(
     if is_lora_enabled(actor.args):
         raise RuntimeError("full-parameter DiLoCo cannot export a LoRA actor")
     assert_full_parameter_boundary_clear(actor)
-    _validate_scheduler_tracking_congruence(actor)
+    _validate_scheduler_tracking_congruence(actor, role=role)
     _validate_non_negative_integer(policy_version, "policy version")
     _validate_non_negative_integer(
         local_step_generation,
@@ -1535,7 +1558,7 @@ def prepare_full_parameter_chunked_shard(
     if state.local_step_generation != 0:
         raise RuntimeError("a global full-parameter cut cannot contain local steps")
     installed, generation, exported, _anchor = _require_full_parameter_tracking(actor)
-    _validate_scheduler_tracking_congruence(actor)
+    _validate_scheduler_tracking_congruence(actor, role=role)
     if exported != generation:
         raise RuntimeError("full-parameter global apply has unexported local progress")
     if state.policy_version <= installed:

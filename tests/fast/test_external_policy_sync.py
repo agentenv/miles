@@ -160,6 +160,169 @@ async def test_external_policy_sync_requires_explicit_critic_capability(monkeypa
     assert isinstance(synchronizer, ActorCriticSync)
 
 
+async def test_exact_publication_callback_receives_weight_transfer_engine_set():
+    observed = []
+    actor = object()
+    publication_info = object()
+
+    class Sync:
+        requires_exact_publication_info = True
+
+        async def after_inference_publication(
+            self,
+            *,
+            rollout_id,
+            actor_model,
+            publication_info,
+        ):
+            observed.append((rollout_id, actor_model, publication_info))
+
+    sync = Sync()
+    await train_module._notify_external_policy_publication(
+        sync,
+        rollout_id=3,
+        actor_model=actor,
+        publication_info=publication_info,
+    )
+    assert observed == [(3, actor, publication_info)]
+
+    with pytest.raises(RuntimeError, match="exact weight-publication engines"):
+        await train_module._notify_external_policy_publication(
+            sync,
+            rollout_id=4,
+            actor_model=actor,
+        )
+
+
+async def test_critic_aware_external_sync_runs_after_actor_and_critic_train(monkeypatch):
+    import asyncio
+
+    events = []
+    values_ready = asyncio.Event()
+    actor_finished = asyncio.Event()
+    critic_finished = asyncio.Event()
+
+    class Actor:
+        async def update_weights(self, rollout_id=None):
+            events.append(("publish", rollout_id))
+
+        async def train(self, rollout_id, rollout_data):
+            await values_ready.wait()
+            events.append(("actor", rollout_id, rollout_data))
+            actor_finished.set()
+
+        async def clear_memory(self):
+            events.append("clear")
+
+    class Critic:
+        async def train(self, rollout_id, rollout_data):
+            events.append(("critic-values", rollout_id, rollout_data))
+            values_ready.set()
+            await actor_finished.wait()
+            events.append(("critic-updates", rollout_id))
+            critic_finished.set()
+
+    actor = Actor()
+    critic = Critic()
+    rollout = SimpleNamespace(
+        generate=_Remote(
+            lambda rollout_id: events.append(("rollout", rollout_id)) or "batch"
+        ),
+        dispose=_Remote(lambda: events.append("dispose")),
+    )
+
+    class Sync:
+        supports_critic = True
+
+        async def initialize(
+            self, *, actor_model, critic_model, rollout_manager
+        ):
+            assert actor_model is actor
+            assert critic_model is critic
+            assert rollout_manager is rollout
+            events.append("initialize")
+
+        async def after_local_train(
+            self,
+            *,
+            rollout_id,
+            actor_model,
+            critic_model,
+            rollout_data,
+        ):
+            assert actor_model is actor
+            assert critic_model is critic
+            assert rollout_data == "batch"
+            assert actor_finished.is_set()
+            assert critic_finished.is_set()
+            events.append(("sync", rollout_id))
+
+        async def finalize(self):
+            events.append("finalize")
+
+    async def eager_create_task(coro):
+        task = asyncio.create_task(coro)
+        await asyncio.sleep(0)
+        return task
+
+    monkeypatch.setattr(train_module, "configure_logger", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(train_module, "maybe_start_periodic_pyspy_dump", lambda: None)
+    monkeypatch.setattr(train_module, "maybe_start_mini_ft_controller", lambda _args: None)
+    monkeypatch.setattr(
+        train_module,
+        "create_placement_groups",
+        lambda _args: {"rollout": object()},
+    )
+    monkeypatch.setattr(
+        train_module,
+        "create_rollout_manager",
+        lambda *_args: (rollout, 1),
+    )
+
+    async def create_models(*_args):
+        return actor, critic
+
+    monkeypatch.setattr(train_module, "create_training_models", create_models)
+    monkeypatch.setattr(train_module, "eager_create_task", eager_create_task)
+    monkeypatch.setattr(train_module, "init_tracking", lambda _args: None)
+    monkeypatch.setattr(train_module, "load_function", lambda _path: lambda _args: Sync())
+    monkeypatch.setattr(train_module, "should_run_periodic_action", lambda *_args: False)
+
+    args = SimpleNamespace(
+        external_policy_sync_path="project.sync.create",
+        external_policy_sync_run_until_stop=False,
+        control_server_port=None,
+        offload_rollout=False,
+        check_weight_update_equal=False,
+        num_rollout=1,
+        eval_interval=None,
+        offload_train=False,
+        use_critic=True,
+        start_rollout_id=0,
+        num_critic_only_steps=0,
+        skip_eval_before_train=False,
+        save_trigger_sentinel=None,
+        save_interval=None,
+        debug_exit_after_rollout=None,
+    )
+
+    await train_module.train(args)
+
+    assert events == [
+        "initialize",
+        ("publish", None),
+        ("rollout", 0),
+        ("critic-values", 0, "batch"),
+        ("actor", 0, "batch"),
+        ("critic-updates", 0),
+        ("sync", 0),
+        "clear",
+        ("publish", 0),
+        "finalize",
+        "dispose",
+    ]
+
+
 async def test_centralized_actor_critic_publishes_only_after_both_train(monkeypatch):
     import asyncio
 
@@ -433,6 +596,150 @@ async def test_external_policy_sync_offloads_trainer_before_initial_rollout_onlo
         "finalize",
         "dispose",
     ]
+
+
+@pytest.mark.parametrize("offload_rollout", (False, True))
+async def test_critic_aware_external_sync_has_symmetric_initial_offload(
+    monkeypatch,
+    offload_rollout,
+):
+    events = []
+
+    class Actor:
+        awake = False
+
+        async def onload(self):
+            assert not self.awake
+            self.awake = True
+            events.append("actor_onload")
+
+        async def prepare_weight_update(self):
+            assert self.awake
+            events.append("actor_prepare")
+
+        async def offload(self):
+            assert self.awake
+            self.awake = False
+            events.append("actor_offload")
+
+        async def update_weights(self, rollout_id=None):
+            assert self.awake is (not offload_rollout)
+            events.append(("actor_publish", rollout_id))
+
+    class Critic:
+        awake = False
+
+        async def onload(self):
+            assert not self.awake
+            self.awake = True
+            events.append("critic_onload")
+
+        async def offload(self):
+            assert self.awake
+            self.awake = False
+            events.append("critic_offload")
+
+    actor = Actor()
+    critic = Critic()
+
+    def rollout_onload_weights():
+        assert not actor.awake
+        assert not critic.awake
+        events.append("rollout_onload_weights")
+
+    rollout = SimpleNamespace(
+        onload_weights=_Remote(rollout_onload_weights),
+        onload_kv=_Remote(lambda: events.append("rollout_onload_kv")),
+        dispose=_Remote(lambda: events.append("dispose")),
+    )
+
+    class Sync:
+        supports_critic = True
+
+        async def initialize(
+            self,
+            *,
+            actor_model,
+            critic_model,
+            rollout_manager,
+        ):
+            assert actor_model is actor
+            assert critic_model is critic
+            assert rollout_manager is rollout
+            assert actor_model.awake
+            assert critic_model.awake
+            events.append("initialize")
+
+        async def finalize(self):
+            assert not actor.awake
+            assert not critic.awake
+            events.append("finalize")
+
+    monkeypatch.setattr(train_module, "configure_logger", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(train_module, "maybe_start_periodic_pyspy_dump", lambda: None)
+    monkeypatch.setattr(train_module, "maybe_start_mini_ft_controller", lambda _args: None)
+    monkeypatch.setattr(
+        train_module,
+        "create_placement_groups",
+        lambda _args: {"rollout": object()},
+    )
+    monkeypatch.setattr(
+        train_module,
+        "create_rollout_manager",
+        lambda *_args: (rollout, 1),
+    )
+
+    async def create_models(*_args):
+        return actor, critic
+
+    monkeypatch.setattr(train_module, "create_training_models", create_models)
+    monkeypatch.setattr(train_module, "init_tracking", lambda _args: None)
+    monkeypatch.setattr(train_module, "load_function", lambda _path: lambda _args: Sync())
+
+    args = SimpleNamespace(
+        external_policy_sync_path="project.sync.create",
+        external_policy_sync_run_until_stop=False,
+        control_server_port=None,
+        offload_rollout=offload_rollout,
+        offload_train=True,
+        check_weight_update_equal=False,
+        num_rollout=0,
+        eval_interval=None,
+        use_critic=True,
+        start_rollout_id=0,
+        skip_eval_before_train=False,
+    )
+
+    await train_module.train(args)
+
+    expected = [
+        "actor_onload",
+        "critic_onload",
+        "initialize",
+    ]
+    if offload_rollout:
+        expected.extend(
+            [
+                "actor_prepare",
+                "actor_offload",
+                "critic_offload",
+                "rollout_onload_weights",
+                ("actor_publish", None),
+                "rollout_onload_kv",
+            ]
+        )
+    else:
+        expected.extend(
+            [
+                ("actor_publish", None),
+                "actor_offload",
+                "critic_offload",
+            ]
+        )
+    expected.extend(["finalize", "dispose"])
+    assert events == expected
+    assert not actor.awake
+    assert not critic.awake
 
 
 async def test_external_policy_sync_stops_only_after_final_weight_publication(

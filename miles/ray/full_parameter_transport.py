@@ -30,6 +30,9 @@ from miles.backends.megatron_utils.full_parameter_state import (
 )
 
 
+_CUT_CONTENT_IDENTITY_DOMAIN = b"miles-full-parameter-chunked-cut-content-v1\0"
+
+
 @dataclass(frozen=True)
 class FullParameterChunkedCut:
     """Complete cut descriptor whose tensor bytes remain in nested ObjectRefs."""
@@ -85,6 +88,23 @@ def full_parameter_chunked_cut_identity(cut: FullParameterChunkedCut) -> str:
     digest = hashlib.sha256(b"miles-full-parameter-chunked-cut-v1\0")
     for state in cut.shards:
         digest.update(full_parameter_chunked_shard_identity(state).encode("ascii"))
+    return digest.hexdigest()
+
+
+def full_parameter_chunked_cut_content_identity(
+    cut: FullParameterChunkedCut,
+) -> str:
+    """Hash cut content and owner metadata independently of version labels."""
+
+    _validate_chunked_cut(cut)
+    digest = hashlib.sha256(_CUT_CONTENT_IDENTITY_DOMAIN)
+    for state in cut.shards:
+        normalized = replace(
+            state,
+            policy_version=0,
+            local_step_generation=0,
+        )
+        digest.update(full_parameter_chunked_shard_identity(normalized).encode("ascii"))
     return digest.hexdigest()
 
 
@@ -201,6 +221,95 @@ def iter_full_parameter_fragment_delta_parts(
             raise ValueError("full-parameter delta contains NaN or Inf")
         yield _tensor_bytes(delta)
         del anchor_value, local_value, delta
+
+
+def iter_full_parameter_authoritative_fragment_delta_parts(
+    local_cut: FullParameterChunkedCut,
+    fragment_id: int,
+    *,
+    authoritative_parameter_layout_hash: str,
+    authoritative_topology: FullParameterTopology,
+    authoritative_plan_hash: str,
+    authoritative_descriptor: FullParameterFragmentDescriptor,
+    authoritative_refs: Sequence[object | None],
+    ray_module=None,
+):
+    """Yield bounded FP32 ``local - authoritative`` parts for any local round."""
+
+    local_shard, local_descriptor, local_refs = _fragment_row(
+        local_cut,
+        fragment_id,
+    )
+    if local_cut.local_step_generation < 1:
+        raise ValueError("full-parameter local cut has no optimizer progress")
+    if authoritative_parameter_layout_hash != local_cut.parameter_layout_hash:
+        raise ValueError("full-parameter authoritative layout identity changed")
+    if not isinstance(authoritative_topology, FullParameterTopology) or authoritative_topology != local_shard.topology:
+        raise ValueError("full-parameter authoritative topology identity changed")
+    if authoritative_plan_hash != local_shard.plan_hash:
+        raise ValueError("full-parameter authoritative plan identity changed")
+    if not isinstance(
+        authoritative_descriptor,
+        FullParameterFragmentDescriptor,
+    ):
+        raise TypeError("full-parameter authoritative fragment is malformed")
+    if authoritative_descriptor.fragment_id != local_descriptor.fragment_id or authoritative_descriptor.numel != local_descriptor.numel or len(authoritative_descriptor.chunks) != len(local_descriptor.chunks):
+        raise ValueError("full-parameter authoritative fragment identity changed")
+    if not isinstance(authoritative_refs, Sequence) or isinstance(
+        authoritative_refs,
+        (str, bytes, bytearray, memoryview),
+    ):
+        raise TypeError("full-parameter authoritative fragment refs are malformed")
+    if len(authoritative_refs) != len(authoritative_descriptor.chunks) or any(reference is None for reference in authoritative_refs):
+        raise ValueError("full-parameter authoritative fragment refs are incomplete")
+
+    ray_module = _resolve_ray_module(ray_module)
+    local_fragment_hash = _fragment_hasher(
+        fragment_id,
+        local_shard.parameter_layout_hash,
+        local_shard.plan_hash,
+    )
+    authoritative_fragment_hash = _fragment_hasher(
+        fragment_id,
+        authoritative_parameter_layout_hash,
+        authoritative_plan_hash,
+    )
+    for local_chunk, local_ref, authoritative_chunk, authoritative_ref in zip(
+        local_descriptor.chunks,
+        local_refs,
+        authoritative_descriptor.chunks,
+        authoritative_refs,
+        strict=True,
+    ):
+        if local_chunk.chunk_index != authoritative_chunk.chunk_index or local_chunk.flat_offset != authoritative_chunk.flat_offset or local_chunk.numel != authoritative_chunk.numel:
+            raise ValueError("full-parameter authoritative chunk identity changed")
+        local_value = _validate_cpu_chunk(
+            ray_module.get(local_ref),
+            local_chunk,
+            fragment_id=fragment_id,
+            verify_values=True,
+            parameter_layout_hash=local_shard.parameter_layout_hash,
+            plan_hash=local_shard.plan_hash,
+        )
+        authoritative_value = _validate_cpu_chunk(
+            ray_module.get(authoritative_ref),
+            authoritative_chunk,
+            fragment_id=fragment_id,
+            verify_values=True,
+            parameter_layout_hash=authoritative_parameter_layout_hash,
+            plan_hash=authoritative_plan_hash,
+        )
+        local_fragment_hash.update(_tensor_bytes(local_value))
+        authoritative_fragment_hash.update(_tensor_bytes(authoritative_value))
+        delta = local_value.sub(authoritative_value)
+        if not torch.isfinite(delta).all().item():
+            raise ValueError("full-parameter authoritative delta contains NaN or Inf")
+        yield _tensor_bytes(delta)
+        del local_value, authoritative_value, delta
+    if local_fragment_hash.hexdigest() != local_descriptor.payload_hash:
+        raise ValueError("full-parameter local fragment hash changed")
+    if authoritative_fragment_hash.hexdigest() != authoritative_descriptor.payload_hash:
+        raise ValueError("full-parameter authoritative fragment hash changed")
 
 
 def store_full_parameter_fragment_payload(

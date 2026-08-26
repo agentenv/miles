@@ -267,6 +267,7 @@ class RayTrainGroup:
         )
 
         await self._maybe_log_inference_engine_weight_checksums(rollout_id=rollout_id)
+        return info
 
     async def prepare_weight_update(self):
         await self._execute_all_alive_and_catch("prepare_weight_update")

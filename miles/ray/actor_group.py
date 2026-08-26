@@ -324,6 +324,7 @@ class RayTrainGroup:
         await self.rollout_manager.health_monitoring_pause.remote()
 
         await self._broadcast("update_weights", info=info)
+        return info
 
     async def prepare_weight_update(self):
         await self._broadcast("prepare_weight_update")

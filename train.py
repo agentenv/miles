@@ -24,12 +24,24 @@ async def _notify_external_policy_publication(
     *,
     rollout_id,
     actor_model,
+    publication_info=None,
 ):
     if external_policy_sync is None:
         return
     callback = getattr(external_policy_sync, "after_inference_publication", None)
     if callback is not None:
-        await callback(rollout_id=rollout_id, actor_model=actor_model)
+        kwargs = dict(rollout_id=rollout_id, actor_model=actor_model)
+        if getattr(
+            external_policy_sync,
+            "requires_exact_publication_info",
+            False,
+        ):
+            if publication_info is None:
+                raise RuntimeError(
+                    "external policy identity requires the exact weight-publication engines"
+                )
+            kwargs["publication_info"] = publication_info
+        await callback(**kwargs)
 
 
 def _load_external_policy_sync(args, *, critic_model):
@@ -86,10 +98,15 @@ async def train(args):
     if external_policy_sync is not None:
         if args.offload_train:
             await actor_model.onload()
-        await external_policy_sync.initialize(
+            if critic_model is not None:
+                await critic_model.onload()
+        initialize_kwargs = dict(
             actor_model=actor_model,
             rollout_manager=rollout_manager,
         )
+        if critic_model is not None:
+            initialize_kwargs["critic_model"] = critic_model
+        await external_policy_sync.initialize(**initialize_kwargs)
 
     if args.control_server_port:
         start_control_server(
@@ -114,17 +131,20 @@ async def train(args):
         # otherwise exceed GPU capacity before the first rollout.
         await actor_model.prepare_weight_update()
         await actor_model.offload()
+        if critic_model is not None:
+            await critic_model.offload()
         initial_train_offloaded = True
 
     if args.offload_rollout:
         await rollout_manager.onload_weights.remote()
 
     # always update weight first so that sglang has the loaded weights from training.
-    await actor_model.update_weights()
+    publication_info = await actor_model.update_weights()
     await _notify_external_policy_publication(
         external_policy_sync,
         rollout_id=None,
         actor_model=actor_model,
+        publication_info=publication_info,
     )
     if (
         external_policy_sync is not None
@@ -132,6 +152,8 @@ async def train(args):
         and not initial_train_offloaded
     ):
         await actor_model.offload()
+        if critic_model is not None:
+            await critic_model.offload()
 
     if args.check_weight_update_equal:
         await rollout_manager.check_weights.remote(
@@ -207,11 +229,18 @@ async def train(args):
 
         should_stop = False
         if external_policy_sync is not None:
-            should_stop = bool(await external_policy_sync.after_local_train(
+            after_local_train_kwargs = dict(
                 rollout_id=rollout_id,
                 actor_model=actor_model,
                 rollout_data=rollout_data_ref,
-            ))
+            )
+            if critic_model is not None:
+                after_local_train_kwargs["critic_model"] = critic_model
+            should_stop = bool(
+                await external_policy_sync.after_local_train(
+                    **after_local_train_kwargs
+                )
+            )
 
         external_save = args.save_trigger_sentinel is not None and os.path.exists(args.save_trigger_sentinel)
         if external_save or should_run_periodic_action(
@@ -228,11 +257,12 @@ async def train(args):
         await offload_train()
         if args.offload_rollout:
             await rollout_manager.onload_weights.remote()
-        await actor_model.update_weights(rollout_id=rollout_id)
+        publication_info = await actor_model.update_weights(rollout_id=rollout_id)
         await _notify_external_policy_publication(
             external_policy_sync,
             rollout_id=rollout_id,
             actor_model=actor_model,
+            publication_info=publication_info,
         )
         if args.offload_rollout:
             await rollout_manager.onload_kv.remote()

@@ -367,6 +367,68 @@ def test_local_step_generation_keeps_global_base_until_complete_apply(monkeypatc
         )
 
 
+@pytest.mark.parametrize(
+    ("role", "expected_optimizer_steps"),
+    (("actor", 2), ("critic", 6)),
+)
+def test_local_step_receipt_uses_role_aware_optimizer_progress(
+    monkeypatch,
+    role,
+    expected_optimizer_steps,
+):
+    named = parameters()
+    for _name, parameter in named:
+        parameter.data.copy_(parameter.main_param.to(dtype=parameter.dtype))
+    masters = [parameter.main_param for _name, parameter in named]
+    actor = SimpleNamespace(
+        args=SimpleNamespace(
+            lora_rank=0,
+            lora_adapter_path=None,
+            num_steps_per_rollout=2,
+            num_critic_epochs=3,
+            global_batch_size=4,
+        ),
+        optimizer=SimpleNamespace(
+            optimizer=SimpleNamespace(
+                param_groups=[{"params": masters}],
+                state={},
+            )
+        ),
+        opt_param_scheduler=SimpleNamespace(num_steps=0),
+        _last_rollout_id=0,
+    )
+    monkeypatch.setattr(
+        "miles.backends.megatron_utils.full_parameter_state._named_actor_parameters",
+        lambda _actor: named,
+    )
+    monkeypatch.setattr(
+        "miles.backends.megatron_utils.full_parameter_state.full_parameter_topology",
+        topology,
+    )
+
+    initialize_full_parameter_tracking(actor, 0)
+    actor.opt_param_scheduler.num_steps = expected_optimizer_steps * 4
+    receipt = record_full_parameter_local_step(
+        actor,
+        base_policy_version=0,
+        rollout_id=0,
+        role=role,
+    )
+
+    assert receipt.role == role
+    assert receipt.optimizer_steps == expected_optimizer_steps
+    assert receipt.scheduler_start_steps == 0
+    assert receipt.scheduler_end_steps == expected_optimizer_steps * 4
+
+    exported = export_full_parameter_shard(
+        actor,
+        policy_version=0,
+        local_step_generation=1,
+        role=role,
+    )
+    assert {spec.role for spec in exported.specs} == {role}
+
+
 def test_local_step_receipt_rejects_normal_without_scheduler_progress(monkeypatch):
     named = parameters()
     masters = [parameter.main_param for _name, parameter in named]
