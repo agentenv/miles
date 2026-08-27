@@ -60,18 +60,13 @@ def sort_key(x):
     return (node_ip_parts, gpu_id)
 
 
-def _require_minimum_gpu_memory(
-    gpu_infos: list[tuple[str, float, int]], minimum_bytes: int
-) -> None:
+def _require_minimum_gpu_memory(gpu_infos: list[tuple[str, float, int]], minimum_bytes: int) -> None:
     insufficient = [
-        (node, gpu_id, total_memory)
-        for node, gpu_id, total_memory in gpu_infos
-        if total_memory < minimum_bytes
+        (node, gpu_id, total_memory) for node, gpu_id, total_memory in gpu_infos if total_memory < minimum_bytes
     ]
     if insufficient:
         details = ", ".join(
-            f"{node}/gpu-{gpu_id}: {total_memory / 1024**3:.1f} GiB"
-            for node, gpu_id, total_memory in insufficient
+            f"{node}/gpu-{gpu_id}: {total_memory / 1024**3:.1f} GiB" for node, gpu_id, total_memory in insufficient
         )
         raise RuntimeError(
             "--sao-one-gpu-island requires at least "
@@ -99,16 +94,9 @@ def _create_placement_group(num_gpus, *, minimum_gpu_memory_bytes: int | None = 
         )
     try:
         if minimum_gpu_memory_bytes is None:
-            gpu_ids = ray.get(
-                [actor.get_ip_and_gpu_id.remote() for actor in info_actors]
-            )
+            gpu_ids = ray.get([actor.get_ip_and_gpu_id.remote() for actor in info_actors])
         else:
-            gpu_infos = ray.get(
-                [
-                    actor.get_ip_gpu_id_and_total_memory.remote()
-                    for actor in info_actors
-                ]
-            )
+            gpu_infos = ray.get([actor.get_ip_gpu_id_and_total_memory.remote() for actor in info_actors])
             _require_minimum_gpu_memory(gpu_infos, minimum_gpu_memory_bytes)
             gpu_ids = [(node, gpu_id) for node, gpu_id, _total_memory in gpu_infos]
     finally:
@@ -170,9 +158,7 @@ def create_placement_groups(args):
     logger.info(f"Creating placement group with {num_gpus} GPUs...")
     pg, actor_pg_reordered_bundle_indices, actor_pg_reordered_gpu_ids = _create_placement_group(
         num_gpus,
-        minimum_gpu_memory_bytes=(
-            _SAO_ONE_GPU_ISLAND_MIN_MEMORY_BYTES if one_gpu_sao_island else None
-        ),
+        minimum_gpu_memory_bytes=(_SAO_ONE_GPU_ISLAND_MIN_MEMORY_BYTES if one_gpu_sao_island else None),
     )
 
     rollout_pg_reordered_bundle_indices = actor_pg_reordered_bundle_indices[rollout_offset:]
@@ -241,7 +227,7 @@ async def create_training_models(args, pgs, rollout_manager):
         await actor_model.connect(critic_model)
 
     await actor_model.set_rollout_manager()
-    if args.rollout_global_dataset:
+    if args.rollout_global_dataset and not getattr(args, "rollout_only_from_checkpoint", False):
         await rollout_manager.load.remote(args.start_rollout_id - 1)
 
     return actor_model, critic_model

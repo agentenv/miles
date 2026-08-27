@@ -60,7 +60,11 @@ def _private_key_file(path: Path) -> Path:
         value = resolved.read_bytes().rstrip(b"\r\n")
     except OSError as error:
         raise LaunchError("Terminal-Bench HMAC key is unreadable") from error
-    if not stat.S_ISREG(information.st_mode) or stat.S_IMODE(information.st_mode) not in {0o400, 0o600} or not 32 <= len(value) <= 4096:
+    if (
+        not stat.S_ISREG(information.st_mode)
+        or stat.S_IMODE(information.st_mode) not in {0o400, 0o600}
+        or not 32 <= len(value) <= 4096
+    ):
         raise LaunchError("Terminal-Bench HMAC key is not private and bounded")
     return resolved
 
@@ -82,7 +86,14 @@ def _plan_shards(plan_dir: Path, phase: str) -> list[Path]:
     topology = manifest.get("topology")
     rollouts = manifest.get("rollouts")
     files = manifest.get("files")
-    if not isinstance(topology, dict) or topology.get("islands") != ISLANDS or topology.get("one_physical_gpu_per_island") is not True or not isinstance(rollouts, dict) or rollouts.get("episode_timeout_seconds") != 1800 or not isinstance(files, dict):
+    if (
+        not isinstance(topology, dict)
+        or topology.get("islands") != ISLANDS
+        or topology.get("one_physical_gpu_per_island") is not True
+        or not isinstance(rollouts, dict)
+        or rollouts.get("episode_timeout_seconds") != 1800
+        or not isinstance(files, dict)
+    ):
         raise LaunchError("Terminal-Bench plan topology drifted")
     expected_counts = {"baseline": {44, 45}, "eval": {22, 23}}
     shards = []
@@ -90,7 +101,12 @@ def _plan_shards(plan_dir: Path, phase: str) -> list[Path]:
         relative = f"{phase}/island-{island_id}.jsonl"
         path = plan_dir / relative
         expected_hash = files.get(relative)
-        if not path.is_file() or path.is_symlink() or not isinstance(expected_hash, str) or _sha256(path) != expected_hash:
+        if (
+            not path.is_file()
+            or path.is_symlink()
+            or not isinstance(expected_hash, str)
+            or _sha256(path) != expected_hash
+        ):
             raise LaunchError(f"plan shard is missing or changed: {relative}")
         try:
             rows = [json.loads(line) for line in path.read_text().splitlines() if line]
@@ -237,6 +253,7 @@ def _container_argv(
         str(island_id),
         "--phase",
         phase,
+        *(["--serve-ref-checkpoint"] if phase == "eval" else []),
         "--prompt-data",
         f"/root/plan/{phase}/island-{island_id}.jsonl",
         "--dump-details",
@@ -341,12 +358,18 @@ def launch(args: argparse.Namespace) -> dict[str, Any]:
         "gpus": gpus,
         "model": str(model),
         "checkpoint": str(checkpoint),
+        "served_policy": {
+            "mode": ("actor-checkpoint-publication" if args.phase == "eval" else "direct-hf-checkpoint"),
+            "hf_bootstrap": str(model),
+            "actor_checkpoint": (str(checkpoint) if args.phase == "eval" else None),
+            "weight_equality_required": args.phase == "eval",
+            "bootstrap_difference_required": args.phase == "eval",
+            "publication_evidence": ("checkpoint-publication.json" if args.phase == "eval" else None),
+        },
         "plan_dir": str(plan_dir),
         "codex_binary_sha256": _sha256(codex_binary),
         "hmac_key_file_mode": oct(stat.S_IMODE(hmac_key.stat().st_mode)),
-        "per_island_rollout_seeds": [
-            ROLLOUT_SEED_BASE + island_id for island_id in range(ISLANDS)
-        ],
+        "per_island_rollout_seeds": [ROLLOUT_SEED_BASE + island_id for island_id in range(ISLANDS)],
         "docker_bridge_gateway": bridge_gateway,
         "containers": records,
     }
@@ -358,7 +381,9 @@ def launch(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "manifest": str(manifest_path),
         "containers": names,
-        "monitor": ("watch -n 10 'docker ps -a --filter label=yeto.run=tbench21-sao-rollout --format \"table {{.Names}}\\t{{.Status}}\"'"),
+        "monitor": (
+            "watch -n 10 'docker ps -a --filter label=yeto.run=tbench21-sao-rollout --format \"table {{.Names}}\\t{{.Status}}\"'"
+        ),
     }
 
 

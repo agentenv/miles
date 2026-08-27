@@ -98,7 +98,9 @@ class _FakePolicy:
     async def _create(self, **kw):
         self.n += 1
         text = "```bash\necho hi\n```" if self.n == 1 else "TASK_COMPLETE"
-        msg = types.SimpleNamespace(content=text, model_dump=lambda exclude_none=True: {"role": "assistant", "content": text})
+        msg = types.SimpleNamespace(
+            content=text, model_dump=lambda exclude_none=True: {"role": "assistant", "content": text}
+        )
         return types.SimpleNamespace(choices=[types.SimpleNamespace(message=msg)])
 
 
@@ -167,6 +169,20 @@ def test_with_env_never_replays_after_admission():
     assert body_calls == 1
 
 
+def test_trial_dir_purge_is_bounded_when_server_action_stalls(monkeypatch):
+    class BlockingEnv:
+        async def step(self, _action):
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(oaf, "_PURGE_TIMEOUT_S", 0.01)
+    run_async(
+        asyncio.wait_for(
+            oaf._purge_trial_dirs(BlockingEnv(), _FakeAction),
+            timeout=0.1,
+        )
+    )
+
+
 # --- episode dispatch ------------------------------------------------------
 
 
@@ -181,7 +197,9 @@ def test_shared_leg_dispatch(monkeypatch):
 
     monkeypatch.setattr(oaf, "_with_env", spying_with_env)
 
-    reward, metrics = run_async(oaf.run_episode(_FakePolicy(), "m", [{"role": "system", "content": "s"}], {}, {"task_id": "t1"}))
+    reward, metrics = run_async(
+        oaf.run_episode(_FakePolicy(), "m", [{"role": "system", "content": "s"}], {}, {"task_id": "t1"})
+    )
     actions = _FakeEnv.last_actions
     execs = [a for a in actions if a.action_type == "exec"]
 
@@ -203,7 +221,9 @@ def test_shared_leg_can_use_native_terminal_bench_verifier(monkeypatch):
 
     monkeypatch.setattr(oaf, "_with_env", spying_with_env)
 
-    reward, metrics = run_async(oaf.run_episode(_FakePolicy(), "m", [{"role": "system", "content": "s"}], {}, {"task_id": "t1"}))
+    reward, metrics = run_async(
+        oaf.run_episode(_FakePolicy(), "m", [{"role": "system", "content": "s"}], {}, {"task_id": "t1"})
+    )
     actions = _FakeEnv.last_actions
     execs = [a for a in actions if a.action_type == "exec"]
 

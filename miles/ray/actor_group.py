@@ -8,7 +8,6 @@ import asyncio
 import ray
 from ray.util.placement_group import PlacementGroup
 
-from miles.backends.megatron_utils.trainable_state import TrainableState
 from miles.backends.megatron_utils.full_parameter_state import (
     FULL_PARAMETER_DEFAULT_CHUNK_BYTES,
     FullParameterLocalStepReceipt,
@@ -17,6 +16,7 @@ from miles.backends.megatron_utils.full_parameter_state import (
     FullParameterShardManifest,
     FullParameterShardState,
 )
+from miles.backends.megatron_utils.trainable_state import TrainableState
 from miles.ray.full_parameter_transport import (
     FullParameterChunkedCut,
     abort_prepared_chunked_cut,
@@ -102,6 +102,14 @@ class RayTrainGroup:
             attempt=0,
         )
 
+    async def evaluate_critic(self, rollout_id, rollout_data_pack):
+        """Run one optimizer-free critic evaluation batch on every DP rank."""
+        return await self._broadcast(
+            "evaluate_critic",
+            rollout_id,
+            rollout_data_pack["data_ref"],
+        )
+
     async def export_trainable_state(self) -> TrainableState:
         """Export replicated trainable state from the Megatron main rank."""
         results = await self._broadcast("export_trainable_state")
@@ -138,7 +146,9 @@ class RayTrainGroup:
             policy_version,
             local_step_generation,
         )
-        if len(results) != len(self._actor_handles) or any(not isinstance(state, FullParameterShardState) for state in results):
+        if len(results) != len(self._actor_handles) or any(
+            not isinstance(state, FullParameterShardState) for state in results
+        ):
             raise RuntimeError("Megatron returned an incomplete full-parameter cut")
         topologies = [state.topology for state in results]
         if len(set(topologies)) != len(topologies):
@@ -204,7 +214,11 @@ class RayTrainGroup:
     ) -> tuple[FullParameterLocalStepReceipt, ...]:
         """Record exact successful scheduler progress on every rank."""
 
-        if isinstance(max_receipt_attempts, bool) or not isinstance(max_receipt_attempts, int) or not 1 <= max_receipt_attempts <= 8:
+        if (
+            isinstance(max_receipt_attempts, bool)
+            or not isinstance(max_receipt_attempts, int)
+            or not 1 <= max_receipt_attempts <= 8
+        ):
             raise ValueError("full-parameter receipt retry budget is invalid")
         results = []
         for _attempt in range(max_receipt_attempts):
@@ -224,7 +238,9 @@ class RayTrainGroup:
                 break
         else:
             raise RuntimeError("Megatron local-step receipt is in doubt; learner must fail stop")
-        if len(results) != len(self._actor_handles) or any(not isinstance(receipt, FullParameterLocalStepReceipt) for receipt in results):
+        if len(results) != len(self._actor_handles) or any(
+            not isinstance(receipt, FullParameterLocalStepReceipt) for receipt in results
+        ):
             raise RuntimeError("Megatron returned incomplete local-step receipts")
         topologies = [receipt.topology for receipt in results]
         if len(set(topologies)) != len(topologies):
@@ -269,7 +285,9 @@ class RayTrainGroup:
                 )
             )
         )
-        if not validations or any(isinstance(value, bool) or not isinstance(value, int) or value < 1 for value in validations):
+        if not validations or any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 1 for value in validations
+        ):
             raise RuntimeError("Megatron ranks rejected full-parameter prevalidation")
         results = await asyncio.gather(
             *(
@@ -291,7 +309,9 @@ class RayTrainGroup:
         """Return one bounded optimizer-progress proof from every rank."""
 
         results = await self._broadcast("full_parameter_optimizer_state")
-        if len(results) != len(self._actor_handles) or any(not isinstance(state, FullParameterOptimizerState) for state in results):
+        if len(results) != len(self._actor_handles) or any(
+            not isinstance(state, FullParameterOptimizerState) for state in results
+        ):
             raise RuntimeError("Megatron returned incomplete optimizer-state proofs")
         topologies = [state.topology for state in results]
         if len(set(topologies)) != len(topologies):
@@ -344,7 +364,10 @@ class RayTrainGroup:
         await self._broadcast("clear_memory")
 
     async def connect(self, critic_group):
-        refs = [actor.connect_actor_critic.remote(critic) for actor, critic in zip(self._actor_handles, critic_group._actor_handles, strict=False)]
+        refs = [
+            actor.connect_actor_critic.remote(critic)
+            for actor, critic in zip(self._actor_handles, critic_group._actor_handles, strict=False)
+        ]
         await asyncio.gather(*refs)
 
     async def set_rollout_manager(self):

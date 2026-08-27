@@ -179,6 +179,12 @@ def _parse_testsh_rc(output: str) -> int | None:
 # exec, and evaluate (pytest) each routinely exceed the EnvClient default of 60s.
 _MESSAGE_TIMEOUT_S = float(os.getenv("OPENENV_MESSAGE_TIMEOUT_S", "600"))
 
+# Cleanup must never extend a cancelled episode by another full message
+# timeout. In docker mode an in-flight native verifier can still occupy the
+# session after the client coroutine is cancelled; bounding this best-effort
+# purge lets the environment context close and tear down that verifier.
+_PURGE_TIMEOUT_S = 10.0
+
 # Hard wall-clock cap for one episode. The per-message timeout above bounds a
 # single env op, and OPENENV_MAX_TURNS bounds the turn count, but neither bounds
 # total episode time: a long agentic trajectory can loop for turns * (long
@@ -306,11 +312,21 @@ async def _purge_trial_dirs(env: Any, action_cls: Any) -> None:
     # step time. Preserve repo_cache; delete only the ephemeral per-trial
     # dirs beside it.
     try:
-        await env.step(
-            action_cls(
-                action_type="exec",
-                command=("find /tmp/tbench2_env_runs -mindepth 1 -maxdepth 1 ! -name repo_cache -exec rm -rf {} + 2>/dev/null || true"),
-            )
+        await asyncio.wait_for(
+            env.step(
+                action_cls(
+                    action_type="exec",
+                    command=(
+                        "find /tmp/tbench2_env_runs -mindepth 1 -maxdepth 1 ! -name repo_cache -exec rm -rf {} + 2>/dev/null || true"
+                    ),
+                )
+            ),
+            timeout=_PURGE_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "OpenEnv trial-dir purge exceeded %.0fs; continuing session teardown",
+            _PURGE_TIMEOUT_S,
         )
     except Exception:
         pass
@@ -396,7 +412,9 @@ async def _multi_turn(
         while turns < max_turns:
             turns += 1
             t0 = time.monotonic()
-            completion = await policy.chat.completions.create(model=model_name, messages=convo, extra_body=request_kwargs)
+            completion = await policy.chat.completions.create(
+                model=model_name, messages=convo, extra_body=request_kwargs
+            )
             gen_times.append(time.monotonic() - t0)
             message = completion.choices[0].message
             reply = message.content or ""
@@ -562,7 +580,9 @@ async def _run_for_training(
     # (infra/harness failure, not a legitimate task failure). Drop the sample --
     # returning it as reward 0.0 would inject a false negative into training.
     if reward is None:
-        logger.warning(f"OpenEnv tbench2 episode produced no canonical reward (test.sh exit code={agent_metrics.get('testsh_rc')}); infra/harness failure, dropping sample")
+        logger.warning(
+            f"OpenEnv tbench2 episode produced no canonical reward (test.sh exit code={agent_metrics.get('testsh_rc')}); infra/harness failure, dropping sample"
+        )
         return None
 
     # eval_report is intentionally empty: the canonical-eval marker protocol

@@ -1254,6 +1254,32 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--value-pretrain-eval-only",
+                action="store_true",
+                help=(
+                    "Load a contracted critic and run deterministic mixed-label "
+                    "forward-only explained-variance evaluation."
+                ),
+            )
+            parser.add_argument(
+                "--value-pretrain-eval-num-batches",
+                type=int,
+                default=8,
+                help="Number of disjoint mixed-label batches in the critic EV gate.",
+            )
+            parser.add_argument(
+                "--value-pretrain-eval-split",
+                choices=["train", "heldout"],
+                default="train",
+                help="Manifest split used by forward-only critic evaluation.",
+            )
+            parser.add_argument(
+                "--value-pretrain-eval-report",
+                type=str,
+                default=None,
+                help="Fresh absolute JSON report written by the critic EV gate.",
+            )
+            parser.add_argument(
                 "--critic-value-pretrain-contract-sha256",
                 type=str,
                 default=None,
@@ -1937,6 +1963,27 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "Whether to only run the rollout generation without training. "
                     "This is useful for debugging the rollout generation function."
+                ),
+            )
+            parser.add_argument(
+                "--rollout-only-from-checkpoint",
+                action="store_true",
+                default=False,
+                help=(
+                    "Load the actor checkpoint, publish its weights to the rollout "
+                    "engines, generate rollouts, and skip all training and saving. "
+                    "Unlike --debug-rollout-only, this instantiates the actor so the "
+                    "served policy is the requested checkpoint."
+                ),
+            )
+            parser.add_argument(
+                "--rollout-only-publication-evidence",
+                type=str,
+                default=None,
+                help=(
+                    "Fresh absolute JSON path where checkpoint-backed rollout-only "
+                    "mode records its base-vs-trained checksum change and exact "
+                    "snapshot/reset/republish verification."
                 ),
             )
             parser.add_argument(
@@ -2647,26 +2694,18 @@ def _validate_rollout_weight_version_format(args: argparse.Namespace) -> None:
     if getattr(args, "rollout_weight_version_format", "counter") != "yeto-policy":
         return
 
-    uses_bridge_broadcast = (
-        args.bridge_distributed_weight_sync and args.megatron_to_hf_mode == "bridge"
-    )
-    uses_raw_broadcast = (
-        not args.bridge_distributed_weight_sync and args.megatron_to_hf_mode == "raw"
-    )
+    uses_bridge_broadcast = args.bridge_distributed_weight_sync and args.megatron_to_hf_mode == "bridge"
+    uses_raw_broadcast = not args.bridge_distributed_weight_sync and args.megatron_to_hf_mode == "raw"
     assert uses_bridge_broadcast or uses_raw_broadcast, (
         "--rollout-weight-version-format=yeto-policy requires either "
         "--megatron-to-hf-mode=raw or --bridge-distributed-weight-sync with "
         "--megatron-to-hf-mode=bridge"
     )
-    assert not args.colocate, (
-        "--rollout-weight-version-format=yeto-policy requires non-colocated rollout engines"
-    )
-    assert args.update_weight_transfer_mode == "broadcast", (
-        "--rollout-weight-version-format=yeto-policy requires --update-weight-transfer-mode=broadcast"
-    )
-    assert args.lora_rank <= 0, (
-        "--rollout-weight-version-format=yeto-policy is only supported for full-parameter runs"
-    )
+    assert not args.colocate, "--rollout-weight-version-format=yeto-policy requires non-colocated rollout engines"
+    assert (
+        args.update_weight_transfer_mode == "broadcast"
+    ), "--rollout-weight-version-format=yeto-policy requires --update-weight-transfer-mode=broadcast"
+    assert args.lora_rank <= 0, "--rollout-weight-version-format=yeto-policy is only supported for full-parameter runs"
     assert (
         isinstance(args.start_rollout_id, int)
         and not isinstance(args.start_rollout_id, bool)
@@ -2729,9 +2768,7 @@ def _validate_sao_one_gpu_island(args: argparse.Namespace) -> None:
     ]
     for name, expected in _SAO_ONE_GPU_ISLAND_MODEL_SHAPE.items():
         if getattr(args, name, None) != expected:
-            mismatches.append(
-                f"{name}={getattr(args, name, None)!r} (required {expected!r})"
-            )
+            mismatches.append(f"{name}={getattr(args, name, None)!r} (required {expected!r})")
 
     if getattr(args, "lora_rank", 0) > 0:
         mismatches.append("lora_rank must be <= 0 for full-parameter SAO")
@@ -2742,14 +2779,8 @@ def _validate_sao_one_gpu_island(args: argparse.Namespace) -> None:
 
     for name in ("seq_length", "max_seq_len", "sglang_context_length"):
         value = getattr(args, name, None)
-        if (
-            not isinstance(value, int)
-            or isinstance(value, bool)
-            or not 1 <= value <= _SAO_ONE_GPU_ISLAND_MAX_CONTEXT
-        ):
-            mismatches.append(
-                f"{name}={value!r} (required 1..{_SAO_ONE_GPU_ISLAND_MAX_CONTEXT})"
-            )
+        if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= _SAO_ONE_GPU_ISLAND_MAX_CONTEXT:
+            mismatches.append(f"{name}={value!r} (required 1..{_SAO_ONE_GPU_ISLAND_MAX_CONTEXT})")
 
     max_running = getattr(args, "sglang_max_running_requests", None)
     if (
@@ -2758,40 +2789,33 @@ def _validate_sao_one_gpu_island(args: argparse.Namespace) -> None:
         or not 1 <= max_running <= _SAO_ONE_GPU_ISLAND_MAX_INFERENCE_CONCURRENCY
     ):
         mismatches.append(
-            "sglang_max_running_requests must be in "
-            f"1..{_SAO_ONE_GPU_ISLAND_MAX_INFERENCE_CONCURRENCY}"
+            "sglang_max_running_requests must be in " f"1..{_SAO_ONE_GPU_ISLAND_MAX_INFERENCE_CONCURRENCY}"
         )
     async_concurrency = getattr(args, "async_max_concurrent_samples", None)
     if async_concurrency is not None and (
         not isinstance(async_concurrency, int)
         or isinstance(async_concurrency, bool)
-        or not 1
-        <= async_concurrency
-        <= _SAO_ONE_GPU_ISLAND_MAX_INFERENCE_CONCURRENCY
+        or not 1 <= async_concurrency <= _SAO_ONE_GPU_ISLAND_MAX_INFERENCE_CONCURRENCY
     ):
         mismatches.append(
-            "async_max_concurrent_samples must be unset or in "
-            f"1..{_SAO_ONE_GPU_ISLAND_MAX_INFERENCE_CONCURRENCY}"
+            "async_max_concurrent_samples must be unset or in " f"1..{_SAO_ONE_GPU_ISLAND_MAX_INFERENCE_CONCURRENCY}"
         )
     memory_fraction = getattr(args, "sglang_mem_fraction_static", None)
-    if not isinstance(memory_fraction, (int, float)) or isinstance(
-        memory_fraction, bool
-    ) or not 0.0 < float(memory_fraction) <= 0.50:
+    if (
+        not isinstance(memory_fraction, (int, float))
+        or isinstance(memory_fraction, bool)
+        or not 0.0 < float(memory_fraction) <= 0.50
+    ):
         mismatches.append("sglang_mem_fraction_static must be in (0, 0.50]")
     if mismatches:
-        raise ValueError(
-            "--sao-one-gpu-island rejected an unvalidated topology: "
-            + "; ".join(mismatches)
-        )
+        raise ValueError("--sao-one-gpu-island rejected an unvalidated topology: " + "; ".join(mismatches))
 
 
 def _validate_rollout_one_pass_no_replacement(args) -> None:
     if not args.rollout_one_pass_no_replacement:
         return
 
-    required_rollout_function = (
-        "miles.rollout.inference_rollout.inference_rollout_common.InferenceRolloutFn"
-    )
+    required_rollout_function = "miles.rollout.inference_rollout.inference_rollout_common.InferenceRolloutFn"
     permitted_data_sources = {
         "miles.rollout.data_source.RolloutDataSource",
         "miles.rollout.data_source.RolloutDataSourceWithBuffer",
@@ -2800,9 +2824,7 @@ def _validate_rollout_one_pass_no_replacement(args) -> None:
     if not args.rollout_global_dataset:
         mismatches.append("the global rollout dataset must be enabled")
     if args.rollout_function_path != required_rollout_function:
-        mismatches.append(
-            f"rollout_function_path must be {required_rollout_function}"
-        )
+        mismatches.append(f"rollout_function_path must be {required_rollout_function}")
     if args.data_source_path not in permitted_data_sources:
         mismatches.append("data_source_path must be a built-in rollout data source")
     if args.num_epoch is not None or args.num_rollout != 1:
@@ -2819,15 +2841,130 @@ def _validate_rollout_one_pass_no_replacement(args) -> None:
         mismatches.append("rollout_all_samples_process_path must be unset")
     if mismatches:
         raise ValueError(
-            "--rollout-one-pass-no-replacement rejected an unsafe configuration: "
-            + "; ".join(mismatches)
+            "--rollout-one-pass-no-replacement rejected an unsafe configuration: " + "; ".join(mismatches)
         )
+
+
+def _validate_rollout_only_from_checkpoint(args) -> None:
+    """Fail closed unless checkpoint-backed rollout-only mode is auditable."""
+
+    if not getattr(args, "rollout_only_from_checkpoint", False):
+        return
+
+    mismatches: list[str] = []
+    requirements = {
+        "train_backend": "megatron",
+        "colocate": True,
+        "offload_train": True,
+        "offload_rollout": True,
+        "rollout_weight_version_format": "counter",
+        "multi_lora": False,
+        "bridge_distributed_weight_sync": False,
+        "keep_old_actor": False,
+        "use_opd": False,
+    }
+    mismatches.extend(
+        f"{name} must equal {expected!r}"
+        for name, expected in requirements.items()
+        if getattr(args, name, None) != expected
+    )
+    if args.debug_rollout_only or args.debug_train_only:
+        mismatches.append("debug_rollout_only and debug_train_only must both be disabled")
+    if not args.debug_disable_optimizer:
+        mismatches.append("debug_disable_optimizer must be enabled")
+    if not args.no_load_optim or not args.no_load_rng or not args.finetune:
+        mismatches.append("no_load_optim, no_load_rng, and finetune must be enabled")
+    if args.check_weight_update_equal:
+        mismatches.append("check_weight_update_equal must be disabled because it snapshots the HF bootstrap")
+    if args.debug_skip_weight_update:
+        mismatches.append("debug_skip_weight_update must be disabled")
+    if args.use_critic:
+        mismatches.append("use_critic must be disabled")
+    if args.external_policy_sync_path is not None:
+        mismatches.append("external_policy_sync_path must be unset")
+    if args.eval_interval is not None:
+        mismatches.append("eval_interval must be unset")
+    if args.save_interval is not None or args.save_trigger_sentinel is not None:
+        mismatches.append("checkpoint saving must be disabled")
+    if args.start_rollout_id != 0:
+        mismatches.append("start_rollout_id must equal 0")
+    if args.num_rollout != 1:
+        mismatches.append("num_rollout must equal 1")
+    if not args.rollout_one_pass_no_replacement:
+        mismatches.append("rollout_one_pass_no_replacement must be enabled")
+    if args.load_debug_rollout_data is not None:
+        mismatches.append("load_debug_rollout_data must be unset")
+    if getattr(args, "lora_rank", 0) > 0:
+        mismatches.append("lora_rank must be <= 0")
+    if getattr(args, "dist_ckpt_strictness", None) != "raise_unexpected":
+        mismatches.append("dist_ckpt_strictness must equal 'raise_unexpected'")
+    if getattr(args, "ckpt_step", None) is not None or getattr(args, "ref_ckpt_step", None) is not None:
+        mismatches.append("ckpt_step and ref_ckpt_step must both be unset")
+    if getattr(args, "control_server_port", 0) not in {0, None} or getattr(args, "mini_ft_controller_enable", False):
+        mismatches.append("control server and mini FT controller must be disabled")
+    if getattr(args, "ft_components", []):
+        mismatches.append("ft_components must be empty")
+    if (
+        getattr(args, "kl_coef", 0) != 0
+        or getattr(args, "kl_loss_coef", 0) != 0
+        or getattr(args, "use_kl_loss", False)
+    ):
+        mismatches.append("KL/reference-policy features must be disabled")
+    if any(
+        getattr(args, name, None) is not None
+        for name in (
+            "save",
+            "save_hf",
+            "custom_megatron_post_save_hook_path",
+        )
+    ):
+        mismatches.append("model-save targets and post-save hooks must be unset")
+
+    ref_load = getattr(args, "ref_load", None)
+    if not isinstance(ref_load, str) or not os.path.isdir(ref_load):
+        mismatches.append("ref_load must be a Megatron checkpoint directory")
+    else:
+        marker = os.path.join(ref_load, "latest_checkpointed_iteration.txt")
+        if not os.path.isfile(marker) or os.path.islink(marker):
+            mismatches.append("ref_load must contain a real latest_checkpointed_iteration.txt")
+        else:
+            try:
+                with open(marker, encoding="utf-8") as stream:
+                    iteration = stream.read().strip()
+            except (OSError, UnicodeError):
+                iteration = None
+            if iteration != "0":
+                mismatches.append("ref_load latest checkpoint iteration must equal 0")
+
+    effective_load = getattr(args, "load", None)
+    if not isinstance(effective_load, str) or not os.path.isdir(effective_load):
+        mismatches.append("effective load must be a checkpoint directory")
+    elif (
+        isinstance(ref_load, str)
+        and os.path.isdir(ref_load)
+        and os.path.realpath(ref_load) != os.path.realpath(effective_load)
+    ):
+        mismatches.append("effective load must resolve to ref_load")
+
+    evidence_raw = getattr(args, "rollout_only_publication_evidence", None)
+    if not isinstance(evidence_raw, str) or not os.path.isabs(evidence_raw):
+        mismatches.append("rollout_only_publication_evidence must be an absolute path")
+    else:
+        evidence_parent = os.path.dirname(evidence_raw)
+        if os.path.lexists(evidence_raw) or not os.path.isdir(evidence_parent) or os.path.islink(evidence_parent):
+            mismatches.append("rollout_only_publication_evidence must be fresh under a real directory")
+
+    if mismatches:
+        raise ValueError("--rollout-only-from-checkpoint rejected an unsafe configuration: " + "; ".join(mismatches))
 
 
 def miles_validate_args(args):
     validate_dashboard_args(args)
 
     value_pretrain = args.value_pretrain_manifest is not None
+    value_pretrain_eval = bool(args.value_pretrain_eval_only)
+    if value_pretrain_eval and not value_pretrain:
+        raise ValueError("--value-pretrain-eval-only requires --value-pretrain-manifest")
     from miles.backends.training_utils.sao import apply_sao_online_recipe
 
     apply_sao_online_recipe(args)
@@ -2839,7 +2976,7 @@ def miles_validate_args(args):
     if value_pretrain:
         if args.load is None:
             args.load = args.critic_load
-        if args.save is None:
+        if not value_pretrain_eval and args.save is None:
             args.save = args.critic_save
 
     args.ft_components = _resolve_ft_components(args)
@@ -3123,9 +3260,7 @@ def miles_validate_args(args):
             raise ValueError("adaptive GAE chunk sizes must be positive")
     if args.num_critic_epochs < 1:
         raise ValueError("--num-critic-epochs must be positive")
-    if args.critic_freeze_attention and not (
-        args.advantage_estimator in {"ppo", "gae_adaptive"} or value_pretrain
-    ):
+    if args.critic_freeze_attention and not (args.advantage_estimator in {"ppo", "gae_adaptive"} or value_pretrain):
         raise ValueError("--critic-freeze-attention requires a critic")
 
     if args.get_mismatch_metrics:
@@ -3175,6 +3310,8 @@ def miles_validate_args(args):
         raise ValueError("--value-pretrain-manifest-sha256 requires --value-pretrain-manifest")
     if args.value_pretrain_canary_one_step and not value_pretrain:
         raise ValueError("--value-pretrain-canary-one-step requires --value-pretrain-manifest")
+    if args.value_pretrain_eval_report is not None and not value_pretrain_eval:
+        raise ValueError("--value-pretrain-eval-report requires --value-pretrain-eval-only")
     if args.value_pretrain_epochs < 1:
         raise ValueError("--value-pretrain-epochs must be positive")
     if args.value_pretrain_canary_one_step and args.value_pretrain_epochs != 1:
@@ -3203,8 +3340,6 @@ def miles_validate_args(args):
             value_pretrain_num_steps,
         )
 
-        if args.critic_save is None:
-            raise ValueError("--critic-save is required for offline value pretraining")
         if args.global_batch_size is None:
             raise ValueError("--global-batch-size is required for offline value pretraining")
         manifest = load_value_pretrain_manifest(
@@ -3212,18 +3347,72 @@ def miles_validate_args(args):
             expected_sha256=args.value_pretrain_manifest_sha256,
         )
         apply_objective_to_args(args, manifest.objective)
-        args.value_pretrain_full_steps = value_pretrain_num_steps(
-            num_samples=manifest.train.num_samples,
-            global_batch_size=args.global_batch_size,
-            epochs=args.value_pretrain_epochs,
-        )
+        if value_pretrain_eval:
+            if args.value_pretrain_canary_one_step:
+                raise ValueError(
+                    "--value-pretrain-eval-only cannot be combined with " "--value-pretrain-canary-one-step"
+                )
+            if args.value_pretrain_epochs != 1:
+                raise ValueError("--value-pretrain-eval-only requires --value-pretrain-epochs 1")
+            if args.value_pretrain_eval_num_batches < 1:
+                raise ValueError("--value-pretrain-eval-num-batches must be positive")
+            if args.global_batch_size < 2:
+                raise ValueError("--value-pretrain-eval-only requires --global-batch-size >= 2")
+            if args.value_pretrain_eval_report is None:
+                raise ValueError("--value-pretrain-eval-only requires --value-pretrain-eval-report")
+            if not os.path.isabs(args.value_pretrain_eval_report):
+                raise ValueError("--value-pretrain-eval-report must be an absolute path")
+            report_parent = os.path.dirname(args.value_pretrain_eval_report)
+            if (
+                os.path.lexists(args.value_pretrain_eval_report)
+                or not os.path.isdir(report_parent)
+                or os.path.islink(report_parent)
+            ):
+                raise ValueError("--value-pretrain-eval-report must be fresh under a real directory")
+            if args.critic_load is None:
+                raise ValueError("--value-pretrain-eval-only requires --critic-load")
+            if args.critic_value_pretrain_contract_sha256 is None:
+                raise ValueError("--value-pretrain-eval-only requires " "--critic-value-pretrain-contract-sha256")
+            if args.critic_save is not None or args.save is not None:
+                raise ValueError("--value-pretrain-eval-only forbids checkpoint save paths")
+            if args.save_interval is not None:
+                raise ValueError("--value-pretrain-eval-only forbids --save-interval")
+            if not args.debug_disable_optimizer:
+                raise ValueError("--value-pretrain-eval-only requires --debug-disable-optimizer")
+            if args.custom_megatron_before_log_prob_hook_path is not None:
+                raise ValueError("--value-pretrain-eval-only forbids " "--custom-megatron-before-log-prob-hook-path")
+            if compute_megatron_world_size_except_dp(args) != 1:
+                raise ValueError(
+                    "--value-pretrain-eval-only currently requires pure data parallelism " "(TP=PP=CP=EP=ETP=1)"
+                )
+            eval_spec = manifest.train if args.value_pretrain_eval_split == "train" else manifest.heldout
+            if eval_spec is None:
+                raise ValueError("--value-pretrain-eval-split heldout requires manifest.heldout")
+            required_rows = args.global_batch_size * args.value_pretrain_eval_num_batches
+            if required_rows > eval_spec.num_samples:
+                raise ValueError(
+                    "critic EV gate requires disjoint evaluation rows: "
+                    f"requested {required_rows}, split has {eval_spec.num_samples}"
+                )
+            args.value_pretrain_full_steps = args.value_pretrain_eval_num_batches
+            args.num_rollout = args.value_pretrain_eval_num_batches
+            args.no_load_optim = True
+            args.no_load_rng = True
+            args.no_save_optim = True
+            args.no_save_rng = True
+        else:
+            if args.critic_save is None:
+                raise ValueError("--critic-save is required for offline value pretraining")
+            args.value_pretrain_full_steps = value_pretrain_num_steps(
+                num_samples=manifest.train.num_samples,
+                global_batch_size=args.global_batch_size,
+                epochs=args.value_pretrain_epochs,
+            )
         if args.value_pretrain_canary_one_step:
             if args.save_interval != 1:
                 raise ValueError("--value-pretrain-canary-one-step requires --save-interval 1")
             if args.critic_value_pretrain_contract_sha256 is not None:
-                raise ValueError(
-                    "--value-pretrain-canary-one-step cannot resume from a contracted critic"
-                )
+                raise ValueError("--value-pretrain-canary-one-step cannot resume from a contracted critic")
             if args.critic_load is None:
                 raise ValueError("--value-pretrain-canary-one-step requires --critic-load")
             if os.path.lexists(os.path.join(args.critic_load, "value_pretrain_contract.json")):
@@ -3232,11 +3421,9 @@ def miles_validate_args(args):
                     "not a contracted critic"
                 )
             if os.path.lexists(args.critic_save):
-                raise ValueError(
-                    "--value-pretrain-canary-one-step requires a fresh --critic-save path"
-                )
+                raise ValueError("--value-pretrain-canary-one-step requires a fresh --critic-save path")
             args.num_rollout = 1
-        else:
+        elif not value_pretrain_eval:
             args.num_rollout = args.value_pretrain_full_steps
         # One exact global batch is one critic optimizer step.  These values
         # keep Miles' existing LR scheduler and logging step math correct.
@@ -3250,11 +3437,7 @@ def miles_validate_args(args):
         args.world_size = args.critic_num_nodes * args.critic_num_gpus_per_node
 
     if args.critic_value_pretrain_contract_sha256 is not None:
-        from miles.value_pretraining import (
-            ValueObjective,
-            apply_objective_to_args,
-            load_value_pretrain_contract,
-        )
+        from miles.value_pretraining import ValueObjective, apply_objective_to_args, load_value_pretrain_contract
 
         if args.critic_load is None:
             raise ValueError("--critic-value-pretrain-contract-sha256 requires --critic-load")
@@ -3308,20 +3491,16 @@ def miles_validate_args(args):
 
     if getattr(args, "allow_missing_unquantized_weight_update_hooks", False):
         assert args.bridge_distributed_weight_sync, (
-            "--allow-missing-unquantized-weight-update-hooks requires "
-            "--bridge-distributed-weight-sync"
+            "--allow-missing-unquantized-weight-update-hooks requires " "--bridge-distributed-weight-sync"
         )
         assert not args.colocate, (
-            "--allow-missing-unquantized-weight-update-hooks requires "
-            "non-colocated rollout engines"
+            "--allow-missing-unquantized-weight-update-hooks requires " "non-colocated rollout engines"
         )
         assert args.update_weight_transfer_mode == "broadcast", (
-            "--allow-missing-unquantized-weight-update-hooks requires "
-            "--update-weight-transfer-mode=broadcast"
+            "--allow-missing-unquantized-weight-update-hooks requires " "--update-weight-transfer-mode=broadcast"
         )
         assert args.lora_rank <= 0, (
-            "--allow-missing-unquantized-weight-update-hooks is only supported "
-            "for full-parameter runs"
+            "--allow-missing-unquantized-weight-update-hooks is only supported " "for full-parameter runs"
         )
 
     if args.update_weight_transfer_mode == "disk-delta":
@@ -3348,9 +3527,9 @@ def miles_validate_args(args):
         )
 
     if args.colocate:
-        assert not (args.lora_base_cpu_backup and args.lora_base_disk_reload), (
-            "--lora-base-cpu-backup and --lora-base-disk-reload are mutually exclusive"
-        )
+        assert not (
+            args.lora_base_cpu_backup and args.lora_base_disk_reload
+        ), "--lora-base-cpu-backup and --lora-base-disk-reload are mutually exclusive"
         if args.offload_train is None:
             args.offload_train = True
         if args.offload_rollout is None:
@@ -3421,6 +3600,7 @@ def miles_validate_args(args):
     )
 
     _validate_rollout_one_pass_no_replacement(args)
+    _validate_rollout_only_from_checkpoint(args)
 
     if args.num_epoch is not None:
         if args.num_rollout is not None:

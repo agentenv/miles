@@ -7,21 +7,19 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from miles.rollout.data_source import RolloutDataSource, RolloutDataSourceWithBuffer
 from miles.rollout.base_types import RolloutFnTrainInput, RolloutFnTrainOutput
+from miles.rollout.data_source import RolloutDataSource, RolloutDataSourceWithBuffer
 from miles.rollout.filter_hub.base_types import DynamicFilterOutput
-from miles.rollout.inference_rollout.inference_rollout_common import InferenceRolloutFn
 from miles.rollout.inference_rollout import inference_rollout_train as rollout
+from miles.rollout.inference_rollout.inference_rollout_common import InferenceRolloutFn
 from miles.utils.arguments import (
     _validate_rollout_one_pass_no_replacement,
+    _validate_rollout_only_from_checkpoint,
     get_miles_extra_args_provider,
 )
 from miles.utils.types import Sample
 
-
-_MODULAR_ROLLOUT = (
-    "miles.rollout.inference_rollout.inference_rollout_common.InferenceRolloutFn"
-)
+_MODULAR_ROLLOUT = "miles.rollout.inference_rollout.inference_rollout_common.InferenceRolloutFn"
 
 
 class _Dataset:
@@ -106,12 +104,9 @@ def test_one_pass_data_source_consumes_all_once_without_cycling() -> None:
 def test_one_pass_flag_is_opt_in_and_rejects_refill_configuration() -> None:
     parser = get_miles_extra_args_provider()(argparse.ArgumentParser())
     assert parser.parse_args([]).rollout_one_pass_no_replacement is False
-    assert (
-        parser.parse_args(
-            ["--rollout-one-pass-no-replacement"]
-        ).rollout_one_pass_no_replacement
-        is True
-    )
+    assert parser.parse_args([]).rollout_only_from_checkpoint is False
+    assert parser.parse_args(["--rollout-only-from-checkpoint"]).rollout_only_from_checkpoint is True
+    assert parser.parse_args(["--rollout-one-pass-no-replacement"]).rollout_one_pass_no_replacement is True
 
     args = SimpleNamespace(
         rollout_one_pass_no_replacement=True,
@@ -132,6 +127,65 @@ def test_one_pass_flag_is_opt_in_and_rejects_refill_configuration() -> None:
     with pytest.raises(ValueError, match="over_sampling_batch_size must equal"):
         args.over_sampling_batch_size = 3
         _validate_rollout_one_pass_no_replacement(args)
+
+
+def test_checkpoint_backed_rollout_only_requires_auditable_guards(
+    tmp_path,
+) -> None:
+    checkpoint = tmp_path / "actor-checkpoint"
+    checkpoint.mkdir()
+    (checkpoint / "latest_checkpointed_iteration.txt").write_text("0\n")
+    args = SimpleNamespace(
+        rollout_only_from_checkpoint=True,
+        train_backend="megatron",
+        colocate=True,
+        offload_train=True,
+        offload_rollout=True,
+        rollout_weight_version_format="counter",
+        multi_lora=False,
+        bridge_distributed_weight_sync=False,
+        keep_old_actor=False,
+        use_opd=False,
+        debug_rollout_only=False,
+        debug_train_only=False,
+        debug_disable_optimizer=True,
+        no_load_optim=True,
+        no_load_rng=True,
+        finetune=True,
+        check_weight_update_equal=False,
+        debug_skip_weight_update=False,
+        use_critic=False,
+        external_policy_sync_path=None,
+        eval_interval=None,
+        save_interval=None,
+        save_trigger_sentinel=None,
+        start_rollout_id=0,
+        num_rollout=1,
+        rollout_one_pass_no_replacement=True,
+        load_debug_rollout_data=None,
+        lora_rank=0,
+        dist_ckpt_strictness="raise_unexpected",
+        ckpt_step=None,
+        ref_ckpt_step=None,
+        control_server_port=0,
+        mini_ft_controller_enable=False,
+        ft_components=[],
+        kl_coef=0,
+        kl_loss_coef=0,
+        use_kl_loss=False,
+        save=None,
+        save_hf=None,
+        custom_megatron_post_save_hook_path=None,
+        ref_load=str(checkpoint),
+        load=str(checkpoint),
+        rollout_only_publication_evidence=str(tmp_path / "publication.json"),
+    )
+
+    _validate_rollout_only_from_checkpoint(args)
+
+    args.check_weight_update_equal = True
+    with pytest.raises(ValueError, match="check_weight_update_equal must be disabled"):
+        _validate_rollout_only_from_checkpoint(args)
 
 
 def test_one_pass_data_source_rejects_short_read_and_recycled_buffer() -> None:
@@ -204,9 +258,7 @@ async def test_one_pass_submits_each_planned_group_once(monkeypatch) -> None:
     monkeypatch.setattr(rollout.dumper_utils, "configure_sglang", AsyncMock())
     monkeypatch.setattr(rollout, "load_function", lambda _path: None)
     monkeypatch.setattr(rollout, "submit_generate_tasks", submit)
-    monkeypatch.setattr(
-        rollout, "recompute_samples_rollout_logprobs_via_prefill", recompute
-    )
+    monkeypatch.setattr(rollout, "recompute_samples_rollout_logprobs_via_prefill", recompute)
 
     output, aborted = await rollout.generate_rollout_async(state, 0, data_source)
 
@@ -220,9 +272,7 @@ async def test_one_pass_submits_each_planned_group_once(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["exception", "aborted", "drop", "short"])
-async def test_one_pass_failure_aborts_pending_without_refill(
-    monkeypatch, failure: str
-) -> None:
+async def test_one_pass_failure_aborts_pending_without_refill(monkeypatch, failure: str) -> None:
     args = _args(dynamic_filter_path="test:drop" if failure == "drop" else None)
     state = _State(args)
     groups = [[_sample(index)] for index in range(3)]
@@ -259,9 +309,7 @@ async def test_one_pass_failure_aborts_pending_without_refill(
 
     def load_function(path):
         if path == "test:drop":
-            return lambda _args, _group: DynamicFilterOutput(
-                keep=False, reason="planned-drop"
-            )
+            return lambda _args, _group: DynamicFilterOutput(keep=False, reason="planned-drop")
         return None
 
     monkeypatch.setattr(rollout.dumper_utils, "configure_sglang", AsyncMock())
@@ -299,9 +347,7 @@ async def test_one_pass_preserves_task_failure_when_done_batch_and_abort_fail(
         futures = []
         for group in planned:
             future = asyncio.get_running_loop().create_future()
-            future.set_exception(
-                RuntimeError(f"task-failure-{group[0].index}")
-            )
+            future.set_exception(RuntimeError(f"task-failure-{group[0].index}"))
             futures.append(future)
         return futures
 
@@ -314,9 +360,7 @@ async def test_one_pass_preserves_task_failure_when_done_batch_and_abort_fail(
     monkeypatch.setattr(rollout, "submit_generate_tasks", submit)
     monkeypatch.setattr(rollout, "abort", failing_abort)
 
-    with pytest.raises(
-        rollout.OnePassRolloutError, match="generation task raised"
-    ) as raised:
+    with pytest.raises(rollout.OnePassRolloutError, match="generation task raised") as raised:
         await rollout.generate_rollout_async(state, 9, data_source)
 
     assert source_calls == [3]
@@ -356,9 +400,7 @@ async def test_one_pass_rollout_does_not_recycle_into_data_source(monkeypatch) -
     generate = AsyncMock(return_value=(expected, []))
     monkeypatch.setattr(rollout, "generate_rollout_async", generate)
 
-    output = await InferenceRolloutFn._call_train(
-        owner, RolloutFnTrainInput(rollout_id=4)
-    )
+    output = await InferenceRolloutFn._call_train(owner, RolloutFnTrainInput(rollout_id=4))
 
     assert output is expected
     data_source.add_samples.assert_not_called()

@@ -271,6 +271,14 @@ class RolloutManager:
             engine_gpu_offsets=srv.engine_gpu_offsets,
         )
 
+    async def get_updatable_weight_versions(self) -> list[str]:
+        """Read versions from the engines that receive actor publications."""
+
+        srv = self._get_updatable_server()
+        if srv is None:
+            return []
+        return await srv.get_weight_versions()
+
     def clear_updatable_has_new_engines(self):
         # when fault tolerance is not enabled, we need to manually clear has_new_engines after update_weights
         srv = self._get_updatable_server()

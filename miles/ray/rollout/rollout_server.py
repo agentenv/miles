@@ -232,6 +232,14 @@ class RolloutServer:
             ]
         )
 
+    async def get_weight_versions(self) -> list[str]:
+        """Read the published version from every live node-0 engine."""
+
+        await self.wait_all_engines_alive()
+        return await asyncio.gather(
+            *[engine.actor_handle.get_weight_version.remote() for engine in self.engines if engine.is_allocated]
+        )
+
     async def wait_all_engines_alive(self, timeout: float = 600):
         # TODO: 600s default is hardcoded; make it configurable (e.g. via args) once we have a clearer
         # picture of init/recovery upper bounds across model sizes

@@ -1,3 +1,4 @@
+import json
 import sys
 import types
 from types import SimpleNamespace
@@ -225,18 +226,14 @@ async def test_critic_aware_external_sync_runs_after_actor_and_critic_train(monk
     actor = Actor()
     critic = Critic()
     rollout = SimpleNamespace(
-        generate=_Remote(
-            lambda rollout_id: events.append(("rollout", rollout_id)) or "batch"
-        ),
+        generate=_Remote(lambda rollout_id: events.append(("rollout", rollout_id)) or "batch"),
         dispose=_Remote(lambda: events.append("dispose")),
     )
 
     class Sync:
         supports_critic = True
 
-        async def initialize(
-            self, *, actor_model, critic_model, rollout_manager
-        ):
+        async def initialize(self, *, actor_model, critic_model, rollout_manager):
             assert actor_model is actor
             assert critic_model is critic
             assert rollout_manager is rollout
@@ -404,6 +401,131 @@ async def test_centralized_actor_critic_publishes_only_after_both_train(monkeypa
         ("publish", 0),
         "dispose",
     ]
+
+
+async def test_checkpoint_backed_rollout_only_publishes_then_never_trains(
+    monkeypatch,
+    tmp_path,
+):
+    events = []
+    checksum_calls = 0
+    version_calls = 0
+
+    class Actor:
+        async def update_weights(self, rollout_id=None):
+            events.append(("publish", rollout_id))
+
+        async def train(self, *_args, **_kwargs):
+            raise AssertionError("checkpoint-backed rollout-only mode trained actor")
+
+    actor = Actor()
+
+    def check_weights(**kwargs):
+        nonlocal checksum_calls
+        action = kwargs["action"]
+        events.append(("check_weights", action))
+        if action != "checksum":
+            return [[{"success": True}]]
+        checksum_calls += 1
+        value = {
+            1: "base",
+            2: "trained",
+            3: "reset",
+            4: "trained",
+        }[checksum_calls]
+        return [
+            [
+                {
+                    "success": True,
+                    "ranks": [
+                        {
+                            "checksums": {"model.language_model.weight": value},
+                            "parallelism_info": [{"role": "target", "rank": 0}],
+                        }
+                    ],
+                }
+            ]
+        ]
+
+    def get_weight_versions():
+        nonlocal version_calls
+        version_calls += 1
+        value = {1: "default", 2: "1", 3: "2"}[version_calls]
+        events.append(("weight_version", value))
+        return [value]
+
+    rollout = SimpleNamespace(
+        check_weights=_Remote(check_weights),
+        get_updatable_weight_versions=_Remote(get_weight_versions),
+        generate=_Remote(lambda rollout_id: events.append(("rollout", rollout_id)) or "batch"),
+        dispose=_Remote(lambda: events.append("dispose")),
+    )
+
+    monkeypatch.setattr(train_module, "configure_logger", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(train_module, "maybe_start_periodic_pyspy_dump", lambda: None)
+    monkeypatch.setattr(train_module, "maybe_start_mini_ft_controller", lambda _args: None)
+    monkeypatch.setattr(train_module, "create_placement_groups", lambda _args: {"rollout": object()})
+    monkeypatch.setattr(train_module, "create_rollout_manager", lambda *_args: (rollout, 1))
+
+    async def create_models(*_args):
+        return actor, None
+
+    monkeypatch.setattr(train_module, "create_training_models", create_models)
+    monkeypatch.setattr(train_module, "init_tracking", lambda _args: None)
+
+    checkpoint = tmp_path / "actor-checkpoint"
+    checkpoint.mkdir()
+    (checkpoint / "latest_checkpointed_iteration.txt").write_text("0\n")
+
+    args = SimpleNamespace(
+        external_policy_sync_path=None,
+        control_server_port=None,
+        offload_rollout=False,
+        check_weight_update_equal=False,
+        check_weight_update_allow_quant_error=False,
+        check_weight_update_selector="target",
+        check_weight_update_skip_list=None,
+        num_rollout=1,
+        eval_interval=None,
+        offload_train=False,
+        use_critic=False,
+        start_rollout_id=0,
+        num_critic_only_steps=0,
+        skip_eval_before_train=False,
+        save_trigger_sentinel=None,
+        save_interval=None,
+        debug_exit_after_rollout=None,
+        rollout_only_from_checkpoint=True,
+        rollout_only_publication_evidence=str(tmp_path / "publication.json"),
+        load=str(checkpoint),
+        ref_load=str(checkpoint),
+    )
+
+    await train_module.train(args)
+
+    assert events == [
+        ("check_weights", "checksum"),
+        ("weight_version", "default"),
+        ("publish", None),
+        ("check_weights", "checksum"),
+        ("weight_version", "1"),
+        ("check_weights", "snapshot"),
+        ("check_weights", "reset_tensors"),
+        ("check_weights", "checksum"),
+        ("publish", None),
+        ("weight_version", "2"),
+        ("check_weights", "compare"),
+        ("check_weights", "checksum"),
+        ("rollout", 0),
+        "dispose",
+    ]
+    evidence = json.loads((tmp_path / "publication.json").read_text())
+    assert evidence["changed_language_tensor_count"] == 1
+    assert evidence["reset_changed_language_tensor_count"] == 1
+    assert evidence["bootstrap_weight_versions"] == ["default"]
+    assert evidence["served_weight_versions"] == ["1"]
+    assert evidence["republished_weight_versions"] == ["2"]
+    assert evidence["trained_snapshot_reset_republication_equal"] is True
 
 
 async def test_external_policy_sync_wraps_miles_weight_publication(monkeypatch):

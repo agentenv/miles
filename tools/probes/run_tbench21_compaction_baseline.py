@@ -91,7 +91,17 @@ def _load_rows(path: Path, island_id: int, phase: str) -> list[dict[str, Any]]:
             raise ValueError(f"{path}:{line_number}: invalid JSON") from error
         metadata = row.get("metadata") if isinstance(row, dict) else None
         messages = row.get("messages") if isinstance(row, dict) else None
-        if not isinstance(metadata, dict) or metadata.get("island_id") != island_id or metadata.get("rollout_seed") != ROLLOUT_SEED_BASE + island_id or metadata.get("split") != phase or metadata.get("episode_timeout_seconds") != 1800 or not isinstance(metadata.get("task_id"), str) or not isinstance(metadata.get("sample_id"), str) or not isinstance(messages, list) or not messages:
+        if (
+            not isinstance(metadata, dict)
+            or metadata.get("island_id") != island_id
+            or metadata.get("rollout_seed") != ROLLOUT_SEED_BASE + island_id
+            or metadata.get("split") != phase
+            or metadata.get("episode_timeout_seconds") != 1800
+            or not isinstance(metadata.get("task_id"), str)
+            or not isinstance(metadata.get("sample_id"), str)
+            or not isinstance(messages, list)
+            or not messages
+        ):
             raise ValueError(f"{path}:{line_number}: row violates the baseline-island contract")
         rows.append(row)
     sample_ids = [row["metadata"]["sample_id"] for row in rows]
@@ -117,7 +127,11 @@ def _hmac_key_file() -> Path:
         value = path.read_bytes().rstrip(b"\r\n")
     except OSError as error:
         raise ValueError("Terminal-Bench HMAC key file is unreadable") from error
-    if not stat.S_ISREG(information.st_mode) or stat.S_IMODE(information.st_mode) not in {0o400, 0o600} or not 32 <= len(value) <= 4096:
+    if (
+        not stat.S_ISREG(information.st_mode)
+        or stat.S_IMODE(information.st_mode) not in {0o400, 0o600}
+        or not 32 <= len(value) <= 4096
+    ):
         raise ValueError("Terminal-Bench HMAC key file is not private and bounded")
     return path
 
@@ -158,7 +172,11 @@ print(json.dumps({"stock": stock._IDENTITY_ENV,
         payload = json.loads(completed.stdout)
     except json.JSONDecodeError as error:
         raise RuntimeError("isolated Codex identity preflight returned invalid JSON") from error
-    if not isinstance(payload, dict) or not isinstance(payload.get("stock"), dict) or not isinstance(payload.get("openenv"), dict):
+    if (
+        not isinstance(payload, dict)
+        or not isinstance(payload.get("stock"), dict)
+        or not isinstance(payload.get("openenv"), dict)
+    ):
         raise RuntimeError("isolated Codex identity preflight returned an invalid contract")
     return payload
 
@@ -185,6 +203,33 @@ class ScriptArgs(U.ExecuteTrainConfig):
     concurrency: int = 38
     max_turns: int = 40
     rollout_seed: int = ROLLOUT_SEED_BASE
+    serve_ref_checkpoint: bool = False
+
+
+def _validated_eval_checkpoint(value: str | Path) -> Path:
+    root = Path(value).resolve()
+    marker = root / "latest_checkpointed_iteration.txt"
+    if marker.is_symlink() or not marker.is_file():
+        raise ValueError("eval ref_load has no safe checkpoint iteration marker")
+    try:
+        iteration = marker.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError) as error:
+        raise ValueError("eval ref_load checkpoint marker is unreadable") from error
+    if iteration != "0":
+        raise ValueError(f"eval ref_load checkpoint marker must be rollout 0, got {iteration!r}")
+    iteration_dir = root / "iter_0000000"
+    metadata = iteration_dir / ".metadata"
+    shards = sorted(iteration_dir.glob("*.distcp"))
+    if (
+        iteration_dir.is_symlink()
+        or not iteration_dir.is_dir()
+        or metadata.is_symlink()
+        or not metadata.is_file()
+        or not shards
+        or any(path.is_symlink() or not path.is_file() for path in shards)
+    ):
+        raise ValueError("eval ref_load checkpoint iteration is incomplete")
+    return root
 
 
 def _preflight(args: ScriptArgs) -> tuple[list[dict[str, Any]], dict[str, str]]:
@@ -200,6 +245,8 @@ def _preflight(args: ScriptArgs) -> tuple[list[dict[str, Any]], dict[str, str]]:
         raise ValueError("compaction trigger does not reserve its summary budget")
     if not 1 <= args.concurrency <= 64:
         raise ValueError("one-island concurrency must be in [1, 64]")
+    if args.serve_ref_checkpoint is not (args.phase == "eval"):
+        raise ValueError("--serve-ref-checkpoint is required exactly for the eval phase")
     _hmac_key_file()
 
     prompt_path = Path(args.prompt_data).resolve()
@@ -215,6 +262,8 @@ def _preflight(args: ScriptArgs) -> tuple[list[dict[str, Any]], dict[str, str]]:
     }.items():
         if not Path(value).resolve().is_dir():
             raise FileNotFoundError(f"{name} is missing: {value}")
+    if args.phase == "eval":
+        _validated_eval_checkpoint(args.ref_load)
     binary = Path(args.codex_binary).resolve()
     python = _validated_openenv_python(args.openenv_agent_python)
     if not binary.is_file() or binary.is_symlink() or not os.access(binary, os.X_OK):
@@ -257,10 +306,15 @@ def execute(args: ScriptArgs) -> None:
     dump_path = Path(args.dump_details).resolve()
     island_seed = args.rollout_seed + args.island_id
 
-    checkpoint_args = f"--hf-checkpoint {_q(args.hf_checkpoint)} --ref-load {_q(args.ref_load)} --model-name qwen3_5 --megatron-to-hf-mode raw --no-load-optim --no-load-rng --finetune "
+    checkpoint_args = (
+        f"--train-backend megatron --hf-checkpoint {_q(args.hf_checkpoint)} "
+        f"--ref-load {_q(args.ref_load)} --model-name qwen3_5 "
+        "--megatron-to-hf-mode raw --dist-ckpt-strictness raise_unexpected "
+        "--no-load-optim --no-load-rng --finetune "
+    )
     rollout_args = (
         f"--prompt-data {_q(prompt_path)} --input-key messages --metadata-key metadata "
-        f"--num-rollout 1 --rollout-batch-size {len(rows)} --n-samples-per-prompt 1 "
+        f"--start-rollout-id 0 --num-rollout 1 --rollout-batch-size {len(rows)} --n-samples-per-prompt 1 "
         "--num-steps-per-rollout 1 --rollout-one-pass-no-replacement "
         f"--global-batch-size {len(rows)} --micro-batch-size 1 "
         "--use-dynamic-global-batch-size --sao-compaction "
@@ -269,10 +323,20 @@ def execute(args: ScriptArgs) -> None:
         f"--rollout-max-response-len {args.model_call_max_tokens} "
         f"--max-seq-len {args.max_seq_len} --dump-details {_q(dump_path)} "
     )
-    topology_args = "--num-gpus-per-node 1 --actor-num-nodes 1 --actor-num-gpus-per-node 1 --rollout-num-gpus 1 --rollout-num-gpus-per-engine 1 --tensor-model-parallel-size 1 --pipeline-model-parallel-size 1 --context-parallel-size 1 --expert-model-parallel-size 1 --expert-tensor-parallel-size 1 "
+    topology_args = (
+        ("--colocate " if args.serve_ref_checkpoint else "")
+        + "--num-gpus-per-node 1 --actor-num-nodes 1 --actor-num-gpus-per-node 1 "
+        "--rollout-num-gpus 1 --rollout-num-gpus-per-engine 1 "
+        "--tensor-model-parallel-size 1 --pipeline-model-parallel-size 1 "
+        "--context-parallel-size 1 --expert-model-parallel-size 1 "
+        "--expert-tensor-parallel-size 1 "
+    )
+    eval_sglang_args = (
+        "--sglang-mem-fraction-static 0.15 " "--sglang-max-total-tokens 393216 " "--sglang-max-mamba-cache-size 256 "
+    )
     sglang_args = (
-        "--sglang-mem-fraction-static 0.90 "
-        "--sglang-reasoning-parser qwen3 --sglang-tool-call-parser qwen3_coder "
+        (eval_sglang_args if args.serve_ref_checkpoint else "--sglang-mem-fraction-static 0.90 ")
+        + "--sglang-reasoning-parser qwen3 --sglang-tool-call-parser qwen3_coder "
         f"--sglang-context-length {args.max_seq_len} "
         f"--sglang-server-concurrency {args.concurrency} "
         f"--sglang-max-running-requests {args.concurrency} "
@@ -289,15 +353,23 @@ def execute(args: ScriptArgs) -> None:
         "--session-server-startup-timeout-secs 120 "
         "--tito-allowed-append-roles user tool "
     )
+    checkpoint_rollout_args = (
+        "--rollout-only-from-checkpoint --debug-disable-optimizer "
+        f"--rollout-only-publication-evidence {_q(dump_path.parent / 'checkpoint-publication.json')} "
+        "--rollout-weight-version-format counter "
+        "--update-weight-buffer-size 1073741824 "
+    )
+    chat_template_kwargs = _q('{"clear_thinking":false}')
     runtime_args = (
-        "--debug-rollout-only --max-position-embeddings 262144 "
+        (checkpoint_rollout_args if args.serve_ref_checkpoint else "--debug-rollout-only ")
+        + "--max-position-embeddings 262144 "
         f"--seq-length {args.max_seq_len} "
         "--attention-dropout 0.0 --hidden-dropout 0.0 "
         "--attention-backend flash --attention-softmax-in-fp32 --bf16 "
         f"--seed {island_seed} --rollout-seed {island_seed} "
         "--distributed-timeout-minutes 30 --pin-rollout-manager-to-head "
         "--wandb-mode disabled "
-        f"--apply-chat-template-kwargs {_q('{"clear_thinking":false}')} "
+        f"--apply-chat-template-kwargs {chat_template_kwargs} "
     )
     extra_env = {
         **codex_env,

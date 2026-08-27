@@ -18,6 +18,8 @@ logger = logging.getLogger(__name__)
 
 # The framework supports other asynchronous approaches such as fully async (which is shown in examples/full_async).
 async def train(args):
+    if getattr(args, "rollout_only_from_checkpoint", False):
+        raise ValueError("--rollout-only-from-checkpoint is supported only by synchronous train.py")
     assert not args.colocate, "Colocation is not supported for async training."
     configure_logger(args, source=MainProcessIdentity())
     maybe_start_periodic_pyspy_dump()

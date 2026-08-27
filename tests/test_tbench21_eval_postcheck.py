@@ -50,12 +50,16 @@ def _plan(tmp_path: Path) -> tuple[Path, list[dict[str, postcheck.PlannedSample]
     for island_id, island_rows in enumerate(rows):
         path = plan_dir / f"eval/island-{island_id}.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
-        encoded = b"".join((json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n").encode() for row in island_rows)
+        encoded = b"".join(
+            (json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n").encode() for row in island_rows
+        )
         path.write_bytes(encoded)
         files[f"eval/island-{island_id}.jsonl"] = hashlib.sha256(encoded).hexdigest()
     eval_tasks = [f"task-{index:02d}" for index in range(45)]
     train_tasks = [f"train-{index:02d}" for index in range(44)]
-    task_contracts = {task_id: {"task_name": f"terminal-bench/{task_id}"} for task_id in sorted(eval_tasks + train_tasks)}
+    task_contracts = {
+        task_id: {"task_name": f"terminal-bench/{task_id}"} for task_id in sorted(eval_tasks + train_tasks)
+    }
     split_payload = {
         "seed": "test-split",
         "algorithm": postcheck.PLAN_ALGORITHM,
@@ -143,6 +147,7 @@ def _sample(
     return {
         "index": contract.index,
         "group_index": contract.index,
+        "weight_versions": ["2"],
         "status": "completed",
         "remove_sample": False,
         "reward": reward,
@@ -209,6 +214,35 @@ def _payload(island_id: int, expected: dict[str, postcheck.PlannedSample]) -> di
     return {"rollout_id": 0, "metadata": {}, "samples": samples}
 
 
+def _logical_results(
+    success_counts: list[int] | None = None,
+    *,
+    assistant_mismatch_count: int = 0,
+) -> list[postcheck.LogicalResult]:
+    success_counts = success_counts or [0] * postcheck.EXPECTED_TASKS
+    results = []
+    ordinal = 0
+    for task_index, success_count in enumerate(success_counts):
+        for replica in range(postcheck.ROLLOUTS_PER_TASK):
+            results.append(
+                postcheck.LogicalResult(
+                    sample_id=f"eval:task-{task_index:02d}:r{replica}",
+                    task_id=f"task-{task_index:02d}",
+                    replica=replica,
+                    reward=float(replica < success_count),
+                    status="completed",
+                    verifier="openenv_native_evaluate",
+                    episode_id=f"episode-{ordinal}",
+                    trajectory_id=f"trajectory-{ordinal}",
+                    segments=1,
+                    terminal_tito_boundary_mismatch=False,
+                    terminal_tito_assistant_text_mismatch=(ordinal < assistant_mismatch_count),
+                )
+            )
+            ordinal += 1
+    return results
+
+
 def _inspection(
     island_id: int,
     container_id: str,
@@ -241,6 +275,7 @@ def _inspection(
                 str(island_id),
                 "--phase",
                 "eval",
+                "--serve-ref-checkpoint",
                 "--prompt-data",
                 f"/root/plan/eval/island-{island_id}.jsonl",
                 "--dump-details",
@@ -320,6 +355,29 @@ def _full_fixture(tmp_path: Path, monkeypatch):
         source = island / "details/rollout_data/0.pt"
         source.parent.mkdir(parents=True)
         source.write_bytes(f"pt-{island_id}".encode())
+        _write_json(
+            island / "checkpoint-publication.json",
+            {
+                "schema": postcheck.CHECKPOINT_PUBLICATION_SCHEMA,
+                "effective_load": "/root/input-checkpoint",
+                "ref_load": "/root/input-checkpoint",
+                "checkpoint_iteration": 0,
+                "selector": "target",
+                "skip_tensor_substrings": ["visual"],
+                "engine_count": 1,
+                "language_tensor_count": 420,
+                "changed_language_tensor_count": 17,
+                "reset_changed_language_tensor_count": 17,
+                "base_language_checksum_sha256": f"{1:064x}",
+                "served_language_checksum_sha256": f"{101:064x}",
+                "reset_language_checksum_sha256": f"{201 + island_id:064x}",
+                "bootstrap_weight_versions": ["default"],
+                "served_weight_versions": ["1"],
+                "republished_weight_versions": ["2"],
+                "trained_snapshot_reset_republication_equal": True,
+            },
+            private=True,
+        )
         payloads[source] = _payload(island_id, expected[island_id])
         shard = plan_dir / f"eval/island-{island_id}.jsonl"
         container_id = f"{island_id:x}" * 64
@@ -389,6 +447,14 @@ def _full_fixture(tmp_path: Path, monkeypatch):
             "phase": "eval",
             "runtime_image": {"id": postcheck.RUNTIME_IMAGE_ID},
             "checkpoint": str(checkpoint),
+            "served_policy": {
+                "mode": "actor-checkpoint-publication",
+                "hf_bootstrap": str(model),
+                "actor_checkpoint": str(checkpoint),
+                "weight_equality_required": True,
+                "bootstrap_difference_required": True,
+                "publication_evidence": "checkpoint-publication.json",
+            },
             "plan_dir": str(plan_dir),
             "model": str(model),
             "docker_bridge_gateway": "172.17.0.1",
@@ -443,10 +509,57 @@ def test_full_eval_postcheck_authenticates_and_aggregates(tmp_path, monkeypatch)
     assert [row["logical_trajectories"] for row in report["islands"]] == list(postcheck.EXPECTED_COUNTS)
     assert report["aggregate"]["passed_rollouts"] == 2
     assert report["aggregate"]["pass_at_1"] == 2 / 180
+    assert report["aggregate"]["pass_at_2"] == (2 * 0.5) / 45
+    assert report["aggregate"]["pass_at_3"] == (2 * 0.75) / 45
     assert report["aggregate"]["tasks_with_any_success"] == 2
     assert report["aggregate"]["task_success_rate_at_4"] == 2 / 45
     assert report["aggregate"]["pass_at_4"] == 2 / 45
     assert report["managed_server"]["status"]["managed_containers"] == 0
+    assert len(report["checkpoint_publication_evidence"]) == 8
+    assert report["checkpoint"]["served_via_actor_publication"] is True
+
+
+def test_pass_at_k_matches_full_success_count_spectrum() -> None:
+    success_counts = [0, 1, 2, 3, 4] + [0] * 40
+    report = postcheck._aggregate(
+        _logical_results(success_counts),
+        {f"task-{index:02d}" for index in range(postcheck.EXPECTED_TASKS)},
+    )
+
+    assert [report["tasks"][f"task-{index:02d}"]["pass_at_2"] for index in range(5)] == [0.0, 0.5, 5 / 6, 1.0, 1.0]
+    assert [report["tasks"][f"task-{index:02d}"]["pass_at_3"] for index in range(5)] == [0.0, 0.75, 1.0, 1.0, 1.0]
+
+
+def test_assistant_text_mismatch_ratio_accepts_boundary_and_rejects_excess() -> None:
+    expected_tasks = {f"task-{index:02d}" for index in range(postcheck.EXPECTED_TASKS)}
+    accepted = postcheck._aggregate(
+        _logical_results(assistant_mismatch_count=36),
+        expected_tasks,
+    )
+    assert accepted["terminal_tito_assistant_text_mismatch_ratio"] == 0.2
+
+    with pytest.raises(postcheck.EvalPostcheckError, match="soft safety threshold"):
+        postcheck._aggregate(
+            _logical_results(assistant_mismatch_count=37),
+            expected_tasks,
+        )
+
+
+def test_eval_postcheck_rejects_missing_publication_evidence(tmp_path, monkeypatch):
+    launch, plan, checkpoint, key, _inspections, _payloads, attestations = _full_fixture(tmp_path, monkeypatch)
+    (launch.parent / "island-4/checkpoint-publication.json").unlink()
+
+    with pytest.raises(postcheck.EvalPostcheckError, match="publication evidence"):
+        postcheck.postcheck(
+            launch,
+            plan,
+            checkpoint,
+            key,
+            **attestations,
+            managed_status_url="http://127.0.0.1:8003",
+            managed_run_id="test-run",
+            managed_clean_timeout_s=1.0,
+        )
 
 
 def test_eval_postcheck_rejects_unsigned_or_tampered_outcome(tmp_path, monkeypatch):
@@ -510,12 +623,16 @@ def test_eval_postcheck_reports_only_exact_terminal_boundary_mismatch(tmp_path, 
         outcome["status"] = "max_seq_len"
         outcome["reward"] = 0.0
         outcome["passed"] = False
-        canonical = json.dumps(outcome, allow_nan=False, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+        canonical = json.dumps(
+            outcome, allow_nan=False, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode()
         metadata["exit_status"] = "max_seq_len"
         metadata["reward"] = 0.0
         sample["reward"] = 0.0
         metadata["tbench_trusted_outcome"] = outcome
-        metadata["tbench_trusted_outcome_hmac"] = hmac.new(KEY, postcheck.OUTCOME_DOMAIN + canonical, hashlib.sha256).hexdigest()
+        metadata["tbench_trusted_outcome_hmac"] = hmac.new(
+            KEY, postcheck.OUTCOME_DOMAIN + canonical, hashlib.sha256
+        ).hexdigest()
     terminal = max(rows, key=lambda sample: sample["metadata"]["compaction_segment_index"])
     terminal["metadata"]["tito_session_mismatch"] = [
         {
@@ -541,6 +658,86 @@ def test_eval_postcheck_reports_only_exact_terminal_boundary_mismatch(tmp_path, 
 
     terminal["metadata"]["tito_session_mismatch"][0]["type"] = "assistant_text"
     with pytest.raises(postcheck.EvalPostcheckError, match="unapproved TITO mismatch"):
+        postcheck.postcheck(
+            launch,
+            plan,
+            checkpoint,
+            key,
+            **attestations,
+            managed_status_url=postcheck.MANAGED_STATUS_URL,
+            managed_run_id="test-run",
+            managed_clean_timeout_s=1.0,
+        )
+
+
+def test_eval_postcheck_ledgers_soft_terminal_assistant_mismatch(tmp_path, monkeypatch):
+    launch, plan, checkpoint, key, _inspections, payloads, attestations = _full_fixture(tmp_path, monkeypatch)
+    payload = next(iter(payloads.values()))
+    sample = next(row for row in payload["samples"] if row["reward"] == 1.0)
+    sample_id = sample["metadata"]["sample_id"]
+    rows = [row for row in payload["samples"] if row["metadata"]["sample_id"] == sample_id]
+    terminal = max(rows, key=lambda row: row["metadata"]["compaction_segment_index"])
+    terminal["metadata"]["tito_session_mismatch"] = [
+        {
+            "type": "assistant_text",
+            "segment_index": 49,
+            "expected_text": "assistant normalized terminal tool call",
+            "actual_text": "assistant malformed duplicate terminal tool fields",
+            "detail": "",
+        },
+        {
+            "type": "assistant_text",
+            "segment_index": 51,
+            "expected_text": "assistant normalized final answer",
+            "actual_text": "assistant malformed final answer",
+            "detail": "",
+        },
+    ]
+
+    report = postcheck.postcheck(
+        launch,
+        plan,
+        checkpoint,
+        key,
+        **attestations,
+        managed_status_url=postcheck.MANAGED_STATUS_URL,
+        managed_run_id="test-run",
+        managed_clean_timeout_s=1.0,
+    )
+    assert report["terminal_tito_assistant_text_mismatch_count"] == 1
+    assert report["terminal_tito_assistant_text_mismatch_sample_ids"] == [sample_id]
+    assert report["terminal_tito_assistant_text_mismatch_ratio"] == 1 / 180
+    assert (
+        report["terminal_tito_assistant_text_mismatch_ratio_threshold"] == postcheck.MAX_ASSISTANT_TEXT_MISMATCH_RATIO
+    )
+    assert report["aggregate"]["trace_ineligible_trajectory_count"] == 0
+    assert report["aggregate"]["passed_rollouts"] == 2
+
+    terminal["metadata"]["tito_session_mismatch"][0]["detail"] = "unbounded"
+    with pytest.raises(postcheck.EvalPostcheckError, match="unapproved TITO mismatch"):
+        postcheck.postcheck(
+            launch,
+            plan,
+            checkpoint,
+            key,
+            **attestations,
+            managed_status_url=postcheck.MANAGED_STATUS_URL,
+            managed_run_id="test-run",
+            managed_clean_timeout_s=1.0,
+        )
+
+
+def test_eval_postcheck_rejects_missing_tito_evidence(tmp_path, monkeypatch):
+    launch, plan, checkpoint, key, _inspections, payloads, attestations = _full_fixture(tmp_path, monkeypatch)
+    payload = next(iter(payloads.values()))
+    sample_id = payload["samples"][0]["metadata"]["sample_id"]
+    terminal = max(
+        (row for row in payload["samples"] if row["metadata"]["sample_id"] == sample_id),
+        key=lambda row: row["metadata"]["compaction_segment_index"],
+    )
+    del terminal["metadata"]["tito_session_mismatch"]
+
+    with pytest.raises(postcheck.EvalPostcheckError, match="missing terminal TITO"):
         postcheck.postcheck(
             launch,
             plan,

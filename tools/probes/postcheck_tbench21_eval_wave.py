@@ -36,7 +36,7 @@ ROLLOUT_SEED_BASE = baseline.ROLLOUT_SEED_BASE
 RUNTIME_IMAGE_ID = baseline.RUNTIME_IMAGE_ID
 PLAN_SCHEMA = baseline.PLAN_SCHEMA
 LAUNCH_SCHEMA = baseline.LAUNCH_SCHEMA
-REPORT_SCHEMA = "miles.tbench21-eval-postcheck.v1"
+REPORT_SCHEMA = "miles.tbench21-eval-postcheck.v2"
 EXPECTED_COUNTS = (23, 23, 23, 23, 22, 22, 22, 22)
 EXPECTED_TRAJECTORIES = 180
 EXPECTED_TASKS = 45
@@ -51,6 +51,7 @@ RUNNER = "/root/miles/tools/probes/run_tbench21_compaction_baseline.py"
 CODEX_BINARY = "/root/codex-cli/vendor/x86_64-unknown-linux-musl/bin/codex"
 PLAN_ALGORITHM = "sha256-domain-ranked-first-44"
 CHECKPOINT_SCHEMA = "miles.tbench21-eval-checkpoint-inventory.v1"
+CHECKPOINT_PUBLICATION_SCHEMA = "miles.checkpoint-backed-rollout-publication.v1"
 TERMINAL_STATUSES = frozenset({"completed", "timeout", "max_turns", "max_seq_len"})
 OUTCOME_FIELDS = frozenset(
     {
@@ -72,6 +73,7 @@ OUTCOME_DOMAIN = b"yeto-tbench-outcome-v1\0"
 IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:+@-]{0,511}\Z")
 MAC = re.compile(r"[0-9a-f]{64}\Z")
 TITO_COUNT_DETAIL = re.compile(r"segment count differs: expected ([0-9]+), got ([0-9]+)\Z")
+MAX_ASSISTANT_TEXT_MISMATCH_RATIO = 0.20
 
 
 class EvalPostcheckError(RuntimeError):
@@ -97,6 +99,30 @@ class LogicalResult:
     trajectory_id: str
     segments: int
     terminal_tito_boundary_mismatch: bool
+    terminal_tito_assistant_text_mismatch: bool
+
+
+def _common_tito_mismatch_shape(entry: object, *, status_matches: bool) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    expected_text = entry.get("expected_text")
+    actual_text = entry.get("actual_text")
+    return (
+        set(entry)
+        == {
+            "type",
+            "segment_index",
+            "expected_text",
+            "actual_text",
+            "detail",
+        }
+        and isinstance(expected_text, str)
+        and bool(expected_text)
+        and isinstance(actual_text, str)
+        and bool(actual_text)
+        and expected_text != actual_text
+        and status_matches
+    )
 
 
 def _load_hmac_key(path: Path) -> tuple[Path, bytes]:
@@ -116,7 +142,12 @@ def _load_hmac_key(path: Path) -> tuple[Path, bytes]:
 
 
 def _finite_binary(value: object, *, name: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, numbers.Real) or not math.isfinite(float(value)) or float(value) not in {0.0, 1.0}:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, numbers.Real)
+        or not math.isfinite(float(value))
+        or float(value) not in {0.0, 1.0}
+    ):
         raise EvalPostcheckError(f"{name} must be a finite binary reward")
     return float(value)
 
@@ -265,7 +296,13 @@ def _plan_rows(
         relative = f"eval/island-{island_id}.jsonl"
         shard = plan_dir / relative
         digest = files.get(relative)
-        if not isinstance(digest, str) or len(digest) != 64 or not shard.is_file() or shard.is_symlink() or baseline._sha256(shard) != digest:
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or not shard.is_file()
+            or shard.is_symlink()
+            or baseline._sha256(shard) != digest
+        ):
             raise EvalPostcheckError(f"plan shard changed: {relative}")
         rows: list[dict[str, Any]] = []
         try:
@@ -311,7 +348,9 @@ def _plan_rows(
         contracts.append(expected)
     if len(all_sample_ids) != EXPECTED_TRAJECTORIES:
         raise EvalPostcheckError("eval plan does not contain 180 unique sample IDs")
-    if len(replicas_by_task) != EXPECTED_TASKS or any(replicas != set(range(ROLLOUTS_PER_TASK)) for replicas in replicas_by_task.values()):
+    if len(replicas_by_task) != EXPECTED_TASKS or any(
+        replicas != set(range(ROLLOUTS_PER_TASK)) for replicas in replicas_by_task.values()
+    ):
         raise EvalPostcheckError("eval plan is not exactly 45 tasks with four replicas each")
     if set(replicas_by_task) != set(eval_tasks):
         raise EvalPostcheckError("eval shards do not contain exactly split.eval_task_ids")
@@ -350,20 +389,46 @@ def _validate_training_provenance(
     root = path.parent
     plan = launch.get("plan")
     records = launch.get("containers")
-    if launch.get("schema") != "miles.tbench21-sao-online-wave.v1" or not isinstance(plan, dict) or plan.get("sha256") != plan_sha256 or not isinstance(records, list) or len(records) != ISLANDS or MAC.fullmatch(expected_policy_hash) is None or checkpoint != root / "island-7/actor-checkpoint":
+    if (
+        launch.get("schema") != "miles.tbench21-sao-online-wave.v1"
+        or not isinstance(plan, dict)
+        or plan.get("sha256") != plan_sha256
+        or not isinstance(records, list)
+        or len(records) != ISLANDS
+        or MAC.fullmatch(expected_policy_hash) is None
+        or checkpoint != root / "island-7/actor-checkpoint"
+    ):
         raise EvalPostcheckError("actor checkpoint is not bound to the completed online wave")
     event_hashes: list[str] = []
     for island_id, record in enumerate(records):
         output = root / f"island-{island_id}"
-        if not isinstance(record, dict) or record.get("island_id") != island_id or record.get("name") != f"tbench21-sao-online-island-{island_id}" or record.get("output") != str(output):
+        if (
+            not isinstance(record, dict)
+            or record.get("island_id") != island_id
+            or record.get("name") != f"tbench21-sao-online-island-{island_id}"
+            or record.get("output") != str(output)
+        ):
             raise EvalPostcheckError("training launch island identity changed")
         events_path = output / "events.jsonl"
         try:
             events = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines() if line]
         except (OSError, UnicodeError, json.JSONDecodeError) as error:
             raise EvalPostcheckError("terminal actor publication evidence is unreadable") from error
-        terminal = [event for event in events if isinstance(event, dict) and event.get("event") == "rl_sao_streaming_publication" and event.get("terminal") is True]
-        if len(terminal) != 1 or events[-1] != terminal[0] or terminal[0].get("rollout_id") != 1 or terminal[0].get("actor_policy_hash") != expected_policy_hash or terminal[0].get("actor_fragment_versions") != [1, 2] or terminal[0].get("critic_fragment_versions") != [1, 2]:
+        terminal = [
+            event
+            for event in events
+            if isinstance(event, dict)
+            and event.get("event") == "rl_sao_streaming_publication"
+            and event.get("terminal") is True
+        ]
+        if (
+            len(terminal) != 1
+            or events[-1] != terminal[0]
+            or terminal[0].get("rollout_id") != 1
+            or terminal[0].get("actor_policy_hash") != expected_policy_hash
+            or terminal[0].get("actor_fragment_versions") != [1, 2]
+            or terminal[0].get("critic_fragment_versions") != [1, 2]
+        ):
             raise EvalPostcheckError("training island has no unique expected terminal actor publication")
         event_hashes.append(terminal[0]["actor_policy_hash"])
     return {
@@ -398,6 +463,75 @@ def _validate_checkpoint(path: Path, *, expected_inventory_sha256: str) -> tuple
     return path, inventory_sha256, len(entries)
 
 
+def _validate_checkpoint_publication_evidence(
+    output: Path,
+    *,
+    island_id: int,
+) -> dict[str, Any]:
+    path = output / "checkpoint-publication.json"
+    try:
+        payload = baseline._load_json(
+            path,
+            f"island {island_id} checkpoint publication evidence",
+            private=True,
+        )
+    except baseline.BaselinePostcheckError as error:
+        raise EvalPostcheckError(
+            f"island {island_id} checkpoint publication evidence is missing or invalid"
+        ) from error
+    base_checksum = payload.get("base_language_checksum_sha256")
+    served_checksum = payload.get("served_language_checksum_sha256")
+    reset_checksum = payload.get("reset_language_checksum_sha256")
+    engine_count = payload.get("engine_count")
+    tensor_count = payload.get("language_tensor_count")
+    changed_count = payload.get("changed_language_tensor_count")
+    reset_changed_count = payload.get("reset_changed_language_tensor_count")
+    bootstrap_versions = payload.get("bootstrap_weight_versions")
+    served_versions = payload.get("served_weight_versions")
+    republished_versions = payload.get("republished_weight_versions")
+    if (
+        payload.get("schema") != CHECKPOINT_PUBLICATION_SCHEMA
+        or payload.get("effective_load") != "/root/input-checkpoint"
+        or payload.get("ref_load") != "/root/input-checkpoint"
+        or payload.get("checkpoint_iteration") != 0
+        or payload.get("selector") != "target"
+        or payload.get("skip_tensor_substrings") != ["visual"]
+        or type(engine_count) is not int
+        or engine_count != 1
+        or type(tensor_count) is not int
+        or tensor_count < 1
+        or type(changed_count) is not int
+        or not 1 <= changed_count <= tensor_count
+        or type(reset_changed_count) is not int
+        or not 1 <= reset_changed_count <= tensor_count
+        or MAC.fullmatch(base_checksum or "") is None
+        or MAC.fullmatch(served_checksum or "") is None
+        or MAC.fullmatch(reset_checksum or "") is None
+        or base_checksum == served_checksum
+        or reset_checksum == served_checksum
+        or bootstrap_versions != ["default"]
+        or served_versions != ["1"]
+        or republished_versions != ["2"]
+        or payload.get("trained_snapshot_reset_republication_equal") is not True
+    ):
+        raise EvalPostcheckError(f"island {island_id} did not prove checkpoint publication before rollout")
+    return {
+        "island_id": island_id,
+        "path": str(path),
+        "sha256": baseline._sha256(path),
+        "base_language_checksum_sha256": base_checksum,
+        "served_language_checksum_sha256": served_checksum,
+        "reset_language_checksum_sha256": reset_checksum,
+        "language_tensor_count": tensor_count,
+        "changed_language_tensor_count": changed_count,
+        "reset_changed_language_tensor_count": reset_changed_count,
+        "bootstrap_weight_versions": bootstrap_versions,
+        "served_weight_versions": served_versions,
+        "republished_weight_versions": republished_versions,
+        "trained_snapshot_reset_republication_equal": True,
+    }
+
+
 def _validate_containers(
     records: list[dict[str, Any]],
     inspections: list[dict[str, Any]],
@@ -422,11 +556,23 @@ def _validate_containers(
         config = item.get("Config") if isinstance(item, dict) else None
         labels = config.get("Labels") if isinstance(config, dict) else None
         environment = config.get("Env") if isinstance(config, dict) else None
-        env = dict(value.split("=", 1) for value in environment if isinstance(value, str) and "=" in value) if isinstance(environment, list) else {}
+        env = (
+            dict(value.split("=", 1) for value in environment if isinstance(value, str) and "=" in value)
+            if isinstance(environment, list)
+            else {}
+        )
         command = config.get("Cmd") if isinstance(config, dict) else None
         host_config = item.get("HostConfig") if isinstance(item, dict) else None
         mounts = item.get("Mounts") if isinstance(item, dict) else None
-        mount_by_destination = {mount.get("Destination"): mount for mount in mounts if isinstance(mount, dict) and isinstance(mount.get("Destination"), str)} if isinstance(mounts, list) else {}
+        mount_by_destination = (
+            {
+                mount.get("Destination"): mount
+                for mount in mounts
+                if isinstance(mount, dict) and isinstance(mount.get("Destination"), str)
+            }
+            if isinstance(mounts, list)
+            else {}
+        )
         checkpoint_mount = mount_by_destination.get("/root/input-checkpoint")
         plan_mount = mount_by_destination.get("/root/plan")
         hmac_mount = mount_by_destination.get("/run/secrets/tbench-hmac")
@@ -439,6 +585,7 @@ def _validate_containers(
             str(island_id),
             "--phase",
             "eval",
+            "--serve-ref-checkpoint",
             "--prompt-data",
             f"/root/plan/eval/island-{island_id}.jsonl",
             "--dump-details",
@@ -464,8 +611,14 @@ def _validate_containers(
             "--rollout-seed",
             str(ROLLOUT_SEED_BASE),
         ]
-        codex_source = Path(codex_mount["Source"]) if isinstance(codex_mount, dict) and isinstance(codex_mount.get("Source"), str) else None
-        codex_binary = codex_source / "vendor/x86_64-unknown-linux-musl/bin/codex" if codex_source is not None else None
+        codex_source = (
+            Path(codex_mount["Source"])
+            if isinstance(codex_mount, dict) and isinstance(codex_mount.get("Source"), str)
+            else None
+        )
+        codex_binary = (
+            codex_source / "vendor/x86_64-unknown-linux-musl/bin/codex" if codex_source is not None else None
+        )
         if (
             not isinstance(record, dict)
             or record.get("island_id") != island_id
@@ -518,7 +671,9 @@ def _validate_containers(
             or codex_binary.is_symlink()
             or baseline._sha256(codex_binary) != codex_binary_sha256
         ):
-            raise EvalPostcheckError(f"eval container {island_id} did not exit cleanly with its read-only launch identity")
+            raise EvalPostcheckError(
+                f"eval container {island_id} did not exit cleanly with its read-only launch identity"
+            )
         completed.append(
             {
                 "island_id": island_id,
@@ -527,6 +682,8 @@ def _validate_containers(
                 "exit_code": 0,
                 "oom_killed": False,
                 "checkpoint_read_only": True,
+                "checkpoint_publication_requested": True,
+                "weight_equality_requested": True,
             }
         )
     return completed
@@ -539,9 +696,15 @@ def _validate_payload(
     expected: dict[str, PlannedSample],
     source: Path,
     hmac_key: bytes,
+    expected_weight_version: str,
 ) -> tuple[dict[str, Any], list[LogicalResult]]:
     samples = payload.get("samples")
-    if payload.get("rollout_id") != 0 or not isinstance(payload.get("metadata"), dict) or not isinstance(samples, list) or not samples:
+    if (
+        payload.get("rollout_id") != 0
+        or not isinstance(payload.get("metadata"), dict)
+        or not isinstance(samples, list)
+        or not samples
+    ):
         raise EvalPostcheckError(f"island {island_id} does not contain one native rollout_id=0 batch")
     by_sample: dict[str, list[tuple[dict[str, Any], dict[str, Any], float]]] = defaultdict(list)
     retry_ledgers: dict[str, int] = {}
@@ -552,6 +715,7 @@ def _validate_payload(
         contract = expected.get(sample_id) if isinstance(sample_id, str) else None
         index = raw.get("index") if isinstance(raw, dict) else None
         group_index = raw.get("group_index") if isinstance(raw, dict) else None
+        weight_versions = raw.get("weight_versions") if isinstance(raw, dict) else None
         if (
             not isinstance(raw, dict)
             or not isinstance(metadata, dict)
@@ -562,6 +726,9 @@ def _validate_payload(
             or group_index != contract.index
             or raw.get("status") not in {"completed", "truncated"}
             or raw.get("remove_sample", False) is not False
+            or not isinstance(weight_versions, list)
+            or not weight_versions
+            or {str(value) for value in weight_versions} != {expected_weight_version}
             or metadata.get("task_id") != contract.task_id
             or metadata.get("rollout_replica") != contract.replica
             or metadata.get("split") != "eval"
@@ -586,14 +753,20 @@ def _validate_payload(
             sample_id=sample_id,
             task_id=contract.task_id,
         )
-        if outcome["status"] != metadata["exit_status"] or _finite_binary(raw.get("reward"), name="sample reward") != reward or _finite_binary(metadata.get("reward"), name="metadata reward") != reward:
+        if (
+            outcome["status"] != metadata["exit_status"]
+            or _finite_binary(raw.get("reward"), name="sample reward") != reward
+            or _finite_binary(metadata.get("reward"), name="metadata reward") != reward
+        ):
             raise EvalPostcheckError(f"{source}:{ordinal}: signed reward/status differs from accepted sample")
         by_sample[sample_id].append((raw, outcome, reward))
 
     if set(by_sample) != set(expected):
         missing = sorted(set(expected) - set(by_sample))
         extra = sorted(set(by_sample) - set(expected))
-        raise EvalPostcheckError(f"island {island_id} eval coverage changed: missing={missing[:3]!r}, extra={extra[:3]!r}")
+        raise EvalPostcheckError(
+            f"island {island_id} eval coverage changed: missing={missing[:3]!r}, extra={extra[:3]!r}"
+        )
     results: list[LogicalResult] = []
     segment_count = 0
     for sample_id, rows in by_sample.items():
@@ -615,14 +788,18 @@ def _validate_payload(
             or not next(iter(identities))
             or any(metadata.get("compaction_schema_version") != 1 for metadata in metadata_rows)
             or any(metadata.get("compaction_context_budget") != MAX_SEQ_LEN for metadata in metadata_rows)
-            or any(metadata.get("compaction_context_window") != index // 2 for index, metadata in enumerate(metadata_rows))
+            or any(
+                metadata.get("compaction_context_window") != index // 2 for index, metadata in enumerate(metadata_rows)
+            )
         ):
             raise EvalPostcheckError(f"{source}: {sample_id} has duplicated or malformed compaction segments")
         trajectory_id = next(iter(identities))
         if trajectory_id in trajectory_ids:
             raise EvalPostcheckError(f"{source}: two samples reused one trajectory ID")
         trajectory_ids.add(trajectory_id)
-        if any(outcome != outcomes[0] for outcome in outcomes[1:]) or any(reward != rewards[0] for reward in rewards[1:]):
+        if any(outcome != outcomes[0] for outcome in outcomes[1:]) or any(
+            reward != rewards[0] for reward in rewards[1:]
+        ):
             raise EvalPostcheckError(f"{source}: {sample_id} outcome changed across compaction segments")
         terminal_metadata = metadata_rows[-1]
         orphan_dropped = terminal_metadata.get("compaction_terminal_orphan_summary_dropped")
@@ -636,38 +813,73 @@ def _validate_payload(
         for segment_ordinal, metadata in enumerate(metadata_rows):
             terminal = segment_ordinal == len(metadata_rows) - 1
             if terminal:
-                if metadata.get("compaction_segment_count") != declared_segment_count or metadata.get("compaction_context_window_count") != (len(metadata_rows) + 1) // 2:
+                if (
+                    metadata.get("compaction_segment_count") != declared_segment_count
+                    or metadata.get("compaction_context_window_count") != (len(metadata_rows) + 1) // 2
+                ):
                     raise EvalPostcheckError(f"{source}: {sample_id} terminal compaction totals differ")
-            elif "compaction_segment_count" in metadata or "compaction_context_window_count" in metadata or "compaction_terminal_orphan_summary_dropped" in metadata or "compaction_terminal_orphan_summary_segment_index" in metadata:
-                raise EvalPostcheckError(f"{source}: {sample_id} nonterminal segment carries terminal compaction fields")
-        terminal_mismatch = False
-        for segment_ordinal, (metadata, outcome, reward) in enumerate(zip(metadata_rows, outcomes, rewards, strict=True)):
-            mismatch = metadata.get("tito_session_mismatch")
-            if mismatch in (None, False, []):
+            elif (
+                "compaction_segment_count" in metadata
+                or "compaction_context_window_count" in metadata
+                or "compaction_terminal_orphan_summary_dropped" in metadata
+                or "compaction_terminal_orphan_summary_segment_index" in metadata
+            ):
+                raise EvalPostcheckError(
+                    f"{source}: {sample_id} nonterminal segment carries terminal compaction fields"
+                )
+        terminal_boundary_mismatch = False
+        terminal_assistant_text_mismatch = False
+        for segment_ordinal, (metadata, outcome, reward) in enumerate(
+            zip(metadata_rows, outcomes, rewards, strict=True)
+        ):
+            if "tito_session_mismatch" not in metadata:
+                if segment_ordinal == len(metadata_rows) - 1:
+                    raise EvalPostcheckError(f"{source}: {sample_id} is missing terminal TITO " "comparison evidence")
                 continue
-            if segment_ordinal != len(metadata_rows) - 1 or not isinstance(mismatch, list) or len(mismatch) != 1:
-                raise EvalPostcheckError(f"{source}: {sample_id} has a nonterminal or multi-entry TITO mismatch")
+            mismatch = metadata["tito_session_mismatch"]
+            if not isinstance(mismatch, list):
+                raise EvalPostcheckError(f"{source}: {sample_id} has malformed TITO comparison evidence")
+            if not mismatch:
+                continue
+            if segment_ordinal != len(metadata_rows) - 1:
+                raise EvalPostcheckError(f"{source}: {sample_id} has a nonterminal TITO mismatch")
+            status_matches = outcome.get("status") == metadata.get("exit_status")
+
             entry = mismatch[0]
             detail_match = TITO_COUNT_DETAIL.fullmatch(entry.get("detail", "")) if isinstance(entry, dict) else None
             expected_text = entry.get("expected_text") if isinstance(entry, dict) else None
             actual_text = entry.get("actual_text") if isinstance(entry, dict) else None
-            if (
-                not isinstance(entry, dict)
-                or set(entry) != {"type", "segment_index", "expected_text", "actual_text", "detail"}
-                or entry.get("type") != "special_token_count"
-                or entry.get("segment_index") != -1
-                or detail_match is None
-                or int(detail_match.group(2)) != int(detail_match.group(1)) - 1
-                or not isinstance(expected_text, str)
-                or not expected_text.endswith("[<|im_end|>]")
-                or not isinstance(actual_text, str)
-                or actual_text.endswith("[<|im_end|>]")
-                or metadata.get("exit_status") not in {"max_seq_len", "max_turns"}
-                or outcome.get("status") != metadata.get("exit_status")
-                or reward != 0.0
-            ):
+            boundary_shape = (
+                len(mismatch) == 1
+                and _common_tito_mismatch_shape(entry, status_matches=status_matches)
+                and entry.get("type") == "special_token_count"
+                and entry.get("segment_index") == -1
+                and detail_match is not None
+                and int(detail_match.group(2)) == int(detail_match.group(1)) - 1
+                and expected_text.endswith("[<|im_end|>]")
+                and not actual_text.endswith("[<|im_end|>]")
+                and metadata.get("exit_status") in {"max_seq_len", "max_turns"}
+                and reward == 0.0
+            )
+            # Assistant content is inherited from the generated pretokenized
+            # prefix, so a canonical text rerender may differ without changing
+            # the training tokens. Miles treats this as a soft, ratio-gated TITO
+            # diagnostic; special-token and non-assistant mismatches stay fatal.
+            assistant_segment_indices = [entry.get("segment_index") for entry in mismatch if isinstance(entry, dict)]
+            assistant_text_shape = all(
+                _common_tito_mismatch_shape(entry, status_matches=status_matches)
+                and entry.get("type") == "assistant_text"
+                and type(entry.get("segment_index")) is int
+                and entry["segment_index"] >= 0
+                and entry.get("detail") == ""
+                for entry in mismatch
+            ) and len(set(assistant_segment_indices)) == len(mismatch)
+            if boundary_shape:
+                terminal_boundary_mismatch = True
+            elif assistant_text_shape:
+                terminal_assistant_text_mismatch = True
+            else:
                 raise EvalPostcheckError(f"{source}: {sample_id} has an unapproved TITO mismatch shape")
-            terminal_mismatch = True
         contract = expected[sample_id]
         results.append(
             LogicalResult(
@@ -680,7 +892,8 @@ def _validate_payload(
                 episode_id=outcomes[0]["episode_id"],
                 trajectory_id=trajectory_id,
                 segments=len(rows),
-                terminal_tito_boundary_mismatch=terminal_mismatch,
+                terminal_tito_boundary_mismatch=terminal_boundary_mismatch,
+                terminal_tito_assistant_text_mismatch=terminal_assistant_text_mismatch,
             )
         )
         segment_count += len(rows)
@@ -699,7 +912,15 @@ def _validate_payload(
             "infrastructure_aborted_replacements": 0,
             "signed_outcomes_verified": len(results),
             "terminal_tito_boundary_mismatch_count": sum(result.terminal_tito_boundary_mismatch for result in results),
-            "terminal_tito_boundary_mismatch_sample_ids": sorted(result.sample_id for result in results if result.terminal_tito_boundary_mismatch),
+            "terminal_tito_boundary_mismatch_sample_ids": sorted(
+                result.sample_id for result in results if result.terminal_tito_boundary_mismatch
+            ),
+            "terminal_tito_assistant_text_mismatch_count": sum(
+                result.terminal_tito_assistant_text_mismatch for result in results
+            ),
+            "terminal_tito_assistant_text_mismatch_sample_ids": sorted(
+                result.sample_id for result in results if result.terminal_tito_assistant_text_mismatch
+            ),
         },
         results,
     )
@@ -708,7 +929,11 @@ def _validate_payload(
 def _aggregate(results: list[LogicalResult], expected_tasks: set[str]) -> dict[str, Any]:
     if len(results) != EXPECTED_TRAJECTORIES:
         raise EvalPostcheckError("evaluation did not produce 180 logical results")
-    if len({result.sample_id for result in results}) != EXPECTED_TRAJECTORIES or len({result.episode_id for result in results}) != EXPECTED_TRAJECTORIES or len({result.trajectory_id for result in results}) != EXPECTED_TRAJECTORIES:
+    if (
+        len({result.sample_id for result in results}) != EXPECTED_TRAJECTORIES
+        or len({result.episode_id for result in results}) != EXPECTED_TRAJECTORIES
+        or len({result.trajectory_id for result in results}) != EXPECTED_TRAJECTORIES
+    ):
         raise EvalPostcheckError("evaluation reused a sample, trajectory, or managed episode identity")
     by_task: dict[str, list[LogicalResult]] = defaultdict(list)
     for result in results:
@@ -721,28 +946,60 @@ def _aggregate(results: list[LogicalResult], expected_tasks: set[str]) -> dict[s
         if [result.replica for result in rows] != list(range(ROLLOUTS_PER_TASK)):
             raise EvalPostcheckError(f"task {task_id} does not have replicas 0..3")
         rewards = [result.reward for result in rows]
+        passed_rollouts = sum(reward == 1.0 for reward in rewards)
+        failed_rollouts = ROLLOUTS_PER_TASK - passed_rollouts
+        pass_at_2 = 1.0 - (
+            math.comb(failed_rollouts, 2) / math.comb(ROLLOUTS_PER_TASK, 2) if failed_rollouts >= 2 else 0.0
+        )
+        pass_at_3 = 1.0 - (
+            math.comb(failed_rollouts, 3) / math.comb(ROLLOUTS_PER_TASK, 3) if failed_rollouts >= 3 else 0.0
+        )
         task_results[task_id] = {
             "rewards_by_replica": rewards,
             "reward_sum": sum(rewards),
             "mean_reward": sum(rewards) / ROLLOUTS_PER_TASK,
-            "passed_rollouts": sum(reward == 1.0 for reward in rewards),
+            "passed_rollouts": passed_rollouts,
             "any_success": any(reward == 1.0 for reward in rewards),
+            "pass_at_2": pass_at_2,
+            "pass_at_3": pass_at_3,
         }
     reward_sum = sum(result.reward for result in results)
     tasks_with_success = sum(row["any_success"] for row in task_results.values())
-    mismatch_ids = sorted(result.sample_id for result in results if result.terminal_tito_boundary_mismatch)
+    boundary_mismatch_ids = sorted(result.sample_id for result in results if result.terminal_tito_boundary_mismatch)
+    assistant_text_mismatch_ids = sorted(
+        result.sample_id for result in results if result.terminal_tito_assistant_text_mismatch
+    )
+    assistant_text_mismatch_ratio = len(assistant_text_mismatch_ids) / EXPECTED_TRAJECTORIES
+    if assistant_text_mismatch_ratio > MAX_ASSISTANT_TEXT_MISMATCH_RATIO:
+        raise EvalPostcheckError(
+            "assistant_text TITO mismatch ratio exceeds the soft safety threshold: "
+            f"{len(assistant_text_mismatch_ids)}/{EXPECTED_TRAJECTORIES}="
+            f"{assistant_text_mismatch_ratio:.6f} > "
+            f"{MAX_ASSISTANT_TEXT_MISMATCH_RATIO:.6f}"
+        )
     return {
         "rollout_reward_sum": reward_sum,
         "rollout_mean_reward": reward_sum / EXPECTED_TRAJECTORIES,
         "pass_at_1": reward_sum / EXPECTED_TRAJECTORIES,
+        "pass_at_2": sum(row["pass_at_2"] for row in task_results.values()) / EXPECTED_TASKS,
+        "pass_at_3": sum(row["pass_at_3"] for row in task_results.values()) / EXPECTED_TASKS,
         "passed_rollouts": int(reward_sum),
         "tasks_with_any_success": tasks_with_success,
         "task_success_rate_at_4": tasks_with_success / EXPECTED_TASKS,
         "pass_at_4": tasks_with_success / EXPECTED_TASKS,
         "status_counts": dict(sorted(Counter(result.status for result in results).items())),
         "verifier_counts": dict(sorted(Counter(result.verifier for result in results).items())),
-        "terminal_tito_boundary_mismatch_count": len(mismatch_ids),
-        "terminal_tito_boundary_mismatch_sample_ids": mismatch_ids,
+        "terminal_tito_boundary_mismatch_count": len(boundary_mismatch_ids),
+        "terminal_tito_boundary_mismatch_sample_ids": boundary_mismatch_ids,
+        "terminal_tito_assistant_text_mismatch_count": len(assistant_text_mismatch_ids),
+        "terminal_tito_assistant_text_mismatch_sample_ids": (assistant_text_mismatch_ids),
+        "terminal_tito_assistant_text_mismatch_ratio": (assistant_text_mismatch_ratio),
+        "terminal_tito_assistant_text_mismatch_ratio_threshold": (MAX_ASSISTANT_TEXT_MISMATCH_RATIO),
+        # The terminal special-token exception is score-safe but not suitable
+        # as training input. Assistant-text differences are only a soft
+        # canonical-rerender diagnostic because Miles inherits the actual
+        # assistant tokens from the pretokenized prefix.
+        "trace_ineligible_trajectory_count": len(boundary_mismatch_ids),
         "tasks": task_results,
     }
 
@@ -776,9 +1033,7 @@ def _wait_for_managed_clean(*, url: str, run_id: str, timeout_s: float) -> dict[
     if url != MANAGED_STATUS_URL:
         raise EvalPostcheckError("managed status URL is not the endpoint used by eval containers")
     try:
-        from examples.experimental.openenv.preflight_tbench21_shared_server import (
-            wait_for_idle_managed_status,
-        )
+        from examples.experimental.openenv.preflight_tbench21_shared_server import wait_for_idle_managed_status
 
         status = wait_for_idle_managed_status(
             url=url,
@@ -823,6 +1078,7 @@ def postcheck(
     launch = baseline._load_json(launch_manifest_path, "eval launch manifest", private=True)
     records = launch.get("containers")
     runtime_image = launch.get("runtime_image")
+    served_policy = launch.get("served_policy")
     plan_source = plan_dir.expanduser()
     if not plan_source.is_absolute() or plan_source.is_symlink() or not plan_source.is_dir():
         raise EvalPostcheckError("plan directory must be an absolute real directory")
@@ -842,6 +1098,15 @@ def postcheck(
         or not isinstance(runtime_image, dict)
         or runtime_image.get("id") != RUNTIME_IMAGE_ID
         or launch.get("checkpoint") != str(checkpoint)
+        or served_policy
+        != {
+            "mode": "actor-checkpoint-publication",
+            "hf_bootstrap": str(model) if model is not None else None,
+            "actor_checkpoint": str(checkpoint),
+            "weight_equality_required": True,
+            "bootstrap_difference_required": True,
+            "publication_evidence": "checkpoint-publication.json",
+        }
         or launch.get("plan_dir") != str(plan_dir)
         or model is None
         or not model.is_dir()
@@ -879,20 +1144,36 @@ def postcheck(
 
     output_root = launch_manifest_path.parent
     island_reports: list[dict[str, Any]] = []
+    publication_evidence: list[dict[str, Any]] = []
     logical_results: list[LogicalResult] = []
     for island_id, expected in enumerate(expected_by_island):
         record = records[island_id]
         output = output_root / f"island-{island_id}"
         if record.get("output") != str(output) or not output.is_dir() or output.is_symlink():
             raise EvalPostcheckError(f"island {island_id} output path changed after launch")
-        if any((output / name).exists() for name in ("actor-checkpoint", "critic-checkpoint", "completed-groups.pt", "trajectory-evidence")) or any((output / "details" / name).exists() for name in ("train_data", "policy_loss_debug")):
+        if any(
+            (output / name).exists()
+            for name in ("actor-checkpoint", "critic-checkpoint", "completed-groups.pt", "trajectory-evidence")
+        ) or any((output / "details" / name).exists() for name in ("train_data", "policy_loss_debug")):
             raise EvalPostcheckError(f"island {island_id} eval output contains training or optimizer artifacts")
+        island_publication = _validate_checkpoint_publication_evidence(
+            output,
+            island_id=island_id,
+        )
+        publication_evidence.append(island_publication)
         shard = plan_dir / f"eval/island-{island_id}.jsonl"
         if record.get("plan_shard") != str(shard) or record.get("plan_shard_sha256") != baseline._sha256(shard):
             raise EvalPostcheckError(f"island {island_id} launch is not bound to its eval shard")
         rollout_dir = output / "details/rollout_data"
         source = rollout_dir / "0.pt"
-        if not rollout_dir.is_dir() or rollout_dir.is_symlink() or sorted(rollout_dir.iterdir(), key=lambda path: path.name) != [source] or not source.is_file() or source.is_symlink() or source.stat().st_size == 0:
+        if (
+            not rollout_dir.is_dir()
+            or rollout_dir.is_symlink()
+            or sorted(rollout_dir.iterdir(), key=lambda path: path.name) != [source]
+            or not source.is_file()
+            or source.is_symlink()
+            or source.stat().st_size == 0
+        ):
             raise EvalPostcheckError(f"island {island_id} must contain exactly details/rollout_data/0.pt")
         island_report, results = _validate_payload(
             baseline._load_rollout_payload(source),
@@ -900,9 +1181,29 @@ def postcheck(
             expected=expected,
             source=source,
             hmac_key=hmac_key,
+            expected_weight_version=island_publication["republished_weight_versions"][0],
         )
         island_reports.append(island_report)
         logical_results.extend(results)
+
+    # Reset tensors are intentionally randomized under each island's distinct
+    # rollout seed, so their checksum is only an island-local negative control.
+    # The immutable HF bootstrap and the republished actor must match globally.
+    policy_evidence_fields = (
+        "base_language_checksum_sha256",
+        "served_language_checksum_sha256",
+        "language_tensor_count",
+        "changed_language_tensor_count",
+        "reset_changed_language_tensor_count",
+        "bootstrap_weight_versions",
+        "served_weight_versions",
+        "republished_weight_versions",
+    )
+    if any(
+        len({json.dumps(evidence[field], sort_keys=True) for evidence in publication_evidence}) != 1
+        for field in policy_evidence_fields
+    ):
+        raise EvalPostcheckError("eval islands did not serve one identical checkpoint-backed policy")
 
     managed_process = _managed_process(managed_server_pid, run_id=managed_run_id)
     managed_status = _wait_for_managed_clean(
@@ -910,6 +1211,7 @@ def postcheck(
         run_id=managed_run_id,
         timeout_s=managed_clean_timeout_s,
     )
+    aggregate = _aggregate(logical_results, expected_tasks)
     return {
         "schema": REPORT_SCHEMA,
         "ok": True,
@@ -928,7 +1230,12 @@ def postcheck(
             "inventory_sha256": checkpoint_inventory_sha256,
             "inventory_files": checkpoint_inventory_files,
             "mounted_read_only_by_all_islands": True,
+            "served_via_actor_publication": True,
+            "sglang_weight_equality_verified_by_all_islands": True,
+            "base_to_trained_language_change_verified_by_all_islands": True,
+            "hf_bootstrap_path": str(model),
         },
+        "checkpoint_publication_evidence": publication_evidence,
         "training_provenance": training_provenance,
         "hmac_key_file_mode": oct(stat.S_IMODE(hmac_key_path.stat().st_mode)),
         "containers": completed,
@@ -937,11 +1244,32 @@ def postcheck(
         "task_count": len(expected_tasks),
         "rollouts_per_task": ROLLOUTS_PER_TASK,
         "signed_outcomes_verified": sum(report["signed_outcomes_verified"] for report in island_reports),
-        "trajectories_with_infrastructure_503_retry": sum(report["trajectories_with_infrastructure_503_retry"] for report in island_reports),
+        "trajectories_with_infrastructure_503_retry": sum(
+            report["trajectories_with_infrastructure_503_retry"] for report in island_reports
+        ),
         "infrastructure_aborted_replacements": 0,
-        "terminal_tito_boundary_mismatch_count": sum(report["terminal_tito_boundary_mismatch_count"] for report in island_reports),
-        "terminal_tito_boundary_mismatch_sample_ids": sorted(sample_id for report in island_reports for sample_id in report["terminal_tito_boundary_mismatch_sample_ids"]),
-        "aggregate": _aggregate(logical_results, expected_tasks),
+        "terminal_tito_boundary_mismatch_count": sum(
+            report["terminal_tito_boundary_mismatch_count"] for report in island_reports
+        ),
+        "terminal_tito_boundary_mismatch_sample_ids": sorted(
+            sample_id
+            for report in island_reports
+            for sample_id in report["terminal_tito_boundary_mismatch_sample_ids"]
+        ),
+        "terminal_tito_assistant_text_mismatch_count": sum(
+            report["terminal_tito_assistant_text_mismatch_count"] for report in island_reports
+        ),
+        "terminal_tito_assistant_text_mismatch_sample_ids": sorted(
+            sample_id
+            for report in island_reports
+            for sample_id in report["terminal_tito_assistant_text_mismatch_sample_ids"]
+        ),
+        "terminal_tito_assistant_text_mismatch_ratio": aggregate["terminal_tito_assistant_text_mismatch_ratio"],
+        "terminal_tito_assistant_text_mismatch_ratio_threshold": aggregate[
+            "terminal_tito_assistant_text_mismatch_ratio_threshold"
+        ],
+        "assistant_text_mismatches_are_soft_token_roundtrip_diagnostics": True,
+        "aggregate": aggregate,
         "managed_server": {"process": managed_process, "status": managed_status},
     }
 

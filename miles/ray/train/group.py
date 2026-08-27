@@ -165,6 +165,21 @@ class RayTrainGroup:
 
         self._test_action_executor.run_after_step(rollout_id=rollout_id)
 
+    async def evaluate_critic(self, rollout_id: int, rollout_data_pack):
+        """Run one optimizer-free critic evaluation batch on every live cell."""
+
+        _cells, results = await self._execute_all_alive_and_catch(
+            "evaluate_critic",
+            rollout_id,
+            rollout_data_pack["data_ref"],
+        )
+        flattened = []
+        for result in results:
+            if isinstance(result, BaseException):
+                raise RuntimeError("critic evaluation failed in a trainer cell") from result
+            flattened.extend(result)
+        return flattened
+
     def _allocate_witness_info(self, *, rollout_id: int, attempt: int, sample_indices):
         if self._witness_allocator is None:
             return None
