@@ -212,6 +212,11 @@ def setup_model_and_optimizer(
                 getattr(args, "use_gloo_process_groups", False),
             ),
         )
+    if args.stream_optimizer_state_to_disk:
+        from miles_plugins.optimizers.nvme_stream import setup_optimizer_state_streaming
+
+        setup_optimizer_state_streaming(args, optimizer)
+
     opt_param_scheduler = get_optimizer_param_scheduler(args, optimizer, role=role)
     return model, optimizer, opt_param_scheduler
 
@@ -688,8 +693,7 @@ def train(
     args = get_args()
     disable_optimizer = args.debug_disable_optimizer or optimizer is None
     capture_external_stats = (
-        getattr(args, "external_policy_sync_path", None) is not None
-        and is_first_replica_megatron_main_rank()
+        getattr(args, "external_policy_sync_path", None) is not None and is_first_replica_megatron_main_rank()
     )
     train_started = time.monotonic() if capture_external_stats else None
     if capture_external_stats:

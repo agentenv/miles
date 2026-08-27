@@ -33,14 +33,15 @@ class _FakeObs:
 
 
 class _FakeResult:
-    def __init__(self, output="", reward=None, instruction=""):
-        self.observation = _FakeObs(output=output, instruction=instruction)
+    def __init__(self, output="", reward=None, instruction="", info=None):
+        self.observation = _FakeObs(output=output, instruction=instruction, info=info or {})
         if reward is not None:
             self.reward = reward
 
 
 class _FakeEnv:
-    """Records every step() action; answers both scoring protocols."""
+    """Records every step() action; answers `evaluate` like a contract-carrying
+    server (reward plus the canonical-harness marker)."""
 
     last_actions: list = []
     last_init: dict = {}
@@ -76,9 +77,7 @@ class _FakeEnv:
     async def step(self, action):
         self.actions.append(action)
         if action.action_type == "evaluate":
-            return _FakeResult(reward=1.0)
-        if "test.sh" in (action.command or ""):
-            return _FakeResult(output=f"{oaf._REWARD_MARKER}1.0")
+            return _FakeResult(reward=1.0, info={"tests_passed": True, "harness": "tests/test.sh"})
         return _FakeResult(output="ok")
 
 
@@ -187,33 +186,10 @@ def test_trial_dir_purge_is_bounded_when_server_action_stalls(monkeypatch):
 
 
 def test_shared_leg_dispatch(monkeypatch):
-    """The shared-server run_episode: exec prefixed with the task workdir,
-    canonical-exec scoring, rm-hack present, standard `evaluate` never used."""
-    monkeypatch.delenv("OPENENV_NATIVE_EVALUATE", raising=False)
-    monkeypatch.setattr(oaf, "_load_tbench2", lambda: _CLASSES)
-
-    async def spying_with_env(env_cls, env_url, body):
-        return await body(env_cls())
-
-    monkeypatch.setattr(oaf, "_with_env", spying_with_env)
-
-    reward, metrics = run_async(
-        oaf.run_episode(_FakePolicy(), "m", [{"role": "system", "content": "s"}], {}, {"task_id": "t1"})
-    )
-    actions = _FakeEnv.last_actions
-    execs = [a for a in actions if a.action_type == "exec"]
-
-    assert reward == 1.0
-    assert execs[0].command == "cd /app && echo hi"
-    assert any("bash /tests/test.sh" in a.command for a in execs)
-    assert any("/tmp/tbench2_env_runs" in a.command for a in execs), "rm-hack missing"
-    assert not any(a.action_type == "evaluate" for a in actions)
-    assert metrics["turns"] == 2 and metrics["tool_calls"] == 1
-
-
-def test_shared_leg_can_use_native_terminal_bench_verifier(monkeypatch):
-    """TB2.1-capable servers own workdir selection and canonical scoring."""
-    monkeypatch.setenv("OPENENV_NATIVE_EVALUATE", "1")
+    """The shared-server run_episode: exec commands pass through unmodified
+    (the server resolves the workdir), scoring via the standard `evaluate`
+    action — and the trial-dir purge (post_episode) runs, since the shared
+    server outlives the episode."""
     monkeypatch.setattr(oaf, "_load_tbench2", lambda: _CLASSES)
 
     async def spying_with_env(env_cls, env_url, body):
@@ -229,6 +205,34 @@ def test_shared_leg_can_use_native_terminal_bench_verifier(monkeypatch):
 
     assert reward == 1.0
     assert execs[0].command == "echo hi"
-    assert not any("bash /tests/test.sh" in a.command for a in execs)
+    assert any("/tmp/tbench2_env_runs" in (a.command or "") for a in execs), "trial-dir purge missing"
     assert any(a.action_type == "evaluate" for a in actions)
     assert metrics["turns"] == 2 and metrics["tool_calls"] == 1
+
+
+def test_old_server_reward_is_not_trusted(monkeypatch):
+    """A server without the canonical contract (e.g. an out-of-date install)
+    answers `evaluate` with a plausible-looking reward but no harness marker
+    (its info is {tests_passed, exit_code} from bare pytest). That reward must
+    be dropped, not ingested: source preflight is impossible against a remote
+    server."""
+
+    class _OldServerEnv(_FakeEnv):
+        async def step(self, action):
+            if action.action_type == "evaluate":
+                self.actions.append(action)
+                return _FakeResult(reward=1.0, info={"tests_passed": True, "exit_code": 0})
+            return await super().step(action)
+
+    monkeypatch.setattr(oaf, "_load_tbench2", lambda: {"env": _OldServerEnv, "action": _CLASSES["action"]})
+
+    async def spying_with_env(env_cls, env_url, body):
+        return await body(env_cls())
+
+    monkeypatch.setattr(oaf, "_with_env", spying_with_env)
+
+    reward, metrics = run_async(
+        oaf.run_episode(_FakePolicy(), "m", [{"role": "system", "content": "s"}], {}, {"task_id": "t1"})
+    )
+    assert reward is None
+    assert metrics["turns"] == 2  # the episode itself completed; only scoring was rejected

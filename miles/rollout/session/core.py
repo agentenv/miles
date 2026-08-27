@@ -5,6 +5,7 @@ HTTP-agnostic: the FastAPI adapter (``sessions.py`` + ``server.py``) turns each 
 - ``chat_completions`` strips the R3 replay payloads (``routed_experts`` / ``indexer_topk``) from the client reply copy-on-write; the ``SessionRecord`` keeps the full response for the training path (``GET /sessions/{id}``).
 - ``chat_completions`` holds the per-session lock for prep and state update but not across the proxy call; ``closing`` re-checks and the ``num_assistant`` check gate concurrent DELETE/chat.
 - ``stream: true`` is served as fake streaming: the backend call stays non-streaming (TITO needs the complete message + meta_info) and the full response is re-rendered as a single SSE chunk plus ``data: [DONE]``. Errors all happen before the SSE body is built, so they keep their real status codes as JSON.
+- ``collect_samples`` assembles training Samples from the session's records on the server (compute -> truncate -> merge, synchronously on the loop like the lock-free ``get_session``); deterministic assembly failures return 422 with the assertion text.
 """
 
 import json
@@ -14,6 +15,7 @@ from dataclasses import dataclass
 
 from starlette.responses import Response
 
+from miles.rollout.generate_utils.sample_utils import merge_samples
 from miles.rollout.session.errors import (
     ContextBudgetError,
     MessageValidationError,
@@ -22,6 +24,8 @@ from miles.rollout.session.errors import (
     UpstreamResponseError,
 )
 from miles.rollout.session.linear_trajectory import SessionRegistry
+from miles.rollout.session.samples.codec import encode_samples
+from miles.rollout.session.samples.merge import compute_samples_from_openai_records, truncate_samples_by_total_tokens
 from miles.rollout.session.types import GetSessionResponse, SessionRecord
 
 logger = logging.getLogger(__name__)
@@ -29,8 +33,11 @@ logger = logging.getLogger(__name__)
 JSON_MEDIA_TYPE = "application/json"
 
 # Hop-by-hop / length-framing headers dropped from the upstream response so the
-# transport layer recomputes them from the body we actually send.
-_DROP_RESPONSE_HEADERS = ("content-length", "transfer-encoding", "content-encoding")
+# transport layer recomputes them from the body we actually send. "server" and
+# "date" are dropped because our own ASGI server always emits them, so echoing
+# upstream's copy puts two of each on the wire; aiohttp's parser rejects that
+# outright with "Duplicate 'Server' header found" instead of reading the body.
+_DROP_RESPONSE_HEADERS = ("content-length", "transfer-encoding", "content-encoding", "server", "date")
 
 _COMPACTION_HEADER_NAMES = {
     "schema_version": "x-miles-compaction-schema-version",
@@ -71,6 +78,11 @@ class ProxyRequest:
 def _render_json(payload) -> bytes:
     """Encode like Starlette's JSONResponse (compact, non-ASCII preserved)."""
     return json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
+
+
+def _samples_response(payload: bytes) -> Response:
+    """The samples-op reply: one safetensors binary payload."""
+    return Response(content=payload, status_code=200, media_type="application/octet-stream")
 
 
 _CLIENT_STRIPPED_META_KEYS = ("routed_experts", "indexer_topk")
@@ -176,8 +188,10 @@ class SessionCore:
         session_id = self.registry.create_session()
         return Response(content=_render_json({"session_id": session_id}), status_code=200, media_type=JSON_MEDIA_TYPE)
 
-    async def get_session(self, session_id: str) -> Response:
-        session = self.registry.get_session(session_id)
+    def _session_metadata(self, session_id: str, session) -> dict:
+        """The per-session assembly/inspection metadata dict, shared by
+        `get_session` (records debug dump) and `collect_samples` (samples op)
+        so the two can never drift."""
         metadata: dict = {}
         try:
             mismatch = self.registry.compute_session_mismatch(session)
@@ -192,15 +206,54 @@ class SessionCore:
             metadata["compaction_schema_version"] = session.compaction_schema_version
             metadata["compaction_context_budget"] = session.compaction_context_budget
             metadata["accumulated_token_ids_by_context_window"] = {
-                str(key): value
-                for key, value in session.accumulated_token_ids_by_context_window().items()
+                str(key): value for key, value in session.accumulated_token_ids_by_context_window().items()
             }
             metadata["compaction_context_window_count"] = session.compaction_context_window + 1
             metadata["compaction_segment_count"] = session.compaction_segment_index + 1
+        return metadata
+
+    async def get_session(self, session_id: str) -> Response:
+        session = self.registry.get_session(session_id)
+        metadata = self._session_metadata(session_id, session)
         payload = GetSessionResponse(session_id=session_id, records=session.records, metadata=metadata)
         return Response(
             content=_render_json(payload.model_dump(mode="json")), status_code=200, media_type=JSON_MEDIA_TYPE
         )
+
+    async def collect_samples(self, session_id: str, *, max_seq_len: int | None) -> Response:
+        """Assemble training Samples from this session's records.
+
+        Validation failures return 422; unexpected errors propagate.
+        """
+        session = self.registry.get_session(session_id)
+        metadata = self._session_metadata(session_id, session)
+        metadata["records_collected"] = len(session.records)
+        tokenizer = self.registry.tokenizer
+        if not session.records:
+            return _samples_response(encode_samples([], metadata, empty_reason="no_records"))
+        try:
+            samples = compute_samples_from_openai_records(
+                self.args,
+                session.records,
+                tokenizer,
+                accumulated_token_ids=metadata.get("accumulated_token_ids"),
+                accumulated_token_ids_by_context_window=metadata.get("accumulated_token_ids_by_context_window"),
+                max_trim_tokens=metadata.get("max_trim_tokens", 0),
+            )
+            if max_seq_len is not None:
+                samples = truncate_samples_by_total_tokens(samples, max_seq_len, tokenizer)
+            if not samples:
+                return _samples_response(encode_samples([], metadata, empty_reason="all_truncated"))
+            # Compaction segments need outcome metadata from the agent before
+            # they can be merged (notably for terminal orphan summaries), so
+            # the server ships their per-turn samples. The driver applies that
+            # metadata and performs the segment-local merge. Legacy sessions
+            # keep the upstream one-sample server assembly contract.
+            if session.compaction_schema_version is None:
+                samples = [merge_samples(samples, tokenizer)]
+        except (AssertionError, ValueError) as exc:
+            return Response(content=str(exc).encode(), status_code=422, media_type="text/plain")
+        return _samples_response(encode_samples(samples, metadata))
 
     async def delete_session(self, session_id: str) -> Response:
         session = self.registry.get_session(session_id)
@@ -249,9 +302,7 @@ class SessionCore:
 
             compaction = _parse_compaction_headers(headers)
             transition_checkpoint = (
-                session.compaction_transition_checkpoint()
-                if compaction["schema_version"] is not None
-                else None
+                session.compaction_transition_checkpoint() if compaction["schema_version"] is not None else None
             )
             try:
                 session.prepare_compaction_segment(
@@ -279,21 +330,25 @@ class SessionCore:
             # Must be False so stop-token text is trimmed from assistant content;
             # token IDs still come from logprobs below.
             request_body["no_stop_trim"] = False
-            # Chat template kwargs should also be forwarded to sglang to make sure
-            # parsers work correctly.
-            server_ctk = self.registry.tito_tokenizer.chat_template_kwargs
-            if server_ctk:
-                request_body["chat_template_kwargs"] = {
-                    **server_ctk,
-                    **(request_body.get("chat_template_kwargs") or {}),
-                }
-
-            request_messages = request_body.get("messages", [])
+            # FIXME(session): Only nested `chat_template_kwargs` reach the local renderer;
+            # top-level `reasoning` and `reasoning_effort` are not mapped to template kwargs.
             try:
+                request_ctk = request_body.get("chat_template_kwargs")
+                if request_ctk is not None and not isinstance(request_ctk, dict):
+                    raise MessageValidationError("chat_template_kwargs must be an object")
+                tito_tokenizer = self.registry.tito_tokenizer
+                if request_ctk:
+                    tito_tokenizer = tito_tokenizer.clone_with_chat_template_kwargs(request_ctk)
+                if tito_tokenizer.chat_template_kwargs:
+                    request_body["chat_template_kwargs"] = dict(tito_tokenizer.chat_template_kwargs)
+                else:
+                    request_body.pop("chat_template_kwargs", None)
+
+                request_messages = request_body.get("messages", [])
                 prompt_token_ids = session.prepare_pretokenized(
                     request_messages,
                     tools=request_body.get("tools"),
-                    tito_tokenizer=self.registry.tito_tokenizer,
+                    tito_tokenizer=tito_tokenizer,
                 )
                 request_body["input_ids"] = prompt_token_ids
                 logger.debug("Using TITO input_ids: %d tokens", len(prompt_token_ids))
@@ -309,6 +364,10 @@ class SessionCore:
                             f"prompt_tokens={len(prompt_token_ids)}, max_tokens={max_tokens}, "
                             f"context_budget={context_budget}"
                         )
+            except ValueError as e:
+                if transition_checkpoint is not None:
+                    session.restore_compaction_transition(transition_checkpoint)
+                raise MessageValidationError(str(e)) from e
             except Exception:
                 if transition_checkpoint is not None:
                     session.restore_compaction_transition(transition_checkpoint)
@@ -325,9 +384,7 @@ class SessionCore:
 
         # --- Phase 2: proxy to backend (NO lock held) ---
         headers = {
-            key: value
-            for key, value in headers.items()
-            if key.lower() not in _COMPACTION_HEADER_NAMES.values()
+            key: value for key, value in headers.items() if key.lower() not in _COMPACTION_HEADER_NAMES.values()
         }
         headers = {**headers, "X-SMG-Routing-Key": session_id}
         result = await self.backend.do_proxy(
@@ -400,8 +457,7 @@ class SessionCore:
             )
             if actual_compaction_state != expected_compaction_state:
                 logger.warning(
-                    "Session %s compaction state changed during proxy (expected=%r, got=%r), "
-                    "skipping state update",
+                    "Session %s compaction state changed during proxy (expected=%r, got=%r), " "skipping state update",
                     session_id,
                     expected_compaction_state,
                     actual_compaction_state,
@@ -426,24 +482,16 @@ class SessionCore:
                 response=response,
                 compaction_schema_version=session.compaction_schema_version,
                 compaction_context_window=(
-                    session.compaction_context_window
-                    if session.compaction_schema_version is not None
-                    else None
+                    session.compaction_context_window if session.compaction_schema_version is not None else None
                 ),
                 compaction_segment_index=(
-                    session.compaction_segment_index
-                    if session.compaction_schema_version is not None
-                    else None
+                    session.compaction_segment_index if session.compaction_schema_version is not None else None
                 ),
                 compaction_segment_type=(
-                    session.compaction_segment_type
-                    if session.compaction_schema_version is not None
-                    else None
+                    session.compaction_segment_type if session.compaction_schema_version is not None else None
                 ),
                 compaction_context_budget=(
-                    session.compaction_context_budget
-                    if session.compaction_schema_version is not None
-                    else None
+                    session.compaction_context_budget if session.compaction_schema_version is not None else None
                 ),
             )
             session.append_record(record)

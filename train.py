@@ -9,10 +9,11 @@ from pathlib import Path
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 
 from miles.ray.placement_group import create_placement_groups, create_rollout_manager, create_training_models
+from miles.utils import object_store
 from miles.utils.arguments import parse_args
-from miles.utils.async_utils import eager_create_task
 from miles.utils.audit_utils.checksum_utils import flatten_inference_engine_checksums
 from miles.utils.audit_utils.process_identity import MainProcessIdentity
+from miles.utils.data import remove_rollout_data_refs
 from miles.utils.debug_utils.periodic_py_spy import maybe_start_periodic_pyspy_dump
 from miles.utils.ft_utils.control_server.server import start_control_server
 from miles.utils.ft_utils.mini_ft_controller import maybe_start_mini_ft_controller
@@ -259,31 +260,13 @@ def _load_external_policy_sync(args, *, critic_model):
     return synchronizer
 
 
-async def _train_actor_and_critic(
-    actor_model,
-    critic_model,
-    rollout_id,
-    rollout_data_ref,
-):
-    """Train both roles concurrently and stop either one when its peer fails."""
-    critic_task = await eager_create_task(critic_model.train(rollout_id, rollout_data_ref))
-    actor_task = await eager_create_task(actor_model.train(rollout_id, rollout_data_ref))
-    tasks = (critic_task, actor_task)
-    try:
-        await asyncio.gather(*tasks)
-    except BaseException:
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        raise
-
-
 async def train(args):
+    assert not args.fully_async, "--fully-async requires the async driver: run train_async.py"
     configure_logger(args, source=MainProcessIdentity())
     maybe_start_periodic_pyspy_dump()
     # allocate the GPUs
     pgs = create_placement_groups(args)
+    object_store.init_instance(args, contribute_segment=False)
     init_tracking(args)
 
     # create the rollout manager, with sglang engines inside.
@@ -320,11 +303,9 @@ async def train(args):
     initial_train_offloaded = False
     if external_policy_sync is not None and args.offload_train and args.offload_rollout:
         # Match the steady-state publication order below.  The external
-        # policy has already been applied while the trainer is awake, so
-        # retain its prepared LoRA payload before releasing trainer memory.
-        # Resuming rollout weights while the trainer is still resident can
-        # otherwise exceed GPU capacity before the first rollout.
-        await actor_model.prepare_weight_update()
+        # policy has already been applied while the trainer is awake. Release
+        # trainer memory before resuming rollout weights; the current updater
+        # supports publication from the offloaded actor state.
         await actor_model.offload()
         if critic_model is not None:
             await critic_model.offload()
@@ -379,22 +360,27 @@ async def train(args):
         await rollout_manager.eval.remote(rollout_id=0)
 
     async def offload_train():
+        if args.use_critic:
+            return
         if args.offload_train:
-            if args.use_critic:
-                await critic_model.offload()
-                if rollout_id >= args.num_critic_only_steps:
-                    await actor_model.offload()
-            else:
-                await actor_model.offload()
+            await actor_model.offload()
         else:
             await actor_model.clear_memory()
 
     async def save(rollout_id, force_sync=False):
         force_sync = force_sync or rollout_id == args.num_rollout - 1
+
+        async def save_training_model(model):
+            if args.use_critic and args.offload_train:
+                await model.onload()
+            await model.save_model(rollout_id, force_sync=force_sync)
+            if args.use_critic and args.offload_train:
+                await model.offload()
+
         if (not args.use_critic) or (rollout_id >= args.num_critic_only_steps):
-            await actor_model.save_model(rollout_id, force_sync=force_sync)
+            await save_training_model(actor_model)
         if args.use_critic:
-            await critic_model.save_model(rollout_id, force_sync=force_sync)
+            await save_training_model(critic_model)
         await rollout_manager.save.remote(rollout_id)
 
     # train loop.
@@ -408,7 +394,7 @@ async def train(args):
         if args.eval_interval is not None and rollout_id == args.start_rollout_id and not args.skip_eval_before_train:
             await rollout_manager.eval.remote(rollout_id)
 
-        rollout_data_ref = await rollout_manager.generate.remote(rollout_id)
+        rollout_data_pack = await rollout_manager.generate.remote(rollout_id)
 
         if checkpoint_rollout_only:
             logger.info(
@@ -416,6 +402,7 @@ async def train(args):
                 "skipping actor/critic training, saving, and republishing",
                 rollout_id,
             )
+            remove_rollout_data_refs(args, rollout_data_pack)
             continue
 
         if args.offload_rollout:
@@ -426,30 +413,30 @@ async def train(args):
                 offload_tags.append(GPU_MEMORY_TYPE_WEIGHTS)
             await rollout_manager.offload.remote(tags=offload_tags)
 
-        if args.use_critic:
-            if rollout_id >= args.num_critic_only_steps:
-                await _train_actor_and_critic(
-                    actor_model,
-                    critic_model,
-                    rollout_id,
-                    rollout_data_ref,
-                )
-            else:
-                critic_task = await eager_create_task(critic_model.train(rollout_id, rollout_data_ref))
-                await critic_task
-        else:
-            await actor_model.train(rollout_id, rollout_data_ref)
-
         should_stop = False
-        if external_policy_sync is not None:
-            after_local_train_kwargs = dict(
-                rollout_id=rollout_id,
-                actor_model=actor_model,
-                rollout_data=rollout_data_ref,
-            )
-            if critic_model is not None:
-                after_local_train_kwargs["critic_model"] = critic_model
-            should_stop = bool(await external_policy_sync.after_local_train(**after_local_train_kwargs))
+        try:
+            if args.use_critic:
+                values = await critic_model.train(rollout_id, rollout_data_pack)
+                if args.offload_train:
+                    await critic_model.offload()
+                if rollout_id >= args.num_critic_only_steps:
+                    await actor_model.train(rollout_id, rollout_data_pack, external_data=values)
+                    if args.offload_train:
+                        await actor_model.offload()
+            else:
+                await actor_model.train(rollout_id, rollout_data_pack)
+
+            if external_policy_sync is not None:
+                after_local_train_kwargs = dict(
+                    rollout_id=rollout_id,
+                    actor_model=actor_model,
+                    rollout_data=rollout_data_pack,
+                )
+                if critic_model is not None:
+                    after_local_train_kwargs["critic_model"] = critic_model
+                should_stop = bool(await external_policy_sync.after_local_train(**after_local_train_kwargs))
+        finally:
+            remove_rollout_data_refs(args, rollout_data_pack)
 
         external_save = args.save_trigger_sentinel is not None and os.path.exists(args.save_trigger_sentinel)
         if external_save or should_run_periodic_action(
@@ -459,8 +446,6 @@ async def train(args):
             if external_save:
                 os.remove(args.save_trigger_sentinel)
 
-        if args.offload_train and (not args.use_critic or rollout_id >= args.num_critic_only_steps):
-            await actor_model.prepare_weight_update()
         await offload_train()
         if args.offload_rollout:
             await rollout_manager.onload_weights.remote()

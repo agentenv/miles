@@ -64,6 +64,10 @@ active sessions plus managed/orphan counts. Containers lacking either exact
 label—including persistent infrastructure and rollout-island containers—are
 never swept.
 
+The installed `tbench2_env` must be `>=` the #1012 merge (04d259ea6), same as
+step 2b below; the adapter drops every episode (with a warning) from a server
+that doesn't carry that contract.
+
 ### 2b. Alternative: Daytona cloud sandboxes (no Docker host)
 
 Instead of one shared env server, the adapter can give **every episode its own
@@ -89,6 +93,7 @@ needs `pyproject.toml` present next to the package):
 
 ```bash
 git clone https://github.com/huggingface/OpenEnv.git
+# This frozen revision includes the #1012 canonical Docker scoring contract.
 git -C OpenEnv checkout d2d4754b333ac285913d113e26c2126207434956
 pip install -e OpenEnv/envs/tbench2_env
 ```

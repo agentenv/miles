@@ -22,9 +22,11 @@ class ModelConfig:
     reasoning_parser: str
     tool_call_parser: str | None
     tito_model: str
-    allowed_append_roles: tuple[str, ...]
     num_gpus: int = 4
     tp_size: int = 1
+    context_length: int | None = None
+    rollout_max_response_len: int = SESSION_VERIFY_INVARIANT_ARGS["rollout_max_response_len"]
+    cuda_graph_backend_prefill: str | None = None
     # sglang expert-parallel size.  MoE archs like DeepSeek V4 hit a fused-moe
     # shape assert at ep=1; mirror the family's serving recipe (usually =tp).
     ep_size: int = 1
@@ -45,12 +47,17 @@ class ModelConfig:
 
 def run_one(cfg: ModelConfig) -> None:
     invariants = dict(SESSION_VERIFY_INVARIANT_ARGS)
+    # This harness produces one rollout batch, so its train-side batch divisor
+    # must track the actual sample count when large-model lanes reduce samples.
+    invariants["global_batch_size"] = invariants["rollout_batch_size"] * cfg.n_samples_per_prompt
+    invariants["rollout_max_response_len"] = cfg.rollout_max_response_len
+    invariants["sglang_cuda_graph_backend_prefill"] = cfg.cuda_graph_backend_prefill
     invariants["sglang_ep_size"] = cfg.ep_size
+    invariants["sglang_context_length"] = cfg.context_length
     invariants["enable_spec"] = cfg.enable_spec
     args = argparse.Namespace(
         hf_checkpoint=cfg.model_name,
         tito_model=cfg.tito_model,
-        tito_allowed_append_roles=list(cfg.allowed_append_roles),
         sglang_reasoning_parser=cfg.reasoning_parser,
         sglang_tool_call_parser=cfg.tool_call_parser,
         rollout_num_gpus_per_engine=cfg.tp_size,

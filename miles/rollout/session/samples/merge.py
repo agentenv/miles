@@ -1,18 +1,9 @@
-# doc-dev: docs/developer/session-server-sample-assembly.md
-"""Training-sample assembly: session records -> `Sample` objects.
+"""Training-sample assembly: session records -> per-turn `Sample`s, truncated at turn boundaries.
 
-Owned by the session package so the assembly can run inside the owning
-session worker (records never have to leave the session server); the rollout
-driver imports the same functions until the client-side switch lands, so
-there is exactly one implementation either way.
+Owned by the session package so the assembly runs on the owning instance (records never have to leave the session server). The wire codec for the assembled reply lives in `codec`.
 
-- Depends on `generate_utils.generate_endpoint_utils` for the R3 replay
-  decoders (accepted utils-level dependency: the decoders have other
-  consumers on the single-turn `/generate` path and must not fork).
-- Order contract: `truncate_samples_by_total_tokens` runs BEFORE
-  `merge_samples` — truncation is a turn-level budget decision (which turns
-  survive; the overflowing turn is cut at a turn boundary, later turns are
-  dropped) and the turn structure only exists pre-merge.
+- Depends on `generate_utils.generate_endpoint_utils` for the R3 replay decoders (accepted utils-level dependency: the decoders have other consumers on the single-turn `/generate` path and must not fork).
+- Order contract: `truncate_samples_by_total_tokens` runs BEFORE `merge_samples` — truncation is a turn-level budget decision (which turns survive; the overflowing turn is cut at a turn boundary, later turns are dropped) and the turn structure only exists pre-merge.
 """
 
 from argparse import Namespace
@@ -33,7 +24,6 @@ _TERMINAL_ORPHAN_SUMMARY_EXIT_STATUSES = frozenset({"max_seq_len", "max_turns"})
 
 def compute_samples_from_openai_records(
     args: Namespace,
-    input_sample: Sample,
     records: list[SessionRecord],
     tokenizer,
     accumulated_token_ids: list[int] | None = None,
@@ -63,9 +53,7 @@ def compute_samples_from_openai_records(
     if compaction_enabled and accumulated_token_ids_by_context_window is None:
         raise ValueError("compaction session is missing per-window accumulated token IDs")
 
-    per_window_ids = {
-        int(key): value for key, value in (accumulated_token_ids_by_context_window or {}).items()
-    }
+    per_window_ids = {int(key): value for key, value in (accumulated_token_ids_by_context_window or {}).items()}
     current_window: int | None = None
     current_accumulated = accumulated_token_ids
 
@@ -85,9 +73,7 @@ def compute_samples_from_openai_records(
                 current_window = window
                 current_accumulated = per_window_ids[window]
                 cursor = 0
-            next_window = (
-                records[i + 1].compaction_context_window if i + 1 < len(records) else None
-            )
+            next_window = records[i + 1].compaction_context_window if i + 1 < len(records) else None
             is_last = next_window != window
         else:
             is_last = i == len(records) - 1
@@ -123,7 +109,7 @@ def compute_samples_from_openai_records(
             # Step 4: advance cursor past matched output to the next turn
             cursor += matched
 
-        sample = _compute_sample_from_openai_record(args, input_sample, record, tokenizer, trim_count)
+        sample = _compute_sample_from_openai_record(args, record, tokenizer, trim_count)
         if compaction_enabled:
             sample.metadata.update(
                 {
@@ -182,9 +168,7 @@ def merge_samples_by_compaction_segment(samples: list[Sample], tokenizer) -> lis
                 raise ValueError("compaction segment indices must be contiguous from zero")
             expected_type = "execution" if index % 2 == 0 else "summary"
             if segment_type != expected_type:
-                raise ValueError(
-                    f"compaction segment {index} must be {expected_type}, got {segment_type}"
-                )
+                raise ValueError(f"compaction segment {index} must be {expected_type}, got {segment_type}")
             groups.append([])
         elif groups[-1][0].metadata["compaction_segment_type"] != segment_type:
             raise ValueError("compaction segment type changed within a segment")
@@ -202,22 +186,14 @@ def merge_samples_by_compaction_segment(samples: list[Sample], tokenizer) -> lis
         # completed execution prefix.  Outcome authentication remains downstream;
         # all other terminal-summary shapes remain a hard error here so malformed
         # trajectories cannot be hidden.
-        exit_statuses = [
-            (sample.metadata or {}).get("exit_status") for sample in samples
-        ]
+        exit_statuses = [(sample.metadata or {}).get("exit_status") for sample in samples]
         exit_status = exit_statuses[0]
         if any(value != exit_status for value in exit_statuses[1:]):
-            raise ValueError(
-                "terminal compaction summary has inconsistent episode exit statuses"
-            )
+            raise ValueError("terminal compaction summary has inconsistent episode exit statuses")
         terminal_orphan = groups[-1][0]
-        if (
-            not isinstance(exit_status, str)
-            or exit_status not in _TERMINAL_ORPHAN_SUMMARY_EXIT_STATUSES
-        ):
+        if not isinstance(exit_status, str) or exit_status not in _TERMINAL_ORPHAN_SUMMARY_EXIT_STATUSES:
             raise ValueError(
-                "compaction trajectory ended in a summary segment without a "
-                "declared max_seq_len/max_turns boundary"
+                "compaction trajectory ended in a summary segment without a " "declared max_seq_len/max_turns boundary"
             )
         if terminal_orphan.status not in {
             Sample.Status.COMPLETED,
@@ -235,15 +211,15 @@ def merge_samples_by_compaction_segment(samples: list[Sample], tokenizer) -> lis
         retained = deepcopy(merged[-1])
         retained.metadata = dict(retained.metadata or {})
         retained.metadata["compaction_terminal_orphan_summary_dropped"] = True
-        retained.metadata["compaction_terminal_orphan_summary_segment_index"] = (
-            terminal_orphan.metadata["compaction_segment_index"]
-        )
+        retained.metadata["compaction_terminal_orphan_summary_segment_index"] = terminal_orphan.metadata[
+            "compaction_segment_index"
+        ]
         merged[-1] = retained
     return merged
 
 
 def _compute_sample_from_openai_record(
-    args: Namespace, input_sample: Sample, record: SessionRecord, tokenizer, trim_count: int = 0
+    args: Namespace, record: SessionRecord, tokenizer, trim_count: int = 0
 ) -> Sample:
     choice = record.response["choices"][0]
 
@@ -254,7 +230,7 @@ def _compute_sample_from_openai_record(
     output_token_ids = [item[1] for item in choice["meta_info"]["output_token_logprobs"]]
     output_log_probs = [item[0] for item in choice["meta_info"]["output_token_logprobs"]]
 
-    sample = deepcopy(input_sample)
+    sample = Sample()
     sample.tokens = prompt_token_ids + output_token_ids
     sample.rollout_log_probs = output_log_probs
     sample.response = tokenizer.decode(output_token_ids)
@@ -275,6 +251,8 @@ def _compute_sample_from_openai_record(
         case "abort":
             sample.status = Sample.Status.ABORTED
 
+    if args.sglang_speculative_algorithm:
+        sample.spec_info.add(choice.get("meta_info", {}))
     sample.prefix_cache_info.add(choice.get("meta_info", {}))
     if "weight_version" in choice["meta_info"]:
         sample.weight_versions.append(choice["meta_info"]["weight_version"])

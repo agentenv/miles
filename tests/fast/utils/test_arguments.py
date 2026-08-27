@@ -15,6 +15,7 @@ from miles.utils.arguments import (
     _validate_sao_one_gpu_island,
     get_miles_extra_args_provider,
     miles_validate_args,
+    validate_async_off_policy_correction,
 )
 from miles.utils.misc import function_registry
 
@@ -151,6 +152,36 @@ def test_recompute_logprobs_via_prefill_flag_is_parsed():
     args = parser.parse_args(["--recompute-logprobs-via-prefill"] + REQUIRED_ARGS)
 
     assert args.recompute_logprobs_via_prefill is True
+
+
+def test_sglang_parallel_sizes_keep_server_args_destinations():
+    parser = add_sglang_arguments(argparse.ArgumentParser())
+    args = parser.parse_args(
+        [
+            "--sglang-tp-size",
+            "6",
+            "--sglang-data-parallel-size",
+            "2",
+            "--sglang-pipeline-parallel-size",
+            "3",
+            "--sglang-expert-parallel-size",
+            "4",
+            "--sglang-attention-context-parallel-size",
+            "5",
+        ]
+    )
+    args.rollout_num_gpus_per_engine = 8
+    args.true_on_policy_mode = False
+    args.sglang_enable_dp_attention = True
+    args.use_session_server = False
+
+    validate_sglang_args(args)
+
+    assert args.sglang_tp_size == 8
+    assert args.sglang_dp_size == 2
+    assert args.sglang_pp_size == 3
+    assert args.sglang_ep_size == 4
+    assert args.sglang_attn_cp_size == 5
 
 
 def test_custom_megatron_post_save_hook_path_is_parsed():
@@ -336,6 +367,150 @@ def test_custom_megatron_post_save_hook_path_requires_save():
         miles_validate_args(args)
 
 
+class TestTitoFixedTemplateConfiguration:
+    def _parse(self, extra):
+        parser = argparse.ArgumentParser()
+        get_miles_extra_args_provider()(parser)
+        return parser.parse_args(extra + ["--num-rollout", "1"] + REQUIRED_ARGS)
+
+    def test_removed_role_flag_is_rejected(self):
+        with pytest.raises(SystemExit):
+            self._parse(["--tito-allowed-append-roles", "tool"])
+
+    @pytest.mark.parametrize(
+        ("extra", "expect_warning"),
+        [
+            (["--use-session-server"], True),
+            ([], False),
+            (["--use-session-server", "--tito-model", "qwen3"], False),
+        ],
+    )
+    def test_warns_only_for_default_model_session(self, caplog, extra, expect_warning):
+        args = self._parse(extra)
+
+        with caplog.at_level(logging.WARNING, logger="miles.utils.arguments"):
+            miles_validate_args(args)
+
+        target_records = [
+            record
+            for record in caplog.records
+            if record.getMessage().startswith("--tito-model=default uses a best-effort four-role append surface.")
+        ]
+        assert len(target_records) == int(expect_warning)
+
+    def test_named_family_requires_session_server(self):
+        args = self._parse(["--tito-model", "qwen3"])
+        with pytest.raises(ValueError, match="--tito-model=qwen3 requires --use-session-server"):
+            miles_validate_args(args)
+
+    def test_named_family_resolves_registered_template_and_kwargs(self):
+        args = self._parse(["--use-session-server", "--tito-model", "qwen3"])
+        miles_validate_args(args)
+        assert args.chat_template_path.endswith("/qwen3_fixed.jinja")
+        assert args.apply_chat_template_kwargs == {"clear_thinking": False}
+
+    def test_named_family_rejects_custom_template(self):
+        args = self._parse(
+            [
+                "--use-session-server",
+                "--tito-model",
+                "qwen3",
+                "--chat-template-path",
+                "/tmp/custom.jinja",
+            ]
+        )
+        with pytest.raises(ValueError, match="cannot override the template registered"):
+            miles_validate_args(args)
+
+    def test_named_family_rejects_conflicting_registered_kwarg(self):
+        args = self._parse(
+            [
+                "--use-session-server",
+                "--tito-model",
+                "qwen3",
+                "--apply-chat-template-kwargs",
+                '{"clear_thinking": true}',
+            ]
+        )
+        with pytest.raises(ValueError, match="clear_thinking=True conflicts"):
+            miles_validate_args(args)
+
+    def test_named_family_accepts_same_registered_and_additional_kwargs(self):
+        args = self._parse(
+            [
+                "--use-session-server",
+                "--tito-model",
+                "qwen3",
+                "--apply-chat-template-kwargs",
+                '{"clear_thinking": false, "enable_thinking": true}',
+            ]
+        )
+        miles_validate_args(args)
+        assert args.apply_chat_template_kwargs == {
+            "clear_thinking": False,
+            "enable_thinking": True,
+        }
+
+
+def test_bridge_mode_rejects_critic(tmp_path):
+    parser = argparse.ArgumentParser()
+    get_miles_extra_args_provider()(parser)
+    args = parser.parse_args(
+        [
+            "--advantage-estimator",
+            "ppo",
+            "--megatron-to-hf-mode",
+            "bridge",
+            "--hf-checkpoint",
+            str(tmp_path),
+            "--num-rollout",
+            "1",
+        ]
+        + REQUIRED_ARGS
+    )
+
+    with pytest.raises(
+        AssertionError,
+        match="Critic models are not supported with --megatron-to-hf-mode bridge",
+    ):
+        miles_validate_args(args)
+
+
+def test_critic_rejects_experimental_ft_trainer(tmp_path, monkeypatch):
+    monkeypatch.setenv("MILES_EXPERIMENTAL_FT_TRAINER", "1")
+    parser = argparse.ArgumentParser()
+    get_miles_extra_args_provider()(parser)
+    args = parser.parse_args(
+        ["--advantage-estimator", "ppo", "--hf-checkpoint", str(tmp_path), "--num-rollout", "1"] + REQUIRED_ARGS
+    )
+
+    with pytest.raises(AssertionError, match="MILES_EXPERIMENTAL_FT_TRAINER"):
+        miles_validate_args(args)
+
+
+def test_critic_rejects_reward_level_kl(tmp_path):
+    parser = argparse.ArgumentParser()
+    get_miles_extra_args_provider()(parser)
+    args = parser.parse_args(
+        [
+            "--advantage-estimator",
+            "ppo",
+            "--kl-coef",
+            "0.05",
+            "--ref-load",
+            str(tmp_path),
+            "--hf-checkpoint",
+            str(tmp_path),
+            "--num-rollout",
+            "1",
+        ]
+        + REQUIRED_ARGS
+    )
+
+    with pytest.raises(AssertionError, match="does not support reward-level KL"):
+        miles_validate_args(args)
+
+
 class TestMultiLoRAValidation:
     def _parse(self, extra):
         parser = argparse.ArgumentParser()
@@ -414,6 +589,37 @@ class TestMultiLoRAValidation:
 
         with pytest.raises(AssertionError, match="MILES_EXPERIMENTAL_FT_TRAINER"):
             miles_validate_args(args)
+
+    def test_rejects_pipeline_parallelism(self):
+        # Adapter routing is not recompute-safe under a pipelined schedule.
+        args = self._parse([])
+        args.pipeline_model_parallel_size = 2
+        with pytest.raises(AssertionError, match="pipeline-model-parallel-size 1"):
+            miles_validate_args(args)
+
+    def test_rejects_bshd_qkv_format(self):
+        # bshd interleaves samples in the sequence-major flattening the spans assume.
+        args = self._parse([])
+        args.qkv_format = "bshd"
+        with pytest.raises(AssertionError, match="qkv-format thd"):
+            miles_validate_args(args)
+
+    def test_rejects_shared_outer_expert_loras(self):
+        # Per-expert layout only; the flag would switch sglang to a layout training never produces.
+        args = self._parse([])
+        args.experts_shared_outer_loras = True
+        with pytest.raises(AssertionError, match="experts-shared-outer-loras"):
+            miles_validate_args(args)
+
+    def test_accepts_expert_leaf_targets_without_expert_tp_flag(self):
+        # --expert-tensor-parallel-size stays None until Megatron's own validate_args;
+        # comparing the raw value here rejected every run that omitted the flag.
+        args = self._parse(["--target-modules", "gate_proj,up_proj,down_proj"])
+        args.expert_tensor_parallel_size = None
+
+        miles_validate_args(args)
+
+        assert args.multi_lora is True
 
 
 class TestResolveFtComponents:
@@ -518,3 +724,27 @@ def test_sglang_parallel_size_aliases_keep_last_value():
     args = parser.parse_args(["--sglang-data-parallel-size", "2", "--sglang-dp-size", "3"])
 
     assert args.sglang_dp_size == 3
+
+
+def _make_async_ppo_args(**overrides) -> SimpleNamespace:
+    defaults = dict(
+        use_critic=True,
+        use_rollout_logprobs=False,
+        use_tis=False,
+        keep_old_actor=False,
+    )
+    defaults.update(overrides)
+    return SimpleNamespace(**defaults)
+
+
+class TestValidateAsyncOffPolicyCorrection:
+    def test_ppo_without_correction_is_rejected(self):
+        with pytest.raises(AssertionError, match="behavior-policy correction"):
+            validate_async_off_policy_correction(_make_async_ppo_args())
+
+    @pytest.mark.parametrize("flag", ["use_rollout_logprobs", "use_tis", "keep_old_actor"])
+    def test_ppo_with_any_correction_passes(self, flag):
+        validate_async_off_policy_correction(_make_async_ppo_args(**{flag: True}))
+
+    def test_non_ppo_estimators_are_unaffected(self):
+        validate_async_off_policy_correction(_make_async_ppo_args(use_critic=False))

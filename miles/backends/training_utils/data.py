@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from miles.utils.audit_utils.witness.allocator import WitnessInfo
 from miles.utils.data import get_minimum_num_micro_batch_size
 from miles.utils.ft_utils.process_group_utils import GeneralPGUtil
+from miles.utils.object_store import ObjectStoreGetResult
 from miles.utils.seqlen_balancing import get_seqlen_balanced_partitions
 from miles.utils.types import RolloutBatch
 
@@ -34,11 +35,11 @@ def get_rollout_data(
     args: Namespace,
     rollout_data_ref: Box,
     witness_info: WitnessInfo | None = None,
-) -> RolloutBatch:
+) -> tuple[RolloutBatch, ObjectStoreGetResult]:
     parallel_state = get_parallel_state()
     # Fetch data through ray on CPU, not sure if this will be performance bottleneck.
     # Both first pp stage and the last pp stage will receive the data.
-    rollout_data = process_rollout_data(
+    rollout_data, store_get_result = process_rollout_data(
         args,
         rollout_data_ref,
         parallel_state.effective_dp.rank,
@@ -136,7 +137,7 @@ def get_rollout_data(
         rollout_data["rollout_routed_experts"] = [torch.from_numpy(r) for r in rollout_data["rollout_routed_experts"]]
     if "rollout_indexer_topk" in rollout_data:
         rollout_data["rollout_indexer_topk"] = [torch.from_numpy(r) for r in rollout_data["rollout_indexer_topk"]]
-    return rollout_data
+    return rollout_data, store_get_result
 
 
 def get_batch(
@@ -531,81 +532,4 @@ def get_data_iterator(
     return (
         data_iterator,
         num_microbatches,
-    )
-
-
-def sync_actor_critic_data(
-    args: Namespace,
-    rollout_data: RolloutBatch | None = None,
-    group: dist.ProcessGroup | None = None,
-) -> None:
-    """
-    Broadcast `values` (from critic) and optionally `log_probs`/`ref_log_probs`
-    (from actor) across PP ranks to align data dependencies.
-
-    - Values are broadcast from src=1.
-    - Log-probs and ref-log-probs are broadcast from src=0 when KL is used.
-    Updates `rollout_data` in place with the synchronized tensors.
-    """
-    log_probs_key = "log_probs" if not args.use_rollout_logprobs else "rollout_log_probs"
-    values, log_probs, ref_log_probs = map(rollout_data.get, ("values", log_probs_key, "ref_log_probs"))
-
-    # return when not the pp last stage
-    if not values and not log_probs:
-        return
-
-    use_cpu_transport = dist.get_backend(group) == "gloo"
-    if bool(getattr(args, "sao_one_gpu_island", False)) and not use_cpu_transport:
-        raise RuntimeError("--sao-one-gpu-island requires a Gloo actor-critic process group")
-
-    # The actor/critic group is a standalone process group layered on top of
-    # two independent Megatron worlds whose default rank is 0 in both
-    # processes.  ``dist.get_rank(group)`` translates through that default
-    # world and therefore reports 0 for the critic as well.  Query the custom
-    # process group directly so its critic rank remains 1.
-    rank = group.rank() if use_cpu_transport and group is not None else None
-    handles = []
-    wire_tensors: list[torch.Tensor] = []
-    receive_copies: list[tuple[torch.Tensor, torch.Tensor]] = []
-
-    def queue_broadcast(tensor: torch.Tensor, *, src: int) -> None:
-        if use_cpu_transport:
-            if rank == src:
-                wire_tensor = tensor.detach().to(device="cpu", copy=True).contiguous()
-            else:
-                wire_tensor = torch.empty_like(tensor, device="cpu")
-                receive_copies.append((tensor, wire_tensor))
-            wire_tensors.append(wire_tensor)
-            tensor = wire_tensor
-        handles.append(dist.broadcast(tensor, src=src, group=group, async_op=True))
-
-    if not values:
-        values = [torch.empty_like(log_prob) for log_prob in log_probs]
-    for value in values:
-        queue_broadcast(value, src=1)
-
-    if args.kl_coef != 0 or args.use_kl_loss:
-        if not log_probs:
-            log_probs = [torch.empty_like(value) for value in values]
-        if not ref_log_probs:
-            ref_log_probs = [torch.empty_like(value) for value in values]
-        for ref_log_prob, log_prob in zip(ref_log_probs, log_probs, strict=False):
-            queue_broadcast(log_prob, src=0)
-            queue_broadcast(ref_log_prob, src=0)
-
-    for handle in handles:
-        handle.wait()
-    for destination, wire_tensor in receive_copies:
-        destination.copy_(wire_tensor)
-
-    rollout_data.update(
-        {
-            k: v
-            for k, v in {
-                "values": values,
-                log_probs_key: log_probs,
-                "ref_log_probs": ref_log_probs,
-            }.items()
-            if v is not None
-        }
     )

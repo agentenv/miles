@@ -521,8 +521,15 @@ tests covering mixed-label EV, checkpoint publication, evaluation postchecks,
 pass@k, bounded purge, Codex lifecycle deadlines, TITO, and rollout launch
 arguments.
 
-Ruff, Python byte compilation, and `git diff --check` passed before upstream
-integration. The relevant suites must be rerun after resolving upstream changes.
+After upstream integration, 192 focused tests passed locally across the managed
+Terminal-Bench/OpenEnv path, compaction dataset and launch planning, critic EV,
+external policy synchronization, session sample merging, SAO math, and shared
+actor/critic routing. The conflict-resolved paths also passed Black, isort, Ruff,
+Python compilation, and `git diff --check`.
+
+The merged tree has not been rerun end to end on GPUs. Tests that import the
+production Megatron/SGLang stack still require the production container, so a
+short GPU smoke remains the next runtime validation step.
 
 ## Remaining limitations
 

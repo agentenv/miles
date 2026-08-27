@@ -81,12 +81,8 @@ def compute_advantages_and_returns(
         values=values,
         max_seq_lens=max_seq_lens,
         lambd_override=lambd_override,
-        compaction_subsequent_active_tokens=rollout_data.get(
-            "compaction_subsequent_active_tokens"
-        ),
-        compaction_trajectory_active_tokens=rollout_data.get(
-            "compaction_trajectory_active_tokens"
-        ),
+        compaction_subsequent_active_tokens=rollout_data.get("compaction_subsequent_active_tokens"),
+        compaction_trajectory_active_tokens=rollout_data.get("compaction_trajectory_active_tokens"),
     )
 
     # Apply on-policy distillation KL penalty to advantages (orthogonal to advantage estimator)

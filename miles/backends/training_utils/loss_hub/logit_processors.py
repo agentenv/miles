@@ -17,7 +17,9 @@ def _value_support(args: Namespace, device: torch.device) -> torch.Tensor:
 def predict_values_from_logits(logits: torch.Tensor, args: Namespace) -> torch.Tensor:
     """Convert scalar or categorical value-head output to scalar predictions."""
     if getattr(args, "value_loss_type", "mse") == "classification":
+        assert logits.size(-1) == args.value_num_bins, f"{logits.shape}"
         return logits.float().softmax(dim=-1) @ _value_support(args, logits.device)
+    assert logits.size(-1) == 1, f"{logits.shape}"
     return logits.squeeze(-1).float()
 
 
@@ -40,8 +42,9 @@ def get_responses(
     handles split sequences across ranks.
 
     Args:
-        logits: Model outputs with shape `[1, T, V]` (policy) or `[1, T, 1]`
-            (value). Must be float32.
+        logits: Model outputs with shape `[1, T, V]` (policy) or `[1, T, K]`
+            (value), where `K` is one for scalar regression or the configured
+            number of categorical bins. Must be float32 or bfloat16.
         args: Configuration containing `rollout_temperature` for scaling.
         unconcat_tokens: List of token tensors (prompt+response) per sample.
         total_lengths: Total sequence lengths (prompt+response) per sample.
@@ -49,12 +52,13 @@ def get_responses(
 
     Yields:
         Tuple of `(logits_chunk, tokens_chunk)` where `logits_chunk` is shape
-        `[R, V]` (policy) or `[R, 1]` (value) and `tokens_chunk` is shape `[R]`
-        (1D int64), both aligned to response tokens for one sample.
+        `[R, V]` (policy) or `[R, K]` (value) and `tokens_chunk` is shape
+        `[R]` (1D int64), both aligned to response tokens for one sample.
     """
     qkv_format = args.qkv_format
 
     if not args.true_on_policy_mode:
+        # FSDP hands native bf16 here (no full-vocab fp32 buffer); chunks are upcast to fp32 downstream
         assert logits.dtype in (torch.float32, torch.bfloat16), f"{logits.dtype}"
     assert len(logits.shape) == 3, f"{logits.shape}"
 
@@ -236,13 +240,14 @@ def get_values(
 ) -> dict[str, list[torch.Tensor]]:
     """Extract per-token value predictions over response tokens.
 
-    For each sample, extracts response-aligned chunks from the value head
-    output and squeezes the final dimension from `[R, 1]` to `[R]`.
+    For each sample, extracts response-aligned chunks from the value head and
+    returns scalar predictions. Regression heads are squeezed from `[R, 1]`;
+    categorical heads are projected from `[R, K]` onto their scalar support.
 
     Args:
-        logits: Value head output with shape `[1, T, 1]`.
-        args: Configuration (passed to `get_responses` which uses
-            `rollout_temperature` even though values don't need temperature).
+        logits: Value head output with shape `[1, T, 1]` for regression or
+            `[1, T, K]` for categorical prediction.
+        args: Value-objective and sequence-layout configuration.
         unconcat_tokens: List of token tensors per sample.
         total_lengths: Total sequence lengths per sample.
         response_lengths: Response segment lengths per sample.

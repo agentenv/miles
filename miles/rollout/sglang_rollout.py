@@ -20,7 +20,7 @@ from miles.utils import dumper_utils
 from miles.utils.async_utils import run
 from miles.utils.data import Dataset
 from miles.utils.eval_config import EvalDatasetConfig
-from miles.utils.http_utils import get, post
+from miles.utils.http_utils import get, post, router_worker_base_urls
 from miles.utils.lifecycle import TrajectoryLifecycle
 from miles.utils.lora import LORA_ADAPTER_NAME, is_lora_enabled
 from miles.utils.misc import SingletonMeta, call_agent_abort_hook, load_function
@@ -28,6 +28,7 @@ from miles.utils.multi_lora import make_rid, slot_lora_name
 from miles.utils.processing_utils import (
     call_processor,
     encode_image_for_rollout_engine,
+    extract_multimodal_train_inputs,
     load_processor,
     load_tokenizer,
 )
@@ -153,9 +154,7 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         processor_output = call_processor(state.processor, sample.prompt, sample.multimodal_inputs)
         prompt_ids = processor_output["input_ids"][0]
         prompt_ids = prompt_ids.tolist() if hasattr(prompt_ids, "tolist") else list(prompt_ids)
-        sample.multimodal_train_inputs = {
-            k: v for k, v in processor_output.items() if k not in ["input_ids", "attention_mask"]
-        } or None
+        sample.multimodal_train_inputs = extract_multimodal_train_inputs(processor_output)
     else:
         prompt_ids = state.tokenizer.encode(sample.prompt, add_special_tokens=False)
 
@@ -399,6 +398,7 @@ async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
     else:
         response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/workers")
         urls = [worker["url"] for worker in response["workers"]]
+    urls = router_worker_base_urls(urls)
 
     logger.info(f"Abort request for {urls}")
     abort_tasks = [post(f"{url}/abort_request", {"abort_all": True}) for url in urls]
