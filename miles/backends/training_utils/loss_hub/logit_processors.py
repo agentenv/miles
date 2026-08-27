@@ -8,6 +8,21 @@ from miles.backends.training_utils.loss_hub.math_utils import calculate_log_prob
 from miles.backends.training_utils.parallel import get_parallel_state
 
 
+def _value_support(args: Namespace, device: torch.device) -> torch.Tensor:
+    """Return the scalar support represented by a categorical value head."""
+    low, high = args.value_reward_range
+    return torch.linspace(low, high, args.value_num_bins, dtype=torch.float32, device=device)
+
+
+def predict_values_from_logits(logits: torch.Tensor, args: Namespace) -> torch.Tensor:
+    """Convert scalar or categorical value-head output to scalar predictions."""
+    if getattr(args, "value_loss_type", "mse") == "classification":
+        assert logits.size(-1) == args.value_num_bins, f"{logits.shape}"
+        return logits.float().softmax(dim=-1) @ _value_support(args, logits.device)
+    assert logits.size(-1) == 1, f"{logits.shape}"
+    return logits.squeeze(-1).float()
+
+
 def get_responses(
     logits: torch.Tensor,
     *,
@@ -16,6 +31,7 @@ def get_responses(
     total_lengths: list[int],
     response_lengths: list[int],
     max_seq_lens: list[int] | None = None,
+    apply_temperature: bool = True,
 ) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
     """Yield response-aligned `(logits_chunk, tokens_chunk)` pairs per sample.
 
@@ -26,8 +42,9 @@ def get_responses(
     handles split sequences across ranks.
 
     Args:
-        logits: Model outputs with shape `[1, T, V]` (policy) or `[1, T, 1]`
-            (value). Must be float32.
+        logits: Model outputs with shape `[1, T, V]` (policy) or `[1, T, K]`
+            (value), where `K` is one for scalar regression or the configured
+            number of categorical bins. Must be float32 or bfloat16.
         args: Configuration containing `rollout_temperature` for scaling.
         unconcat_tokens: List of token tensors (prompt+response) per sample.
         total_lengths: Total sequence lengths (prompt+response) per sample.
@@ -35,8 +52,8 @@ def get_responses(
 
     Yields:
         Tuple of `(logits_chunk, tokens_chunk)` where `logits_chunk` is shape
-        `[R, V]` (policy) or `[R, 1]` (value) and `tokens_chunk` is shape `[R]`
-        (1D int64), both aligned to response tokens for one sample.
+        `[R, V]` (policy) or `[R, K]` (value) and `tokens_chunk` is shape
+        `[R]` (1D int64), both aligned to response tokens for one sample.
     """
     qkv_format = args.qkv_format
 
@@ -52,7 +69,7 @@ def get_responses(
         assert max_seq_lens is not None
         logits = logits.view(-1, logits.size(-1))
 
-    if logits.size(-1) > 1 and args.rollout_temperature > 0 and args.rollout_temperature != 1.0:
+    if apply_temperature and logits.size(-1) > 1 and args.rollout_temperature > 0 and args.rollout_temperature != 1.0:
         logits = logits.div(args.rollout_temperature)
     if args.true_on_policy_mode:
         if getattr(args, "bf16", False):
@@ -223,13 +240,14 @@ def get_values(
 ) -> dict[str, list[torch.Tensor]]:
     """Extract per-token value predictions over response tokens.
 
-    For each sample, extracts response-aligned chunks from the value head
-    output and squeezes the final dimension from `[R, 1]` to `[R]`.
+    For each sample, extracts response-aligned chunks from the value head and
+    returns scalar predictions. Regression heads are squeezed from `[R, 1]`;
+    categorical heads are projected from `[R, K]` onto their scalar support.
 
     Args:
-        logits: Value head output with shape `[1, T, 1]`.
-        args: Configuration (passed to `get_responses` which uses
-            `rollout_temperature` even though values don't need temperature).
+        logits: Value head output with shape `[1, T, 1]` for regression or
+            `[1, T, K]` for categorical prediction.
+        args: Value-objective and sequence-layout configuration.
         unconcat_tokens: List of token tensors per sample.
         total_lengths: Total sequence lengths per sample.
         response_lengths: Response segment lengths per sample.
@@ -248,10 +266,9 @@ def get_values(
         total_lengths=total_lengths,
         response_lengths=response_lengths,
         max_seq_lens=max_seq_lens,
+        apply_temperature=False,
     ):
-        assert logits_chunk.size(-1) == 1, f"{logits_chunk.shape}"
-        # upcast (no-op for fp32) so value-head outputs stay fp32 even when logits arrive bf16
-        value_list.append(logits_chunk.squeeze(-1).float())
+        value_list.append(predict_values_from_logits(logits_chunk, args))
 
     res = {
         "values": value_list,

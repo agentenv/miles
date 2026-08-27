@@ -7,6 +7,7 @@ from typing import Any
 from tqdm import tqdm
 
 from miles.rollout.generate_utils.generate_endpoint_utils import policy_uses_routing_key
+from miles.rollout.generate_utils.sample_utils import is_compaction_trajectory
 from miles.rollout.inference_rollout.inference_rollout_common import (
     GenerateState,
     compute_sampling_params,
@@ -99,7 +100,9 @@ async def eval_rollout_single_dataset(
                     f"reward={s.reward}"
                 )
             do_print = False
-        if isinstance(sample, list):
+        if isinstance(sample, list) and is_compaction_trajectory(sample):
+            data.append(sample[-1])
+        elif isinstance(sample, list):
             data.extend(sample)
         else:
             data.append(sample)

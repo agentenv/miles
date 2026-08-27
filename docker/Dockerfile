@@ -15,8 +15,8 @@ FROM lmsysorg/sglang:${SGLANG_IMAGE_TAG} AS sglang
 
 # ======================================== Arguments =============================================
 
-ARG SGLANG_BRANCH=sglang-miles
-ARG SGLANG_COMMIT=""
+ARG SGLANG_REPOSITORY=https://github.com/agentenv/sglang.git
+ARG SGLANG_COMMIT=b34df47444271ebda0673d68fe000399804c181b
 
 ARG MEGATRON_REPO=radixark/Megatron-LM
 ARG MEGATRON_BRANCH=miles-main
@@ -188,21 +188,18 @@ RUN if [ "${ENABLE_CUDA_13}" = "1" ]; then \
 
 RUN rm -rf /root/.cache/pip /root/flash-attention
 
-# ====================================== Install sglang-miles ============================================
+# ====================================== Install pinned SGLang ============================================
 
-# Install sglang from sglang-miles branch
-# The CUDA 12 sglang images sed their dependency markers from cu13 to cu12 in
-# python/pyproject.toml and never commit it, so a plain checkout aborts on the dirty
-# file. Force it, then re-apply the same rewrite: the tree we just checked out carries
-# the cu13 markers, and sglang's editable install makes them visible to every later pip
-# resolve, which would drag cu13 packages onto a cu12 image.
+# The SAO/DiLoCo path requires the v0.5.16-based agentenv patch that releases
+# LoRA references when requests abort. The CUDA 12 base image rewrites
+# dependency markers in python/pyproject.toml but leaves the checkout dirty, so
+# force the pinned checkout and then restore the
+# CUDA 12 markers before the editable install exposes them to later resolves.
 RUN cd /sgl-workspace/sglang && \
-    git fetch origin ${SGLANG_BRANCH} && \
-    if [ -n "${SGLANG_COMMIT}" ]; then \
-      git checkout -f ${SGLANG_COMMIT}; \
-    else \
-      git checkout -f FETCH_HEAD; \
-    fi && \
+    git fetch --depth 1 ${SGLANG_REPOSITORY} ${SGLANG_COMMIT} && \
+    git reset --hard HEAD && \
+    git checkout --detach ${SGLANG_COMMIT} && \
+    test "$(git rev-parse HEAD)" = "${SGLANG_COMMIT}" && \
     if [ "${ENABLE_CUDA_13}" != "1" ]; then \
       sed -i 's/cuda-python>=13\.0/cuda-python>=12,<13/' python/pyproject.toml && \
       sed -i 's/flashinfer_python\[cu13\]/flashinfer_python[cu12]/' python/pyproject.toml && \

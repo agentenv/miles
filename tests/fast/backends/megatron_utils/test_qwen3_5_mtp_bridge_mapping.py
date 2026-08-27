@@ -200,3 +200,19 @@ def test_raw_qwen3_5_mtp_export_keeps_eh_proj_column_order():
     )
 
     assert converted == [("mtp.fc.weight", weight)]
+
+
+def test_raw_qwen3_5_tied_embedding_uses_sglang_loader_key_without_copying():
+    module = load_raw_export_module()
+    weight = torch.arange(24, dtype=torch.float32).view(3, 8)
+
+    converted = module.convert_qwen3_5_to_hf(
+        types.SimpleNamespace(),
+        "module.module.embedding.word_embeddings.weight",
+        weight,
+    )
+
+    # Qwen3.5's SGLang loader mirrors this key into lm_head when
+    # tie_word_embeddings is enabled, so the raw publisher must preserve it.
+    assert converted == [("model.language_model.embed_tokens.weight", weight)]
+    assert converted[0][1] is weight

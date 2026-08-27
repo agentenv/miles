@@ -40,6 +40,14 @@ def _set_random_seed(
 
 def _initialize_distributed(args, get_embedding_ranks=None, get_position_embedding_ranks=None):
     """Initialize torch.distributed and core model parallel."""
+    # Miles' older argument layer calls this ``enable_gloo_process_groups``;
+    # current Megatron exposes it as ``use_gloo_process_groups``.  Conversion
+    # tools use Megatron's parser directly, so accept either spelling.
+    use_gloo_process_groups = getattr(
+        args,
+        "enable_gloo_process_groups",
+        getattr(args, "use_gloo_process_groups", False),
+    )
     # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.
     mpu.initialize_model_parallel(
@@ -57,7 +65,7 @@ def _initialize_distributed(args, get_embedding_ranks=None, get_position_embeddi
         order="tp-cp-ep-dp-pp" if not args.use_tp_pp_dp_mapping else "tp-cp-ep-pp-dp",
         get_embedding_ranks=get_embedding_ranks,
         get_position_embedding_ranks=get_position_embedding_ranks,
-        create_gloo_process_groups=args.enable_gloo_process_groups,
+        create_gloo_process_groups=use_gloo_process_groups,
     )
 
 

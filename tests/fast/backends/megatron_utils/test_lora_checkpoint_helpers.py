@@ -10,7 +10,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from miles.backends.megatron_utils.checkpoint import _is_megatron_checkpoint, save_checkpoint_with_lora
+from miles.backends.megatron_utils.checkpoint import (
+    _is_megatron_checkpoint,
+    _omit_fresh_critic_head_from_sharded_state,
+    load_checkpoint,
+    save_checkpoint_with_lora,
+)
 
 # ---------------------------------------------------------------------------
 # _is_megatron_checkpoint
@@ -92,3 +97,108 @@ class TestSaveCheckpointWithLoRA:
         save_checkpoint_with_lora(42, model, MagicMock(), MagicMock())
 
         mock_save_ckpt.assert_called_once()
+
+
+class _FakeShard:
+    def __init__(self, key):
+        self.key = key
+
+
+class _FakeCriticModule:
+    output_layer = object()
+
+    def __init__(self):
+        self.calls = 0
+
+    def sharded_state_dict(self):
+        self.calls += 1
+        return {
+            "decoder.layers.0.weight": _FakeShard("decoder.layers.0.weight"),
+            "output_layer.weight": _FakeShard("output_layer.weight"),
+            "output_layer.bias": _FakeShard("output_layer.bias"),
+        }
+
+
+class _FakeWrapper:
+    role = "critic"
+
+    def __init__(self, module):
+        self.module = module
+
+
+def test_fresh_critic_bootstrap_filters_only_value_head_and_restores_method():
+    module = _FakeCriticModule()
+    original_method = module.sharded_state_dict
+
+    with _omit_fresh_critic_head_from_sharded_state([_FakeWrapper(module)]) as omitted:
+        assert set(module.sharded_state_dict()) == {"decoder.layers.0.weight"}
+
+    assert omitted == {"output_layer.weight", "output_layer.bias"}
+    assert set(module.sharded_state_dict()) == {
+        "decoder.layers.0.weight",
+        "output_layer.weight",
+        "output_layer.bias",
+    }
+    assert module.sharded_state_dict.__func__ is original_method.__func__
+
+
+@patch("miles.backends.megatron_utils.checkpoint.is_lora_enabled", return_value=False)
+@patch("miles.backends.megatron_utils.checkpoint.get_args")
+@patch("miles.backends.megatron_utils.checkpoint._load_checkpoint_megatron")
+def test_checkpoint_load_bootstraps_backbone_but_not_fresh_critic_head(
+    mock_megatron_load,
+    mock_get_args,
+    _mock_lora_enabled,
+    tmp_path,
+):
+    (tmp_path / "latest_checkpointed_iteration.txt").write_text("release")
+    module = _FakeCriticModule()
+    wrapped = _FakeWrapper(module)
+    mock_get_args.return_value = Namespace(
+        load=str(tmp_path),
+        _critic_bootstrap_from_actor_checkpoint=True,
+    )
+
+    def observe_requested_state(**kwargs):
+        assert kwargs["ddp_model"] == [wrapped]
+        assert set(module.sharded_state_dict()) == {"decoder.layers.0.weight"}
+        return 0, 0
+
+    mock_megatron_load.side_effect = observe_requested_state
+
+    assert load_checkpoint([wrapped], None, None, None, False) == (0, 0)
+    assert set(module.sharded_state_dict()) == {
+        "decoder.layers.0.weight",
+        "output_layer.weight",
+        "output_layer.bias",
+    }
+
+
+@patch("miles.backends.megatron_utils.checkpoint.is_lora_enabled", return_value=False)
+@patch("miles.backends.megatron_utils.checkpoint.get_args")
+@patch("miles.backends.megatron_utils.checkpoint._load_checkpoint_megatron")
+def test_contracted_critic_resume_requests_trained_value_head(
+    mock_megatron_load,
+    mock_get_args,
+    _mock_lora_enabled,
+    tmp_path,
+):
+    (tmp_path / "latest_checkpointed_iteration.txt").write_text("8")
+    module = _FakeCriticModule()
+    wrapped = _FakeWrapper(module)
+    mock_get_args.return_value = Namespace(
+        load=str(tmp_path),
+        _critic_bootstrap_from_actor_checkpoint=False,
+    )
+
+    def observe_requested_state(**_kwargs):
+        assert set(module.sharded_state_dict()) == {
+            "decoder.layers.0.weight",
+            "output_layer.weight",
+            "output_layer.bias",
+        }
+        return 8, 0
+
+    mock_megatron_load.side_effect = observe_requested_state
+
+    assert load_checkpoint([wrapped], None, None, None, False) == (8, 0)

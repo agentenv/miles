@@ -115,6 +115,16 @@ def lora_base_cpu_backup_enabled(args: Namespace) -> bool:
     return is_lora_enabled(args) and getattr(args, "colocate", False) and getattr(args, "lora_base_cpu_backup", False)
 
 
+def lora_base_disk_reload_enabled(args: Namespace) -> bool:
+    """LoRA + colocate using a disk reload instead of a host-RAM base mirror."""
+    return is_lora_enabled(args) and getattr(args, "colocate", False) and getattr(args, "lora_base_disk_reload", False)
+
+
+def lora_base_sync_skipped(args: Namespace) -> bool:
+    """Whether the immutable LoRA base already has a rollout-side restore path."""
+    return lora_base_cpu_backup_enabled(args) or lora_base_disk_reload_enabled(args)
+
+
 def is_lora_model(model: Sequence[torch.nn.Module]) -> bool:
     """Check if model has LoRA layers applied."""
     for model_chunk in model:
@@ -336,6 +346,11 @@ def create_lora_instance(args: Namespace):
         lora_kwargs["experts_shared_outer_loras"] = True
 
     lora = lora_cls(**lora_kwargs)
+
+    if os.environ.get("YETO_DSV4_CLONE_ONLY_LORA") == "1":
+        from yeto.rl.deepseek_v4_clone_lora import wrap_clone_only_lora
+
+        lora = wrap_clone_only_lora(lora)
 
     logger.info(
         f"Created {lora_cls.__name__}: rank={args.lora_rank}, alpha={args.lora_alpha}, "

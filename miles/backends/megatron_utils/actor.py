@@ -36,6 +36,7 @@ from miles.utils.types import RolloutBatch
 
 from ...utils.profile_utils import TrainProfiler
 from ...utils.tensor_backper import TensorBackuper
+from ..training_utils.cp_utils import get_local_response_loss_masks
 from ..training_utils.data import DataIterator, get_data_iterator, get_rollout_data
 from ..training_utils.log_utils import log_cpu_memory, log_perf_data, log_rollout_data
 from ..training_utils.loss import (
@@ -51,14 +52,43 @@ from .ft.checkpoint_transfer import recv_ckpt
 from .ft.checkpoint_transfer import send_ckpt as _send_ckpt
 from .ft.in_memory_checkpoint import InMemoryCheckpointManager
 from .ft.indep_dp import reconfigure_indep_dp_group
+from .full_parameter_state import (
+    FULL_PARAMETER_DEFAULT_CHUNK_BYTES,
+    FullParameterChunkedShardState,
+    FullParameterCommitStatus,
+    FullParameterLocalStepReceipt,
+    FullParameterOptimizerState,
+    FullParameterOwnerFragmentPlan,
+    FullParameterShardManifest,
+    FullParameterShardState,
+)
+from .full_parameter_state import abort_prepared_full_parameter_shard as abort_external_prepared_full_parameter_shard
+from .full_parameter_state import apply_full_parameter_shard as apply_external_full_parameter_shard
+from .full_parameter_state import assert_full_parameter_boundary_clear
+from .full_parameter_state import commit_prepared_full_parameter_shard as commit_external_prepared_full_parameter_shard
+from .full_parameter_state import export_full_parameter_chunked_shard as export_external_full_parameter_chunked_shard
+from .full_parameter_state import export_full_parameter_shard as export_external_full_parameter_shard
+from .full_parameter_state import finalize_full_parameter_commit as finalize_external_full_parameter_commit
+from .full_parameter_state import full_parameter_commit_status as external_full_parameter_commit_status
+from .full_parameter_state import full_parameter_initial_policy_version
+from .full_parameter_state import full_parameter_optimizer_state as external_full_parameter_optimizer_state
+from .full_parameter_state import full_parameter_shard_manifest as external_full_parameter_shard_manifest
+from .full_parameter_state import full_parameter_topology as external_full_parameter_topology
+from .full_parameter_state import initialize_full_parameter_tracking
+from .full_parameter_state import install_full_parameter_fragment_plan as install_external_full_parameter_fragment_plan
+from .full_parameter_state import prepare_full_parameter_chunked_shard as prepare_external_full_parameter_chunked_shard
+from .full_parameter_state import record_full_parameter_local_step as record_external_full_parameter_local_step
+from .full_parameter_state import validate_full_parameter_shard as validate_external_full_parameter_shard
 from .initialize import init, is_first_replica_megatron_main_rank
 from .lora_utils import is_lora_enabled
 from .model import TrainStepOutcome, forward_only, initialize_model_and_optimizer, save, train
 from .parallel import verify_megatron_parallel_state
 from .replay_utils import register_replay_list_moe
+from .trainable_state import TrainableState
+from .trainable_state import apply_trainable_state as apply_external_trainable_state
+from .trainable_state import export_trainable_state as export_external_trainable_state
 from .update_weight.common import named_params_and_buffers
 from .update_weight.update_weight_from_distributed.broadcast import UpdateWeightFromDistributed
-from .update_weight.update_weight_from_distributed.p2p import UpdateWeightP2P
 from .update_weight.update_weight_from_tensor import UpdateWeightFromTensor
 
 if TYPE_CHECKING:
@@ -67,6 +97,40 @@ if TYPE_CHECKING:
 logging.getLogger("megatron").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
+
+
+def _select_update_weight_cls(args: Namespace, *, is_lora: bool):
+    bridge_distributed_weight_sync = getattr(args, "bridge_distributed_weight_sync", False)
+    if bridge_distributed_weight_sync:
+        assert not args.colocate, "--bridge-distributed-weight-sync is only for non-colocated engines"
+        assert (
+            args.megatron_to_hf_mode == "bridge"
+        ), "--bridge-distributed-weight-sync requires --megatron-to-hf-mode bridge"
+        assert (
+            args.update_weight_transfer_mode == "broadcast"
+        ), "--bridge-distributed-weight-sync requires --update-weight-transfer-mode broadcast"
+        assert not is_lora, "--bridge-distributed-weight-sync is only for full-parameter runs"
+        return UpdateWeightFromTensor
+    if args.colocate:
+        return UpdateWeightFromTensor
+    if args.update_weight_transfer_mode == "broadcast":
+        return UpdateWeightFromDistributed
+    if args.update_weight_transfer_mode == "disk-delta":
+        from .update_weight.update_weight_from_distributed.delta import UpdateWeightFromDiskDelta
+
+        return UpdateWeightFromDiskDelta
+
+    from .update_weight.update_weight_from_distributed.p2p import UpdateWeightP2P
+
+    return UpdateWeightP2P
+
+
+def _published_weight_version(weight_updater) -> str:
+    """Read an updater's wire version without depending on its concrete class."""
+    publisher = getattr(weight_updater, "published_weight_version", None)
+    if callable(publisher):
+        return str(publisher())
+    return str(weight_updater.weight_version)
 
 
 def _setup_disk_offload_reclaim(disk_dir: str) -> None:
@@ -193,6 +257,15 @@ class MegatronTrainRayActor(TrainRayActor):
 
         verify_megatron_parallel_state(self.model)
 
+        if getattr(self.args, "external_policy_sync_path", None) is not None and not is_lora_enabled(self.args):
+            initialize_full_parameter_tracking(
+                self,
+                full_parameter_initial_policy_version(
+                    self.args,
+                    loaded_rollout_id,
+                ),
+            )
+
         start_rollout_id = loaded_rollout_id + 1
         self._asleep = False
 
@@ -231,18 +304,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.vocab_size is None:
             self.args.vocab_size = self.tokenizer.vocab_size
 
-        if self.args.colocate:
-            update_weight_cls = UpdateWeightFromTensor
-        else:
-            if self.args.update_weight_transfer_mode == "broadcast":
-                update_weight_cls = UpdateWeightFromDistributed
-            elif self.args.update_weight_transfer_mode == "disk-delta":
-                # Lazy import: keeps the delta deps (numpy/zstandard/xxhash) off the other paths.
-                from .update_weight.update_weight_from_distributed.delta import UpdateWeightFromDiskDelta
-
-                update_weight_cls = UpdateWeightFromDiskDelta
-            else:
-                update_weight_cls = UpdateWeightP2P
+        update_weight_cls = _select_update_weight_cls(self.args, is_lora=is_lora_enabled(args))
         self.weight_updater = update_weight_cls(
             self.args,
             self.model,
@@ -274,6 +336,144 @@ class MegatronTrainRayActor(TrainRayActor):
         self.prof.on_init_end()
 
         return start_rollout_id
+
+    def export_trainable_state(self) -> TrainableState | None:
+        """Collectively export one complete LoRA state from the Megatron main rank."""
+        return export_external_trainable_state(
+            self,
+            policy_version=getattr(self, "_external_policy_version", 0),
+        )
+
+    def apply_trainable_state(self, state: TrainableState, *, reset_optimizer: bool) -> int:
+        """Apply a complete replicated LoRA state on this Megatron rank."""
+        reset_count = apply_external_trainable_state(
+            self,
+            state,
+            reset_optimizer=reset_optimizer,
+        )
+        self._external_policy_version = state.policy_version
+        return reset_count
+
+    def full_parameter_topology(self):
+        """Return the topology coordinate that owns this actor's FP32 shard."""
+        return external_full_parameter_topology()
+
+    def full_parameter_shard_manifest(self) -> FullParameterShardManifest:
+        """Describe this rank's FP32 masters without exporting tensor values."""
+        return external_full_parameter_shard_manifest(self, role=self.role)
+
+    def install_full_parameter_fragment_plan(
+        self,
+        plan: FullParameterOwnerFragmentPlan,
+    ) -> int:
+        """Install one exact-coverage topology-owned fragment plan."""
+        return install_external_full_parameter_fragment_plan(
+            self,
+            plan,
+            role=self.role,
+        )
+
+    def export_full_parameter_shard(
+        self,
+        policy_version: int,
+        local_step_generation: int = 0,
+    ) -> FullParameterShardState:
+        """Export this rank's topology-bound FP32 optimizer-master shard."""
+        return export_external_full_parameter_shard(
+            self,
+            policy_version=policy_version,
+            local_step_generation=local_step_generation,
+            role=self.role,
+        )
+
+    def export_full_parameter_chunked_shard(
+        self,
+        policy_version: int,
+        local_step_generation: int = 0,
+        max_chunk_bytes: int = FULL_PARAMETER_DEFAULT_CHUNK_BYTES,
+    ) -> FullParameterChunkedShardState:
+        """Export bounded flat CPU chunks as nested Ray ObjectRefs."""
+        return export_external_full_parameter_chunked_shard(
+            self,
+            policy_version=policy_version,
+            local_step_generation=local_step_generation,
+            max_chunk_bytes=max_chunk_bytes,
+            role=self.role,
+        )
+
+    def prepare_full_parameter_chunked_shard(
+        self,
+        state: FullParameterChunkedShardState,
+        commit_token: str,
+    ) -> int:
+        """Validate a complete chunked shard without changing parameters."""
+        return prepare_external_full_parameter_chunked_shard(
+            self,
+            state,
+            commit_token=commit_token,
+            role=self.role,
+        )
+
+    def commit_prepared_full_parameter_shard(self, commit_token: str) -> int:
+        """Commit one previously validated shard and preserve Adam moments."""
+        return commit_external_prepared_full_parameter_shard(
+            self,
+            commit_token=commit_token,
+            role=self.role,
+        )
+
+    def finalize_full_parameter_commit(self, commit_token: str) -> int:
+        """Finalize an idempotent group-wide commit journal."""
+        return finalize_external_full_parameter_commit(
+            self,
+            commit_token=commit_token,
+        )
+
+    def full_parameter_commit_status(
+        self,
+        commit_token: str,
+        policy_version: int,
+        state_identity_hash: str,
+    ) -> FullParameterCommitStatus:
+        """Report an exact transaction phase for safe group reconciliation."""
+        return external_full_parameter_commit_status(
+            self,
+            commit_token=commit_token,
+            policy_version=policy_version,
+            state_identity_hash=state_identity_hash,
+        )
+
+    def abort_prepared_full_parameter_shard(self, commit_token: str) -> bool:
+        """Discard only this actor's prepare context."""
+        return abort_external_prepared_full_parameter_shard(
+            self,
+            commit_token=commit_token,
+        )
+
+    def apply_full_parameter_shard(self, state: FullParameterShardState) -> int:
+        """Apply one complete shard while preserving local optimizer moments."""
+        return apply_external_full_parameter_shard(self, state, role=self.role)
+
+    def validate_full_parameter_shard(self, state: FullParameterShardState) -> int:
+        """Validate one incoming shard without mutating local training state."""
+        return validate_external_full_parameter_shard(self, state, role=self.role)
+
+    def record_full_parameter_local_step(
+        self,
+        base_policy_version: int,
+        rollout_id: int,
+    ) -> FullParameterLocalStepReceipt:
+        """Record one successful local optimizer generation."""
+        return record_external_full_parameter_local_step(
+            self,
+            base_policy_version=base_policy_version,
+            rollout_id=rollout_id,
+            role=self.role,
+        )
+
+    def full_parameter_optimizer_state(self) -> FullParameterOptimizerState:
+        """Return a bounded proof of full-parameter optimizer progress."""
+        return external_full_parameter_optimizer_state(self, role=self.role)
 
     @with_logs
     @timer
@@ -341,6 +541,7 @@ class MegatronTrainRayActor(TrainRayActor):
         rollout_id: int,
         store_prefix: str = "",
     ) -> dict[str, list[torch.Tensor]]:
+        assert_full_parameter_boundary_clear(self)
 
         with timer(f"{store_prefix}log_probs"):
             return forward_only(
@@ -366,7 +567,8 @@ class MegatronTrainRayActor(TrainRayActor):
         witness_info: WitnessInfo | None = None,
         attempt: int = 0,
         external_data=None,
-    ):
+    ) -> TrainStepOutcome | dict:
+        assert_full_parameter_boundary_clear(self)
         self._heartbeat.bump()
         self._last_rollout_id = rollout_id
         if self.args.offload_train and self._asleep:
@@ -397,33 +599,172 @@ class MegatronTrainRayActor(TrainRayActor):
             return result
 
     @with_logs
-    def train_critic(self, rollout_id: int, rollout_data: RolloutBatch) -> dict:
-        # Create data iterator for log_probs and train.
-        data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
-        rollout_data.update(
-            forward_only(
+    def evaluate_critic(
+        self,
+        rollout_id: int,
+        rollout_data_ref: Box,
+    ) -> dict[str, object] | None:
+        """Run a read-only value forward pass and return sufficient statistics.
+
+        The dedicated value-evaluation entry point requires a pure-DP topology,
+        so exactly one Ray actor reports each DP shard.  Returning sufficient
+        statistics instead of token predictions keeps the cross-process payload
+        bounded while preserving exact aggregate explained variance.
+        """
+
+        if self.role != "critic":
+            raise RuntimeError("evaluate_critic is only valid for critic actors")
+        if not self.args.debug_disable_optimizer:
+            raise RuntimeError("critic evaluation requires --debug-disable-optimizer")
+        if self.optimizer is not None or self.opt_param_scheduler is not None:
+            raise RuntimeError("critic evaluation unexpectedly initialized optimizer state")
+
+        parallel_state = get_parallel_state()
+        topology = (
+            parallel_state.tp.size,
+            parallel_state.pp.size,
+            parallel_state.cp.size,
+            parallel_state.ep.size,
+            parallel_state.etp.size,
+        )
+        if topology != (1, 1, 1, 1, 1):
+            raise RuntimeError(
+                "critic value evaluation currently requires pure data parallelism; " f"got TP/PP/CP/EP/ETP={topology}"
+            )
+
+        with ExitStack() as stack:
+            rollout_data, store_get_result = get_rollout_data(self.args, rollout_data_ref)
+            stack.enter_context(store_get_result)
+            data_iterator, num_microbatches = get_data_iterator(
+                self.args,
+                self.model,
+                rollout_data,
+            )
+            predictions = forward_only(
                 get_values,
                 self.args,
                 self.model,
                 data_iterator,
                 num_microbatches,
                 rollout_id=rollout_id,
-            )
-        )
+            ).get("values")
+            if predictions is None:
+                return None
+            if len(predictions) != len(rollout_data["returns"]):
+                raise RuntimeError("critic evaluation prediction/target row counts differ")
 
-        compute_advantages_and_returns(self.args, rollout_data)
+            local_masks = get_local_response_loss_masks(
+                rollout_data["total_lengths"],
+                rollout_data["response_lengths"],
+                rollout_data["loss_masks"],
+                self.args.qkv_format,
+                rollout_data.get("max_seq_lens"),
+            )
+            active_returns: list[torch.Tensor] = []
+            active_residuals: list[torch.Tensor] = []
+            for values, returns, mask in zip(
+                predictions,
+                rollout_data["returns"],
+                local_masks,
+                strict=True,
+            ):
+                values = values.float().flatten()
+                returns = returns.float().flatten()
+                active = mask.bool().flatten()
+                if values.shape != returns.shape or active.shape != returns.shape:
+                    raise RuntimeError("critic evaluation value/return/mask shapes differ")
+                active_returns.append(returns[active])
+                active_residuals.append((returns - values)[active])
+
+            returns = torch.cat(active_returns).double()
+            residuals = torch.cat(active_residuals).double()
+            if returns.numel() < 1:
+                raise RuntimeError("critic evaluation DP shard has no active targets")
+            if not torch.isfinite(returns).all() or not torch.isfinite(residuals).all():
+                raise RuntimeError("critic evaluation produced non-finite targets or residuals")
+            trajectory_returns_sum = sum(row.double().mean().item() for row in active_returns)
+            trajectory_returns_sq_sum = sum(row.double().square().mean().item() for row in active_returns)
+            trajectory_residual_sum = sum(row.double().mean().item() for row in active_residuals)
+            trajectory_residual_sq_sum = sum(row.double().square().mean().item() for row in active_residuals)
+            token_weighted = {
+                "n": int(returns.numel()),
+                "returns_sum": returns.sum().item(),
+                "returns_sq_sum": returns.square().sum().item(),
+                "residual_sum": residuals.sum().item(),
+                "residual_sq_sum": residuals.square().sum().item(),
+            }
+            trajectory_weighted = {
+                "n": len(active_returns),
+                "returns_sum": trajectory_returns_sum,
+                "returns_sq_sum": trajectory_returns_sq_sum,
+                "residual_sum": trajectory_residual_sum,
+                "residual_sq_sum": trajectory_residual_sq_sum,
+            }
+            return {
+                "dp_rank": parallel_state.effective_dp.rank,
+                "sample_indices": [int(index) for index in rollout_data["sample_indices"]],
+                # Keep the token-level fields for compatibility with existing
+                # consumers, while exposing both audited weighting schemes.
+                **token_weighted,
+                "token_weighted": token_weighted,
+                "trajectory_weighted": trajectory_weighted,
+            }
+
+    @with_logs
+    def train_critic(self, rollout_id: int, rollout_data: RolloutBatch) -> dict:
+        # Create data iterator for log_probs and train.
+        data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
+        offline_value_pretraining = bool(getattr(self.args, "value_pretrain_manifest", None))
+        sao_faster_value_update = getattr(self.args, "policy_objective", "ppo") == "sao_dis"
+        if not offline_value_pretraining:
+            rollout_data.update(
+                forward_only(
+                    get_values,
+                    self.args,
+                    self.model,
+                    data_iterator,
+                    num_microbatches,
+                    rollout_id=rollout_id,
+                )
+            )
+            compute_advantages_and_returns(
+                self.args,
+                rollout_data,
+                lambd_override=getattr(self.args, "critic_lambd", None),
+            )
 
         self.args.loss_type = "value_loss"
-        train_step_outcome: TrainStepOutcome = train(
-            rollout_id,
-            self.model,
-            self.optimizer,
-            self.opt_param_scheduler,
-            data_iterator,
-            num_microbatches,
-            witness_info=None,
-            attempt=0,
-        )
+        # Value targets are fixed for this rollout. Rebuild the iterator for
+        # each critic update because train() consumes it.
+        train_step_outcome = TrainStepOutcome.NORMAL
+        for _ in range(getattr(self.args, "num_critic_epochs", 1)):
+            data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
+            train_step_outcome = train(
+                rollout_id,
+                self.model,
+                self.optimizer,
+                self.opt_param_scheduler,
+                data_iterator,
+                num_microbatches,
+                witness_info=None,
+                attempt=0,
+            )
+
+        if sao_faster_value_update and not offline_value_pretraining and rollout_id >= self.args.num_critic_only_steps:
+            # SAO's actor must consume values from the faster-updated critic,
+            # not the stale predictions used to construct this batch's fixed
+            # critic targets. Actor training is already waiting on this send.
+            data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
+            rollout_data.update(
+                forward_only(
+                    get_values,
+                    self.args,
+                    self.model,
+                    data_iterator,
+                    num_microbatches,
+                    rollout_id=rollout_id,
+                )
+            )
 
         self._heartbeat.bump()
         result = {"train_step_outcome": train_step_outcome}
@@ -635,6 +976,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
     @timer
     def save_model(self, rollout_id: int, force_sync: bool = False) -> None:
+        assert_full_parameter_boundary_clear(self)
         self._heartbeat.bump()
         if self.args.debug_rollout_only:
             return
@@ -680,6 +1022,7 @@ class MegatronTrainRayActor(TrainRayActor):
     @with_logs
     @timer
     def update_weights(self, info: "EnginesAndLock") -> None:
+        assert_full_parameter_boundary_clear(self)
         self._heartbeat.bump()
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
@@ -708,7 +1051,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
         if self.args.debug_skip_weight_update:
             if dist.get_rank() == 0:
-                logger.warning("Skipping actor-to-rollout weight update because " "--debug-skip-weight-update is set.")
+                logger.warning("Skipping actor-to-rollout weight update because --debug-skip-weight-update is set.")
             if process_groups_are_temporary:
                 destroy_process_groups()
             return
@@ -735,9 +1078,10 @@ class MegatronTrainRayActor(TrainRayActor):
             if self.args.ci_test and len(rollout_engines) > 0 and not is_lora_enabled(self.args):
                 engine = random.choice(rollout_engines)
                 engine_version = ray.get(engine.get_weight_version.remote())
-                if str(engine_version) != str(self.weight_updater.weight_version):
+                expected_engine_version = _published_weight_version(self.weight_updater)
+                if str(engine_version) != expected_engine_version:
                     raise RuntimeError(
-                        f"Weight version mismatch! Engine: {engine_version}, Updater: {self.weight_updater.weight_version}"
+                        f"Weight version mismatch! Engine: {engine_version}, Updater: {expected_engine_version}"
                     )
 
             if getattr(self.args, "keep_old_actor", False):

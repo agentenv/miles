@@ -16,12 +16,21 @@ from miles.utils.chat_template_utils.tito_tokenizer import (
     MinimaxM27TITOTokenizer,
     Qwen3TITOTokenizer,
     Qwen35TITOTokenizer,
+    Qwen38TITOTokenizer,
     TITOTokenizer,
 )
 
 _EXPECTED_FIXED_TEMPLATES = {
     TITOTokenizerType.QWEN3: ("qwen3_fixed.jinja", {"clear_thinking": False}),
     TITOTokenizerType.QWEN35: ("qwen3.5_fixed.jinja", {"clear_thinking": False}),
+    TITOTokenizerType.QWEN38: (
+        None,
+        {
+            "enable_thinking": True,
+            "preserve_thinking": True,
+            "reasoning_effort": "xhigh",
+        },
+    ),
     TITOTokenizerType.QWENNEXT: ("qwen3_thinking_2507_and_next_fixed.jinja", {"clear_thinking": False}),
     TITOTokenizerType.GLM47: (None, {"clear_thinking": False}),
     TITOTokenizerType.NEMOTRON3: (None, {"truncate_history_thinking": False}),
@@ -78,6 +87,10 @@ def test_fixed_template_rejects_unknown_role():
 )
 def test_restricted_fixed_template_excludes_mid_session_system(tokenizer_cls):
     assert tokenizer_cls.FIXED_TEMPLATE.allowed_append_roles == frozenset({"tool", "user", "assistant"})
+
+
+def test_qwen38_restricts_surface_to_tool_and_user_appends():
+    assert Qwen38TITOTokenizer.FIXED_TEMPLATE.allowed_append_roles == frozenset({"tool", "user"})
 
 
 def test_string_tito_model_accepted():

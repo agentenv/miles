@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 from tests.fast.ray.rollout.conftest import make_args
 
-from miles.ray.rollout.router_manager import _resolve_session_server_ports, start_router, start_session_server
+from miles.ray.rollout.router_manager import (
+    _resolve_session_server_ports,
+    _resolve_session_server_startup_timeout,
+    start_router,
+    start_session_server,
+)
 
 
 class TestStartRouter:
@@ -38,6 +44,40 @@ class TestStartRouter:
             with pytest.raises(RuntimeError, match="already in use"):
                 start_router(args)
 
+    def test_configured_prometheus_port_is_forwarded(self, monkeypatch):
+        args = make_args(
+            sglang_router_ip=None,
+            sglang_router_port=21000,
+            sglang_router_prometheus_port=21001,
+        )
+        router_args = SimpleNamespace()
+        process = SimpleNamespace(start=lambda: None)
+        context = SimpleNamespace(Process=lambda **_kwargs: process)
+        monkeypatch.setattr(
+            "miles.ray.rollout.router_manager.get_host_info",
+            lambda: ("host", "127.0.0.1"),
+        )
+        monkeypatch.setattr(
+            "miles.ray.rollout.router_manager.RouterArgs.from_cli_args",
+            lambda *_args, **_kwargs: router_args,
+        )
+        monkeypatch.setattr(
+            "miles.ray.rollout.router_manager.multiprocessing.get_context",
+            lambda _method: context,
+        )
+        monkeypatch.setattr(
+            "miles.ray.rollout.router_manager.is_port_available",
+            lambda _port: True,
+        )
+        monkeypatch.setattr(
+            "miles.ray.rollout.router_manager.wait_for_server_ready",
+            lambda *_args, **_kwargs: None,
+        )
+
+        start_router(args)
+
+        assert router_args.prometheus_port == 21001
+
 
 class TestStartSessionServer:
     def test_disabled_returns_silently(self):
@@ -65,6 +105,47 @@ class TestStartSessionServer:
         with patch("miles.ray.rollout.router_manager.is_port_available", return_value=False):
             with pytest.raises(RuntimeError, match="already in use"):
                 start_session_server(args)
+
+    @pytest.mark.parametrize("configured_timeout", [None, 45.0])
+    def test_uses_bounded_startup_timeout_and_preserves_process_liveness_check(
+        self, monkeypatch, configured_timeout
+    ):
+        args = make_args(
+            use_session_server=True,
+            hf_checkpoint="/fake/model",
+            sglang_router_ip="127.0.0.1",
+            sglang_router_port=20000,
+            session_server_ip="127.0.0.1",
+            session_server_port=[20001],
+            session_server_startup_timeout_secs=configured_timeout,
+        )
+        process = SimpleNamespace(start=lambda: None)
+        context = SimpleNamespace(Process=lambda **_kwargs: process)
+        waits = []
+        monkeypatch.setattr(
+            "miles.ray.rollout.router_manager.multiprocessing.get_context",
+            lambda _method: context,
+        )
+        monkeypatch.setattr(
+            "miles.ray.rollout.router_manager.is_port_available",
+            lambda _port: True,
+        )
+        monkeypatch.setattr(
+            "miles.ray.rollout.router_manager.wait_for_server_ready",
+            lambda host, port, child, timeout: waits.append((host, port, child, timeout)),
+        )
+
+        start_session_server(args)
+
+        expected_timeout = 30.0 if configured_timeout is None else configured_timeout
+        assert waits == [("127.0.0.1", 20001, process, expected_timeout)]
+
+    @pytest.mark.parametrize("timeout", [True, "120", 0, -1, 120.1, float("inf"), float("nan")])
+    def test_rejects_invalid_or_unbounded_startup_timeout(self, timeout):
+        with pytest.raises(ValueError, match=r"\(0, 120\]"):
+            _resolve_session_server_startup_timeout(
+                SimpleNamespace(session_server_startup_timeout_secs=timeout)
+            )
 
 
 class TestResolveSessionServerPorts:

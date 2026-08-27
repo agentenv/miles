@@ -162,6 +162,36 @@ class TestSessionProxy:
         assert record["path"] == "/v1/chat/completions"
         assert record["status_code"] == 200
 
+    def test_compaction_budget_rejects_before_backend_sampling(self, router_env):
+        session_id = _create_session(router_env.url)
+        backend_request_count = len(router_env.backend.request_log)
+        headers = {
+            "X-Miles-Compaction-Schema-Version": "1",
+            "X-Miles-Compaction-Context-Window": "0",
+            "X-Miles-Compaction-Segment-Index": "0",
+            "X-Miles-Compaction-Segment-Type": "execution",
+            # max_tokens alone exhausts this budget, so any non-empty prompt
+            # must be rejected by the tokenizer-exact inequality.
+            "X-Miles-Compaction-Context-Budget": "2",
+        }
+
+        response = requests.post(
+            f"{router_env.url}/sessions/{session_id}/v1/chat/completions",
+            json={
+                "messages": [{"role": "user", "content": "budget"}],
+                "max_tokens": 2,
+            },
+            headers=headers,
+            timeout=10.0,
+        )
+
+        assert response.status_code == 413
+        assert "prompt_tokens=" in response.json()["error"]
+        assert len(router_env.backend.request_log) == backend_request_count
+        session = requests.get(f"{router_env.url}/sessions/{session_id}", timeout=5.0).json()
+        assert session["records"] == []
+        assert "compaction_schema_version" not in session["metadata"]
+
     def test_proxy_chat_response_has_no_duplicate_server_or_date_header(self, router_env):
         # Both the backend and this server run under uvicorn, so each emits its own
         # server/date. Echoing upstream's copy puts two of each on the wire, and

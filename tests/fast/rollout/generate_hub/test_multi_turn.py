@@ -26,6 +26,23 @@ def is_agentic_variant(variant: str) -> bool:
     return variant == "agentic_tool_call"
 
 
+async def _agent_records_then_raises(*args, **kwargs):
+    from miles.utils.test_utils.mock_tools import run_agentic_tool_call
+
+    await run_agentic_tool_call(*args, **kwargs)
+    raise RuntimeError("raised-agent-diagnostic-" + "x" * 6000)
+
+
+async def _agent_records_then_null(*args, **kwargs):
+    from miles.utils.test_utils.mock_tools import run_agentic_tool_call
+
+    await run_agentic_tool_call(*args, **kwargs)
+    return None
+
+
+_agent_records_then_null._miles_fail_closed_result = True
+
+
 # ------------------------------------ fixtures and consts ----------------------------------------
 
 
@@ -667,6 +684,36 @@ class TestAgentMetadata:
         for s in samples:
             assert s.metadata["session_server_id"] == expected_session_server_id
             assert re.fullmatch(r"[0-9a-f]{32}", s.metadata["session_server_instance_id"])
+
+
+@pytest.mark.parametrize("variant", _AGENTIC_VARIANTS)
+@pytest.mark.parametrize(
+    "agent_name",
+    ("_agent_records_then_raises", "_agent_records_then_null"),
+)
+def test_failed_agent_aborts_even_after_model_records(variant, agent_name, generation_env):
+    generation_env.mock_server.process_fn = TwoTurnStub.process_fn
+    generation_env.args.custom_agent_function_path = f"{__name__}.{agent_name}"
+
+    result = _run_generate(
+        variant,
+        generation_env,
+        make_sample(prompt=TwoTurnStub.PROMPT),
+    )
+
+    assert len(result.requests) == 2
+    samples = listify(result.sample)
+    assert len(samples) == 1
+    assert samples[0].status == Sample.Status.ABORTED
+    failure = samples[0].metadata["agent_failure"]
+    assert failure["schema"] == "miles.agent-failure.v1"
+    assert failure["stage"] == "custom_agent_function"
+    assert failure["records_collected"] == 2
+    assert len(failure["diagnostic"].encode("utf-8")) <= 2048
+    if agent_name.endswith("null"):
+        assert "null without a trustworthy outcome" in failure["diagnostic"]
+    else:
+        assert "diagnostic truncated" in failure["diagnostic"]
 
 
 class TestAgentCollectionFailure:

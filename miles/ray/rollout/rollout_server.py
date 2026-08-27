@@ -40,7 +40,7 @@ def start_rollout_servers(args, pg) -> dict[str, "RolloutServer"]:
         server_groups: list[ServerGroup] = []
         all_init_handles: list = []
         new_engine_indices_per_group: list[list[int]] = []
-        port_cursors = PortCursors.empty()
+        port_cursors = PortCursors.empty(args.rollout_engine_base_port)
 
         for group_cfg in model_cfg.server_groups:
             gpus_per_engine = group_cfg.num_gpus_per_engine
@@ -95,6 +95,7 @@ def start_rollout_servers(args, pg) -> dict[str, "RolloutServer"]:
             router_port=router_port,
             model_name=model_cfg.name,
             update_weights=model_cfg.update_weights,
+            engine_port_base=args.rollout_engine_base_port,
         )
 
     args.sglang_model_routers = {name: (srv.router_ip, srv.router_port) for name, srv in servers.items()}
@@ -156,6 +157,7 @@ class RolloutServer:
     router_port: int | None = None
     model_name: str = "default"
     update_weights: bool = True
+    engine_port_base: int = 15000
 
     @property
     def engines(self) -> list[ServerEngine]:
@@ -192,7 +194,7 @@ class RolloutServer:
 
     async def recover(self):
         """Recover dead engines across all active groups, overlapping init."""
-        port_cursors = PortCursors.empty()
+        port_cursors = PortCursors.empty(self.engine_port_base)
         await asyncio.gather(*[g.recover(port_cursors=port_cursors) for g in self.server_groups])
 
     async def offload(self, tags: list[str] | None = None):
@@ -207,6 +209,13 @@ class RolloutServer:
             handles.extend(g.onload(tags))
         return await asyncio.gather(*handles)
 
+    async def reload_weights_from_disk(self):
+        """Reload the immutable base checkpoint for offloaded server groups."""
+        handles = []
+        for group in self.server_groups:
+            handles.extend(group.onload_weights_from_disk())
+        return await asyncio.gather(*handles)
+
     async def check_weights(
         self, action: str, allow_quant_error: bool = False, selector: str = "all", skip_list: list[str] | None = None
     ):
@@ -217,6 +226,14 @@ class RolloutServer:
                 )
                 for g in self.server_groups
             ]
+        )
+
+    async def get_weight_versions(self) -> list[str]:
+        """Read the published version from every live node-0 engine."""
+
+        await self.wait_all_engines_alive()
+        return await asyncio.gather(
+            *[engine.actor_handle.get_weight_version.remote() for engine in self.engines if engine.is_allocated]
         )
 
     async def wait_all_engines_alive(self, timeout: float = 600):

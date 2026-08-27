@@ -28,6 +28,8 @@ def _is_empty_batch_timeout(task_error: ray.exceptions.RayTaskError) -> bool:
 
 
 async def main(args):
+    if getattr(args, "rollout_only_from_checkpoint", False):
+        raise ValueError("--rollout-only-from-checkpoint is supported only by synchronous train.py")
     assert (
         not args.colocate
     ), "Colocation is not supported for fully-async training (generation needs continuous GPU; colocate time-shares)."

@@ -41,7 +41,7 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
             if weight_type == "lora":
                 named_weights = self._bridge.export_adapter_weights(
                     self.model,
-                    cpu=False,
+                    cpu=True,
                     show_progress=False,
                 )
             elif weight_type == "base":

@@ -9,6 +9,46 @@ _OPD_STUDENT_TOP_LOGPROBS_KEY = "opd_student_top_logprobs"
 _REPLAY_FIELDS = ("rollout_routed_experts", "rollout_indexer_topk")
 
 
+def is_compaction_trajectory(samples: object) -> bool:
+    """Return whether ``samples`` is one validated compacted logical rollout."""
+    if not isinstance(samples, list) or not samples:
+        return False
+    metadata = [getattr(sample, "metadata", None) for sample in samples]
+    marked = [
+        isinstance(value, dict) and value.get("compaction_schema_version") == 1
+        for value in metadata
+    ]
+    if not any(marked):
+        return False
+    if not all(marked):
+        raise ValueError("logical rollout mixes compacted and unmarked samples")
+    indices = [value.get("compaction_segment_index") for value in metadata]
+    types = [value.get("compaction_segment_type") for value in metadata]
+    if (
+        indices != list(range(len(samples)))
+        or types
+        != ["execution" if index % 2 == 0 else "summary" for index in range(len(samples))]
+        or types[-1] != "execution"
+    ):
+        raise ValueError("logical rollout has malformed compaction segments")
+    trajectory_ids = {value.get("compaction_trajectory_id") for value in metadata}
+    if (
+        len(trajectory_ids) != 1
+        or not all(isinstance(value, str) and value for value in trajectory_ids)
+    ):
+        raise ValueError("logical rollout has inconsistent compaction trajectory IDs")
+    context_budgets = {value.get("compaction_context_budget") for value in metadata}
+    if (
+        len(context_budgets) != 1
+        or any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in context_budgets
+        )
+    ):
+        raise ValueError("logical rollout has inconsistent compaction context budgets")
+    return True
+
+
 def merge_samples(samples: list[Sample], tokenizer) -> Sample:
     acc = samples[0]
     for sample in samples[1:]:

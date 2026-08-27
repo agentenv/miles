@@ -9,16 +9,18 @@ logger = logging.getLogger(__name__)
 @dataclass
 class PortCursors:
     _values: dict[int, int]
+    _base_port: int = 15000
 
     @staticmethod
-    def empty() -> "PortCursors":
-        return PortCursors(_values={})
+    def empty(base_port: int = 15000) -> "PortCursors":
+        return PortCursors(_values={}, _base_port=base_port)
 
     def assign(self, other: "PortCursors"):
         self._values = other._values.copy()
+        self._base_port = other._base_port
 
     def next_base_port(self) -> int:
-        return max(self._values.values()) if self._values else 15000
+        return max(self._values.values()) if self._values else self._base_port
 
 
 # NOTE: May re-implement this in a potentially easier way if needed
@@ -109,7 +111,10 @@ def allocate_rollout_engine_addr_and_ports_normal(
             assert key in addr_and_ports[i], f"Engine {i} {key} is not set."
         logger.info(f"Ports for engine {i}: {addr_and_ports[i]}")
 
-    return addr_and_ports, PortCursors(_values=node_port_cursor)
+    return addr_and_ports, PortCursors(
+        _values=node_port_cursor,
+        _base_port=base_port,
+    )
 
 
 def allocate_rollout_engine_addr_and_ports_external(args, rollout_engines):

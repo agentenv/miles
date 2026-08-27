@@ -66,6 +66,7 @@ from miles.utils.chat_template_utils.tito_tokenizer import (
     InklingTITOTokenizer,
     Qwen3TITOTokenizer,
     Qwen35TITOTokenizer,
+    Qwen38TITOTokenizer,
     QwenNextTITOTokenizer,
     TITOTokenizer,
     TITOTokenizerType,
@@ -222,6 +223,22 @@ class TestConfig:
     def test_qwen3(self, qwen3_tito: Qwen3TITOTokenizer):
         assert qwen3_tito._assistant_start_str == "<|im_start|>assistant"
         assert qwen3_tito._newline_id in qwen3_tito.trailing_token_ids
+
+    def test_qwen38_synthetic_history_contains_a_user_query(self):
+        tokenizer = MagicMock()
+        tokenizer.encode.return_value = [1]
+        tokenizer.convert_tokens_to_ids.return_value = 2
+        tito = Qwen38TITOTokenizer(tokenizer)
+
+        messages = tito._synthetic_base_messages(
+            [{"role": "assistant", "content": "", "tool_calls": []}]
+        )
+
+        assert [message["role"] for message in messages] == [
+            "system",
+            "user",
+            "assistant",
+        ]
 
     def test_glm47(self, glm47_tito: GLM47TITOTokenizer):
         assert glm47_tito._assistant_start_str == "<|assistant|>"
@@ -691,7 +708,11 @@ class TestFactory:
 
     @pytest.mark.parametrize(
         "type_str, cls",
-        [("qwen35", Qwen35TITOTokenizer), ("qwennext", QwenNextTITOTokenizer)],
+        [
+            ("qwen35", Qwen35TITOTokenizer),
+            ("qwen38", Qwen38TITOTokenizer),
+            ("qwennext", QwenNextTITOTokenizer),
+        ],
     )
     def test_qwen_variant_inherits_qwen3_boundary_logic(self, type_str, cls):
         """Qwen3.5 / Qwen3-Next reuse Qwen3's boundary handling via inheritance.
@@ -723,6 +744,7 @@ class TestParserBinding:
         [
             (TITOTokenizerType.QWEN3, "qwen3", "qwen25"),
             (TITOTokenizerType.QWEN35, "qwen3", "qwen3_coder"),
+            (TITOTokenizerType.QWEN38, "qwen3", "qwen3_coder"),
             (TITOTokenizerType.QWENNEXT, "qwen3", "qwen25"),
             (TITOTokenizerType.GLM47, "glm45", "glm47"),
             (TITOTokenizerType.NEMOTRON3, "nemotron_3", "qwen3_coder"),

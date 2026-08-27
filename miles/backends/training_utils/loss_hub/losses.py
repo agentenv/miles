@@ -10,13 +10,19 @@ from miles.backends.training_utils.cp_utils import (
     get_sum_of_sample_mean,
 )
 from miles.backends.training_utils.loss_hub.corrections import vanilla_tis_function
-from miles.backends.training_utils.loss_hub.logit_processors import get_log_probs_and_entropy, get_values
+from miles.backends.training_utils.loss_hub.logit_processors import (
+    _value_support,
+    get_log_probs_and_entropy,
+    get_responses,
+    get_values,
+)
 from miles.backends.training_utils.loss_hub.math_utils import (
     compute_approx_kl,
     compute_ess_ratio_contribution,
     compute_gspo_kl,
     compute_opsm_mask,
     compute_policy_loss,
+    compute_sao_dis_policy_loss,
 )
 from miles.backends.training_utils.parallel import get_parallel_state
 from miles.utils.misc import load_function
@@ -91,7 +97,13 @@ def policy_loss_function(
     """
     parallel_state = get_parallel_state()
     advantages = torch.cat(batch["advantages"], dim=0)
-    old_log_probs = batch["rollout_log_probs"] if args.use_rollout_logprobs else batch["log_probs"]
+    policy_objective = getattr(args, "policy_objective", "ppo")
+    if policy_objective == "sao_dis":
+        if not batch.get("rollout_log_probs"):
+            raise ValueError("SAO DIS requires per-token rollout_log_probs")
+        old_log_probs = batch["rollout_log_probs"]
+    else:
+        old_log_probs = batch["rollout_log_probs"] if args.use_rollout_logprobs else batch["log_probs"]
 
     response_lengths = batch["response_lengths"]
     total_lengths = batch["total_lengths"]
@@ -177,9 +189,20 @@ def policy_loss_function(
         advantages.new_zeros(()),
     )
 
-    pg_loss, pg_clipfrac = compute_policy_loss(
-        ppo_kl, advantages, args.eps_clip, args.eps_clip_high, getattr(args, "eps_clip_c", None)
-    )
+    dis_ratio = dis_below = dis_above = None
+    if policy_objective == "sao_dis":
+        rollout_log_probs = torch.cat(batch["rollout_log_probs"], dim=0)
+        pg_loss, dis_ratio, pg_clipfrac, dis_below, dis_above = compute_sao_dis_policy_loss(
+            log_probs,
+            rollout_log_probs,
+            advantages,
+            args.sao_dis_eps_low,
+            args.sao_dis_eps_high,
+        )
+    else:
+        pg_loss, pg_clipfrac = compute_policy_loss(
+            ppo_kl, advantages, args.eps_clip, args.eps_clip_high, getattr(args, "eps_clip_c", None)
+        )
 
     if getattr(args, "dump_details", None) is not None:
         from miles.backends.training_utils.debug_dump import maybe_dump_policy_loss_debug
@@ -338,6 +361,15 @@ def policy_loss_function(
         "ppo_kl": ppo_kl.clone().detach(),
         "ess_ratio": ess_ratio_sum.squeeze(),
     }
+    if policy_objective == "sao_dis":
+        reported_loss.update(
+            {
+                "sao_dis_ratio": sum_of_sample_mean(dis_ratio).clone().detach(),
+                "sao_dis_rejectfrac": pg_clipfrac.clone().detach(),
+                "sao_dis_low_rejectfrac": sum_of_sample_mean(dis_below).clone().detach(),
+                "sao_dis_high_rejectfrac": sum_of_sample_mean(dis_above).clone().detach(),
+            }
+        )
 
     if train_rollout_logprob_abs_diff is not None:
         reported_loss["train_rollout_logprob_abs_diff"] = train_rollout_logprob_abs_diff.clone().detach()
@@ -367,60 +399,135 @@ def policy_loss_function(
     return loss, reported_loss
 
 
+def _two_hot_target_distribution(targets: torch.Tensor, support: torch.Tensor) -> torch.Tensor:
+    """Linearly project scalar targets onto their two adjacent support bins."""
+    num_bins = support.shape[0]
+    low, high = support[0].item(), support[-1].item()
+    positions = (targets.float().clamp(low, high) - low) / (high - low) * (num_bins - 1)
+    lower = positions.floor().long()
+    upper = positions.ceil().long()
+    upper_weight = positions - lower.float()
+    distribution = torch.zeros((*targets.shape, num_bins), dtype=torch.float32, device=targets.device)
+    distribution.scatter_add_(-1, lower.unsqueeze(-1), (1.0 - upper_weight).unsqueeze(-1))
+    distribution.scatter_add_(-1, upper.unsqueeze(-1), upper_weight.unsqueeze(-1))
+    return distribution
+
+
+def _hl_gauss_target_distribution(
+    targets: torch.Tensor,
+    support: torch.Tensor,
+    sigma_ratio: float = 0.75,
+) -> torch.Tensor:
+    """Project scalar targets using Gaussian CDF mass over each support bin."""
+    bin_width = support[1] - support[0]
+    sigma = sigma_ratio * bin_width
+    bin_lo = support - bin_width / 2
+    bin_hi = support + bin_width / 2
+    mu = targets.float().clamp(support[0], support[-1]).unsqueeze(-1)
+    normalizer = sigma * 1.4142135623730951
+    probs = 0.5 * (torch.erf((bin_hi - mu) / normalizer) - torch.erf((bin_lo - mu) / normalizer))
+    return probs / probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+
+
+def _get_value_logits_list(logits: torch.Tensor, args: Namespace, batch: RolloutBatch) -> list[torch.Tensor]:
+    return [
+        logits_chunk
+        for logits_chunk, _ in get_responses(
+            logits,
+            args=args,
+            unconcat_tokens=batch["unconcat_tokens"],
+            total_lengths=batch["total_lengths"],
+            response_lengths=batch["response_lengths"],
+            max_seq_lens=batch.get("max_seq_lens", None),
+            apply_temperature=False,
+        )
+    ]
+
+
 def value_loss_function(
     args: Namespace,
     batch: RolloutBatch,
     logits: torch.Tensor,
     sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Compute clipped value loss and metrics.
-
-    Extracts current value predictions from `logits`, compares them against
-    stored old values with clipping, and computes the maximum of clipped and
-    unclipped squared errors (PPO-style value clipping).
-
-    Args:
-        args: Configuration containing `value_clip` threshold.
-        batch: Mini-batch with "values" (old predictions), "returns",
-            "unconcat_tokens", "total_lengths", and "response_lengths".
-        logits: Value head output with shape `[1, T, 1]`.
-        sum_of_sample_mean: Reduction function that averages per-sample values.
-
-    Returns:
-        Tuple of `(loss, metrics)` where `loss` is a scalar tensor and
-        `metrics` contains detached scalars "value_loss" and "value_clipfrac".
-    """
-    old_values = torch.cat(batch["values"], dim=0)
-
-    values = get_values(
-        logits,
-        args=args,
-        unconcat_tokens=batch["unconcat_tokens"],
-        total_lengths=batch["total_lengths"],
-        response_lengths=batch["response_lengths"],
-        max_seq_lens=batch.get("max_seq_lens", None),
-    )
-    values = torch.cat([value.flatten() for value in values["values"]], dim=0)
-
+    """Compute online PPO value loss or direct offline value-pretraining loss."""
     returns = torch.cat(batch["returns"], dim=0)
+    use_classification = getattr(args, "value_loss_type", "mse") == "classification"
+    offline_pretraining = bool(getattr(args, "value_pretrain_manifest", None))
 
-    values_clipfrac = torch.abs(values - old_values) > args.value_clip
-    values_clipped = old_values + (values - old_values).clamp(-args.value_clip, args.value_clip)
-    surr1 = (values_clipped - returns) ** 2
-    surr2 = (values - returns) ** 2
-    loss = torch.max(surr1, surr2)
+    if use_classification:
+        num_bins = args.value_num_bins
+        raw_logits = torch.cat(
+            [chunk.reshape(-1, num_bins) for chunk in _get_value_logits_list(logits, args, batch)],
+            dim=0,
+        )
+        support = _value_support(args, raw_logits.device)
+        values = raw_logits.float().softmax(dim=-1) @ support
+        if getattr(args, "value_target_type", "hl_gauss") == "hl_gauss":
+            target_dist = _hl_gauss_target_distribution(
+                returns,
+                support,
+                getattr(args, "hl_gauss_sigma_ratio", 0.75),
+            )
+        else:
+            target_dist = _two_hot_target_distribution(returns, support)
+        log_probs = torch.nn.functional.log_softmax(raw_logits.float(), dim=-1)
+        loss = sum_of_sample_mean(-(target_dist * log_probs).sum(dim=-1))
+        if values.numel() == 0:
+            loss += 0 * raw_logits.sum()
+        probs = log_probs.exp()
+        reported_loss = {
+            "value_loss": loss.clone().detach(),
+            "value_accuracy": sum_of_sample_mean(
+                (raw_logits.argmax(dim=-1) == target_dist.argmax(dim=-1)).float()
+            ).detach(),
+            "value_entropy": sum_of_sample_mean(-(probs * log_probs).sum(dim=-1)).detach(),
+            "value_confidence": sum_of_sample_mean(probs.max(dim=-1).values).detach(),
+        }
+    else:
+        values_by_sample = get_values(
+            logits,
+            args=args,
+            unconcat_tokens=batch["unconcat_tokens"],
+            total_lengths=batch["total_lengths"],
+            response_lengths=batch["response_lengths"],
+            max_seq_lens=batch.get("max_seq_lens", None),
+        )
+        values = torch.cat([value.flatten() for value in values_by_sample["values"]], dim=0)
+        if offline_pretraining:
+            loss = sum_of_sample_mean((values - returns) ** 2)
+            reported_loss = {"value_loss": loss.clone().detach()}
+        else:
+            old_values = torch.cat(batch["values"], dim=0)
+            values_clipfrac = torch.abs(values - old_values) > args.value_clip
+            values_clipped = old_values + (values - old_values).clamp(-args.value_clip, args.value_clip)
+            loss = sum_of_sample_mean(torch.max((values_clipped - returns) ** 2, (values - returns) ** 2))
+            reported_loss = {
+                "value_loss": loss.clone().detach(),
+                "value_clipfrac": sum_of_sample_mean(values_clipfrac.float()).detach(),
+            }
+        if values.numel() == 0:
+            loss += 0 * values.sum()
 
-    loss = sum_of_sample_mean(loss)
-    values_clipfrac = sum_of_sample_mean(values_clipfrac.float())
-
-    # make sure the gradient could backprop correctly.
-    if values.numel() == 0:
-        loss += 0 * values.sum()
-
-    reported_loss = {
-        "value_loss": loss.clone().detach(),
-        "value_clipfrac": values_clipfrac.clone().detach(),
-    }
+    # Carry sufficient statistics through the existing distributed metric
+    # reduction so explained variance is globally correct and mask-aware.
+    with torch.no_grad():
+        if values.numel() > 0:
+            local_loss_masks = get_local_response_loss_masks(
+                batch["total_lengths"],
+                batch["response_lengths"],
+                batch["loss_masks"],
+                args.qkv_format,
+                batch.get("max_seq_lens", None),
+            )
+            active = torch.cat(local_loss_masks, dim=0).to(device=values.device).bool()
+            ev_returns = returns[active]
+            ev_residual = ev_returns - values[active]
+            reported_loss["_ev_n"] = torch.tensor(float(ev_returns.numel()), device=values.device)
+            reported_loss["_ev_returns_sum"] = ev_returns.sum()
+            reported_loss["_ev_returns_sq_sum"] = ev_returns.square().sum()
+            reported_loss["_ev_residual_sum"] = ev_residual.sum()
+            reported_loss["_ev_residual_sq_sum"] = ev_residual.square().sum()
 
     return loss, reported_loss
 

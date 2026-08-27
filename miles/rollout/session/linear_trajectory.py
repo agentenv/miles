@@ -41,6 +41,13 @@ class LinearTrajectory:
     trajectory_token_ids: list[list[int]] = field(default_factory=list)
     generated_checkpoint_message_ends: list[int] = field(default_factory=list)
     num_assistant: int = 0
+    compaction_schema_version: int | None = None
+    compaction_context_window: int = 0
+    compaction_segment_index: int = 0
+    compaction_segment_type: str = "execution"
+    compaction_context_budget: int | None = None
+    context_window_token_ids: dict[int, list[int]] = field(default_factory=dict)
+    context_window_record_start: int = 0
 
     @property
     def token_ids(self) -> list[int]:
@@ -49,6 +56,145 @@ class LinearTrajectory:
 
     def append_record(self, record: SessionRecord) -> None:
         self.records.append(record)
+
+    def prepare_compaction_segment(
+        self,
+        *,
+        schema_version: int | None,
+        context_window: int | None,
+        segment_index: int | None,
+        segment_type: str | None,
+        context_budget: int | None,
+    ) -> None:
+        """Validate and enter one explicitly marked CompactionRL segment.
+
+        The protocol is deliberately fail-closed: all four markers are either
+        absent (the legacy append-only path) or present on every request.  A
+        summary is the only legal in-window segment transition; returning to
+        execution must start exactly one new context window.  Previous records
+        and final window token IDs remain durable training evidence.
+
+        Must be called under ``self.lock`` before tokenization.
+        """
+        markers = (
+            schema_version,
+            context_window,
+            segment_index,
+            segment_type,
+            context_budget,
+        )
+        if all(value is None for value in markers):
+            if self.compaction_schema_version is not None:
+                raise MessageValidationError("compaction markers disappeared within a session")
+            return
+        if any(value is None for value in markers):
+            raise MessageValidationError("compaction requests require all protocol markers")
+        if schema_version != 1:
+            raise MessageValidationError(f"unsupported compaction schema version {schema_version!r}")
+        if (
+            isinstance(context_window, bool)
+            or not isinstance(context_window, int)
+            or context_window < 0
+            or isinstance(segment_index, bool)
+            or not isinstance(segment_index, int)
+            or segment_index < 0
+            or segment_type not in {"execution", "summary"}
+            or isinstance(context_budget, bool)
+            or not isinstance(context_budget, int)
+            or context_budget <= 0
+        ):
+            raise MessageValidationError("invalid compaction segment markers")
+
+        if self.compaction_schema_version is None:
+            if self.records or context_window != 0 or segment_index != 0 or segment_type != "execution":
+                raise MessageValidationError("compaction session must begin at execution segment 0 in window 0")
+            self.compaction_schema_version = schema_version
+            self.compaction_context_budget = context_budget
+            return
+
+        if schema_version != self.compaction_schema_version:
+            raise MessageValidationError("compaction schema changed within a session")
+        if context_budget != self.compaction_context_budget:
+            raise MessageValidationError("compaction context budget changed within a session")
+
+        current = (
+            self.compaction_context_window,
+            self.compaction_segment_index,
+            self.compaction_segment_type,
+        )
+        requested = (context_window, segment_index, segment_type)
+        if requested == current:
+            return
+
+        if (
+            context_window == self.compaction_context_window
+            and segment_index == self.compaction_segment_index + 1
+            and self.compaction_segment_type == "execution"
+            and segment_type == "summary"
+        ):
+            self.compaction_segment_index = segment_index
+            self.compaction_segment_type = segment_type
+            return
+
+        if (
+            context_window == self.compaction_context_window + 1
+            and segment_index == self.compaction_segment_index + 1
+            and self.compaction_segment_type == "summary"
+            and segment_type == "execution"
+        ):
+            if not self.token_ids:
+                raise MessageValidationError("cannot compact an empty context window")
+            self.context_window_token_ids[self.compaction_context_window] = list(self.token_ids)
+            self.messages = []
+            self.trajectory_token_ids = []
+            self.generated_checkpoint_message_ends = []
+            self.num_assistant = 0
+            self.context_window_record_start = len(self.records)
+            self.compaction_context_window = context_window
+            self.compaction_segment_index = segment_index
+            self.compaction_segment_type = segment_type
+            return
+
+        raise MessageValidationError(
+            "illegal compaction segment transition: " f"current={current!r}, requested={requested!r}"
+        )
+
+    def accumulated_token_ids_by_context_window(self) -> dict[int, list[int]]:
+        """Return final TITO tokens for every completed/current context window."""
+        values = {key: list(value) for key, value in self.context_window_token_ids.items()}
+        if self.token_ids:
+            values[self.compaction_context_window] = list(self.token_ids)
+        return values
+
+    def compaction_transition_checkpoint(self) -> dict[str, Any]:
+        """Capture the small mutable surface changed before a segment request commits."""
+        return {
+            "messages": self.messages,
+            "trajectory_token_ids": self.trajectory_token_ids,
+            "generated_checkpoint_message_ends": self.generated_checkpoint_message_ends,
+            "num_assistant": self.num_assistant,
+            "compaction_schema_version": self.compaction_schema_version,
+            "compaction_context_window": self.compaction_context_window,
+            "compaction_segment_index": self.compaction_segment_index,
+            "compaction_segment_type": self.compaction_segment_type,
+            "compaction_context_budget": self.compaction_context_budget,
+            "context_window_token_ids": dict(self.context_window_token_ids),
+            "context_window_record_start": self.context_window_record_start,
+        }
+
+    def restore_compaction_transition(self, checkpoint: dict[str, Any]) -> None:
+        """Roll back a boundary request rejected before it produced a record."""
+        self.messages = checkpoint["messages"]
+        self.trajectory_token_ids = checkpoint["trajectory_token_ids"]
+        self.generated_checkpoint_message_ends = checkpoint["generated_checkpoint_message_ends"]
+        self.num_assistant = checkpoint["num_assistant"]
+        self.compaction_schema_version = checkpoint["compaction_schema_version"]
+        self.compaction_context_window = checkpoint["compaction_context_window"]
+        self.compaction_segment_index = checkpoint["compaction_segment_index"]
+        self.compaction_segment_type = checkpoint["compaction_segment_type"]
+        self.compaction_context_budget = checkpoint["compaction_context_budget"]
+        self.context_window_token_ids = checkpoint["context_window_token_ids"]
+        self.context_window_record_start = checkpoint["context_window_record_start"]
 
     def prepare_pretokenized(
         self,
@@ -251,7 +397,7 @@ class LinearTrajectory:
 
         self.messages = stored[:rollback_msg_end]
         self.trajectory_token_ids = self.trajectory_token_ids[: checkpoint_index + 1]
-        self.records = self.records[: checkpoint_index + 1]
+        self.records = self.records[: self.context_window_record_start + checkpoint_index + 1]
         self.generated_checkpoint_message_ends = self.generated_checkpoint_message_ends[: checkpoint_index + 1]
         self.num_assistant = len(self.generated_checkpoint_message_ends)
 

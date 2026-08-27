@@ -139,6 +139,7 @@ def _setup_lora_model_via_bridge(args: Namespace) -> list:
     provider.virtual_pipeline_model_parallel_size = args.virtual_pipeline_model_parallel_size
     provider.context_parallel_size = args.context_parallel_size
     provider.gradient_accumulation_fusion = args.gradient_accumulation_fusion
+    provider.attention_backend = args.attention_backend
     provider.recompute_granularity = args.recompute_granularity
     provider.recompute_method = args.recompute_method
     provider.recompute_num_layers = args.recompute_num_layers
@@ -192,6 +193,8 @@ def _setup_lora_model_via_bridge(args: Namespace) -> list:
         provider.register_pre_wrap_hook(_make_value_model_hook(hidden_size, provider.sequence_parallel))
 
     use_distributed_optimizer = "muon" not in (args.optimizer or "").lower()
+    if getattr(args, "external_policy_sync_path", None) is not None:
+        use_distributed_optimizer = args.use_distributed_optimizer
     if is_multi_lora_enabled(args):
         # Per-slot LayerWise optimizers: plain DDP all-reduce keeps full grads on
         # every rank (whole-param sharding + retained-gradient idempotency).

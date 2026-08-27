@@ -44,10 +44,23 @@ class _FakeEnv:
     server (reward plus the canonical-harness marker)."""
 
     last_actions: list = []
+    last_init: dict = {}
 
-    def __init__(self, base_url="", message_timeout_s=0):
+    def __init__(
+        self,
+        base_url="",
+        message_timeout_s=0,
+        websocket_ping_interval_s=None,
+        websocket_ping_timeout_s=None,
+    ):
         self.actions = []
         _FakeEnv.last_actions = self.actions
+        _FakeEnv.last_init = {
+            "base_url": base_url,
+            "message_timeout_s": message_timeout_s,
+            "websocket_ping_interval_s": websocket_ping_interval_s,
+            "websocket_ping_timeout_s": websocket_ping_timeout_s,
+        }
 
     async def __aenter__(self):
         return self
@@ -57,6 +70,9 @@ class _FakeEnv:
 
     async def reset(self, task_id=None):
         return _FakeResult(instruction="do the thing")
+
+    async def state(self):
+        return types.SimpleNamespace()
 
     async def step(self, action):
         self.actions.append(action)
@@ -88,6 +104,82 @@ class _FakePolicy:
 
 
 _CLASSES = {"env": _FakeEnv, "action": _FakeAction}
+
+
+class ConnectionClosedError(RuntimeError):
+    """Named like the production websocket exception for retry classification."""
+
+
+def test_with_env_retries_capacity_before_admission_only(monkeypatch):
+    attempts = 0
+    body_calls = 0
+
+    class CapacityThenReady(_FakeEnv):
+        async def state(self):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("CAPACITY_REACHED")
+            return types.SimpleNamespace()
+
+    async def no_sleep(_seconds):
+        return None
+
+    async def body(_env):
+        nonlocal body_calls
+        body_calls += 1
+        return "ok"
+
+    monkeypatch.setattr(oaf.asyncio, "sleep", no_sleep)
+    assert run_async(oaf._with_env(CapacityThenReady, "http://env", body)) == "ok"
+    assert attempts == 2
+    assert body_calls == 1
+    assert _FakeEnv.last_init == {
+        "base_url": "http://env",
+        "message_timeout_s": oaf._MESSAGE_TIMEOUT_S,
+        "websocket_ping_interval_s": oaf._WEBSOCKET_PING_INTERVAL_S,
+        "websocket_ping_timeout_s": oaf._WEBSOCKET_PING_TIMEOUT_S,
+    }
+
+
+def test_with_env_never_replays_after_admission():
+    instances = 0
+    body_calls = 0
+
+    class Ready(_FakeEnv):
+        def __init__(self, *args, **kwargs):
+            nonlocal instances
+            super().__init__(*args, **kwargs)
+            instances += 1
+
+    async def body(_env):
+        nonlocal body_calls
+        body_calls += 1
+        raise ConnectionClosedError("connection dropped after reset")
+
+    try:
+        run_async(oaf._with_env(Ready, "http://env", body))
+    except ConnectionClosedError as error:
+        assert "after reset" in str(error)
+    else:  # pragma: no cover - assertion aid
+        raise AssertionError("post-admission disconnect did not propagate")
+
+    assert instances == 1
+    assert body_calls == 1
+
+
+def test_trial_dir_purge_is_bounded_when_server_action_stalls(monkeypatch):
+    class BlockingEnv:
+        async def step(self, _action):
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(oaf, "_PURGE_TIMEOUT_S", 0.01)
+    run_async(
+        asyncio.wait_for(
+            oaf._purge_trial_dirs(BlockingEnv(), _FakeAction),
+            timeout=0.1,
+        )
+    )
 
 
 # --- episode dispatch ------------------------------------------------------

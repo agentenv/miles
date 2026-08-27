@@ -10,7 +10,10 @@ from unittest.mock import MagicMock
 import pytest
 
 from miles.rollout.generate_utils.sample_utils import merge_samples
-from miles.rollout.session.samples.merge import compute_samples_from_openai_records
+from miles.rollout.session.samples.merge import (
+    compute_samples_from_openai_records,
+    merge_samples_by_compaction_segment,
+)
 from miles.rollout.session.types import SessionRecord
 from miles.utils.types import Sample
 
@@ -26,6 +29,22 @@ def _mock_tokenizer():
     tok = MagicMock()
     tok.decode = lambda ids: "".join(f"[{i}]" for i in ids)
     return tok
+
+
+def _make_input_sample(**overrides):
+    defaults = dict(
+        group_index=0,
+        index=0,
+        prompt="test prompt",
+        tokens=[],
+        response="",
+        response_length=0,
+        status=Sample.Status.PENDING,
+        label="test",
+        reward=1.0,
+    )
+    defaults.update(overrides)
+    return Sample(**defaults)
 
 
 def _make_record(
@@ -154,6 +173,126 @@ class TestComputeSamplesFromRecords:
         samples = compute_samples_from_openai_records(_ARGS, [record], tok)
 
         assert samples[0].status == Sample.Status.TRUNCATED
+
+    def test_compaction_windows_become_distinct_trainable_segments(self):
+        tok = _mock_tokenizer()
+        records = [
+            _make_record(prompt_token_ids=[1, 2], output_token_ids=[10]),
+            _make_record(prompt_token_ids=[1, 2, 10, 3], output_token_ids=[20]),
+            _make_record(prompt_token_ids=[7, 8], output_token_ids=[30]),
+        ]
+        markers = [(0, 0, "execution"), (0, 1, "summary"), (1, 2, "execution")]
+        for record, (window, segment, segment_type) in zip(records, markers, strict=True):
+            record.compaction_schema_version = 1
+            record.compaction_context_window = window
+            record.compaction_segment_index = segment
+            record.compaction_segment_type = segment_type
+            record.compaction_context_budget = 8192
+
+        samples = compute_samples_from_openai_records(
+            _ARGS,
+            records,
+            tok,
+            accumulated_token_ids_by_context_window={
+                "0": [1, 2, 10, 3, 20],
+                "1": [7, 8, 30],
+            },
+        )
+        segments = merge_samples_by_compaction_segment(samples, tok)
+
+        assert len(segments) == 3
+        assert [sample.metadata["compaction_segment_type"] for sample in segments] == [
+            "execution",
+            "summary",
+            "execution",
+        ]
+        assert [sample.tokens for sample in segments] == [
+            [1, 2, 10],
+            [1, 2, 10, 3, 20],
+            [7, 8, 30],
+        ]
+
+    @pytest.mark.parametrize("exit_status", ["max_seq_len", "max_turns"])
+    def test_terminal_orphan_summary_is_dropped_at_declared_boundary(self, exit_status):
+        tok = _mock_tokenizer()
+        records = [
+            _make_record(prompt_token_ids=[1, 2], output_token_ids=[10]),
+            _make_record(prompt_token_ids=[1, 2, 10, 3], output_token_ids=[20]),
+        ]
+        for record, (segment, segment_type) in zip(
+            records,
+            [(0, "execution"), (1, "summary")],
+            strict=True,
+        ):
+            record.compaction_schema_version = 1
+            record.compaction_context_window = 0
+            record.compaction_segment_index = segment
+            record.compaction_segment_type = segment_type
+            record.compaction_context_budget = 8192
+
+        samples = compute_samples_from_openai_records(
+            _ARGS,
+            records,
+            tok,
+            accumulated_token_ids_by_context_window={
+                "0": [1, 2, 10, 3, 20],
+            },
+        )
+        for sample in samples:
+            sample.metadata["exit_status"] = exit_status
+
+        segments = merge_samples_by_compaction_segment(samples, tok)
+
+        assert len(segments) == 1
+        assert segments[0].tokens == [1, 2, 10]
+        assert segments[0].metadata["compaction_segment_type"] == "execution"
+        assert segments[0].metadata["compaction_terminal_orphan_summary_dropped"] is True
+        assert segments[0].metadata["compaction_terminal_orphan_summary_segment_index"] == 1
+        assert "compaction_terminal_orphan_summary_dropped" not in samples[0].metadata
+
+    @pytest.mark.parametrize("exit_status", [None, "completed", "timeout"])
+    def test_terminal_summary_without_length_or_turn_boundary_fails_closed(self, exit_status):
+        tok = _mock_tokenizer()
+        samples = [
+            _make_input_sample(
+                metadata={
+                    "compaction_schema_version": 1,
+                    "compaction_context_window": 0,
+                    "compaction_segment_index": segment,
+                    "compaction_segment_type": segment_type,
+                    "compaction_context_budget": 8192,
+                    "exit_status": exit_status,
+                },
+                status=Sample.Status.COMPLETED,
+            )
+            for segment, segment_type in [(0, "execution"), (1, "summary")]
+        ]
+
+        with pytest.raises(ValueError, match="declared max_seq_len/max_turns boundary"):
+            merge_samples_by_compaction_segment(samples, tok)
+
+    def test_terminal_summary_with_mismatched_exit_status_fails_closed(self):
+        tok = _mock_tokenizer()
+        samples = [
+            _make_input_sample(
+                metadata={
+                    "compaction_schema_version": 1,
+                    "compaction_context_window": 0,
+                    "compaction_segment_index": segment,
+                    "compaction_segment_type": segment_type,
+                    "compaction_context_budget": 8192,
+                    "exit_status": exit_status,
+                },
+                status=Sample.Status.COMPLETED,
+            )
+            for segment, segment_type, exit_status in [
+                (0, "execution", "max_seq_len"),
+                (1, "summary", "max_turns"),
+            ]
+        ]
+
+        with pytest.raises(ValueError, match="inconsistent episode exit statuses"):
+            merge_samples_by_compaction_segment(samples, tok)
 
 
 # ── test: multi-turn prefix chain (merge_samples integration) ────────

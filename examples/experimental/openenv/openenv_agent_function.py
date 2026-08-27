@@ -44,6 +44,7 @@ episode-wiring note below); its env vars are documented there.
 """
 
 import asyncio
+import inspect
 import logging
 import os
 import random
@@ -63,6 +64,12 @@ logger = logging.getLogger(__name__)
 # full. Both are transient -- episodes hold a slot only for their rollout -- so
 # jittered backoff + retry serializes the surplus rather than failing it.
 #
+# Retrying is safe only before an episode starts.  A WebSocket can also close
+# after reset/tool execution has created and mutated a task container.  Replaying
+# ``body`` in that case duplicates one immutable sample id and can leak the first
+# container.  _with_env therefore performs a side-effect-free state request as
+# an admission handshake and never retries once that handshake succeeds.
+#
 # A rollout fans out more episodes than the server has slots (e.g. ~32 episodes
 # vs a 16-session cap), so a queued episode must outwait a full episode ahead of
 # it -- minutes, not seconds. The wait deadline is sized for that; the backoff
@@ -70,6 +77,8 @@ logger = logging.getLogger(__name__)
 # reconnects while they wait.
 _CAPACITY_MAX_WAIT_S = 1800.0
 _CAPACITY_BACKOFF_S = (1.0, 5.0)
+_WEBSOCKET_PING_INTERVAL_S = 60.0
+_WEBSOCKET_PING_TIMEOUT_S = 300.0
 
 # Strip a single fenced block: ```python / ```bash / ``` ... ```.
 _FENCE_RE = re.compile(r"```(?:python|py|bash|sh)?\s*\n?(.*?)```", re.DOTALL | re.IGNORECASE)
@@ -99,6 +108,12 @@ TB2_AGENT_SYSTEM_PROMPT = (
 # raise it (and OPENENV_MAX_ROLLOUT_TIME_SECONDS) for tasks declaring larger
 # verifier budgets.
 _MESSAGE_TIMEOUT_S = float(os.getenv("OPENENV_MESSAGE_TIMEOUT_S", "1200"))
+
+# Cleanup must never extend a cancelled episode by another full message
+# timeout. In docker mode an in-flight native verifier can still occupy the
+# session after the client coroutine is cancelled; bounding this best-effort
+# purge lets the environment context close and tear down that verifier.
+_PURGE_TIMEOUT_S = 10.0
 
 # Hard wall-clock cap for one episode. The per-message timeout above bounds a
 # single env op, and OPENENV_MAX_TURNS bounds the turn count, but neither bounds
@@ -213,28 +228,51 @@ async def _purge_trial_dirs(env: Any, action_cls: Any) -> None:
     # step time. Preserve repo_cache; delete only the ephemeral per-trial
     # dirs beside it.
     try:
-        await env.step(
-            action_cls(
-                action_type="exec",
-                command=(
-                    "find /tmp/tbench2_env_runs -mindepth 1 -maxdepth 1 "
-                    "! -name repo_cache -exec rm -rf {} + 2>/dev/null || true"
-                ),
-            )
+        await asyncio.wait_for(
+            env.step(
+                action_cls(
+                    action_type="exec",
+                    command=(
+                        "find /tmp/tbench2_env_runs -mindepth 1 -maxdepth 1 ! -name repo_cache -exec rm -rf {} + 2>/dev/null || true"
+                    ),
+                )
+            ),
+            timeout=_PURGE_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "OpenEnv trial-dir purge exceeded %.0fs; continuing session teardown",
+            _PURGE_TIMEOUT_S,
         )
     except Exception:
         pass
 
 
 async def _with_env(env_cls: Any, env_url: str, body: Callable[[Any], Any]) -> Any:
-    """Open an env session and run ``body(env)``, retrying while a slot is busy."""
+    """Open one admitted env session and run ``body`` exactly once.
+
+    Capacity failures are retried only during connection/admission.  Once the
+    side-effect-free state handshake succeeds, every exception belongs to that
+    logical episode and must propagate; replaying it would create a replacement
+    trajectory under the same sample id.
+    """
     deadline = asyncio.get_event_loop().time() + _CAPACITY_MAX_WAIT_S
     while True:
+        admitted = False
         try:
-            async with env_cls(base_url=env_url, message_timeout_s=_MESSAGE_TIMEOUT_S) as env:
+            async with env_cls(
+                base_url=env_url,
+                message_timeout_s=_MESSAGE_TIMEOUT_S,
+                websocket_ping_interval_s=_WEBSOCKET_PING_INTERVAL_S,
+                websocket_ping_timeout_s=_WEBSOCKET_PING_TIMEOUT_S,
+            ) as env:
+                state = env.state()
+                if inspect.isawaitable(state):
+                    await state
+                admitted = True
                 return await body(env)
         except Exception as e:
-            if _is_retryable_env_error(e) and asyncio.get_event_loop().time() < deadline:
+            if not admitted and _is_retryable_env_error(e) and asyncio.get_event_loop().time() < deadline:
                 await asyncio.sleep(random.uniform(*_CAPACITY_BACKOFF_S))
                 continue
             raise

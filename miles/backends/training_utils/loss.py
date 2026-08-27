@@ -16,7 +16,12 @@ from miles.utils.multi_lora import is_multi_lora_enabled
 from miles.utils.types import RolloutBatch
 
 
-def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) -> None:
+def compute_advantages_and_returns(
+    args: Namespace,
+    rollout_data: RolloutBatch,
+    *,
+    lambd_override: float | None = None,
+) -> None:
     """Compute advantages and returns in-place based on `args.advantage_estimator`.
 
     This function extracts rewards, log-probs, values, and masks from
@@ -73,8 +78,11 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
         loss_masks=loss_masks,
         total_lengths=total_lengths,
         response_lengths=response_lengths,
-        max_seq_lens=max_seq_lens,
         values=values,
+        max_seq_lens=max_seq_lens,
+        lambd_override=lambd_override,
+        compaction_subsequent_active_tokens=rollout_data.get("compaction_subsequent_active_tokens"),
+        compaction_trajectory_active_tokens=rollout_data.get("compaction_trajectory_active_tokens"),
     )
 
     # Apply on-policy distillation KL penalty to advantages (orthogonal to advantage estimator)

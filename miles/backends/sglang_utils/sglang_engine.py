@@ -23,6 +23,18 @@ from miles.utils.multi_lora import is_multi_lora_enabled
 logger = logging.getLogger(__name__)
 
 
+def _allow_missing_unquantized_weight_update_hooks(args, server_args: dict) -> bool:
+    """Return the explicit, runtime-checked legacy BF16 hook decision."""
+
+    return (
+        bool(getattr(args, "allow_missing_unquantized_weight_update_hooks", False))
+        and args.update_weight_transfer_mode == "broadcast"
+        and server_args.get("quantization") is None
+        and server_args.get("modelopt_quant") is None
+        and not server_args.get("torchao_config")
+    )
+
+
 def get_base_gpu_id(args, rank):
     num_gpus = min(args.num_gpus_per_node, args.rollout_num_gpus_per_engine)
     if args.colocate:
@@ -67,7 +79,13 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
     from sglang.srt.entrypoints.http_server import launch_server
 
     multiprocessing.set_start_method("spawn", force=True)
-    server_args.host = server_args.host.strip("[]")
+    if hasattr(server_args, "derive"):
+        server_args = server_args.derive(
+            "miles.sglang_engine.launch_server_process",
+            host=server_args.host.strip("[]"),
+        )
+    else:
+        server_args.host = server_args.host.strip("[]")
     p = multiprocessing.Process(target=launch_server, args=(server_args,))
     p.start()
 
@@ -210,6 +228,10 @@ class SGLangEngine(RayActor):
         self.node_rank = server_args_dict["node_rank"]
         self.server_host = server_args_dict["host"]  # with [] if ipv6
         self.server_port = server_args_dict["port"]
+        self._allow_missing_unquantized_weight_update_hooks = _allow_missing_unquantized_weight_update_hooks(
+            self.args,
+            server_args_dict,
+        )
 
         if self.args.rollout_external:
             self._init_external(server_args_dict, external_engine_need_check_fields=external_engine_need_check_fields)
@@ -622,11 +644,48 @@ class SGLangEngine(RayActor):
 
     def begin_weight_update(self, selector: str = "all"):
         """Open a weight-update session on the engine (restores packed weights for loading)."""
-        return self._make_request("begin_weight_update", {"selector": selector})
+        return self._make_weight_update_hook_request(
+            "begin_weight_update",
+            {"selector": selector},
+        )
 
     def end_weight_update(self):
         """Close the weight-update session (post-load + quant post-process on the full model)."""
-        return self._make_request("end_weight_update", {})
+        return self._make_weight_update_hook_request("end_weight_update")
+
+    def _make_weight_update_hook_request(
+        self,
+        endpoint: str,
+        payload: dict | None = None,
+    ):
+        """Call a modern weight-update hook, with a closed legacy BF16 fallback.
+
+        Older SGLang servers apply unquantized distributed updates directly and do
+        not expose the begin/end hooks. Missing hooks are accepted only when the
+        operator explicitly opts in, broadcast mode is selected, and no
+        quantization backend is configured. Every other HTTP failure remains
+        fatal.
+        """
+        try:
+            return self._make_request(endpoint, payload or {})
+        except requests.exceptions.HTTPError as exc:
+            response = exc.response
+            if (
+                getattr(self, "_allow_missing_unquantized_weight_update_hooks", False)
+                and response is not None
+                and response.status_code == 404
+            ):
+                logger.warning(
+                    "SGLang does not expose /%s; using the explicit legacy "
+                    "unquantized broadcast compatibility path.",
+                    endpoint,
+                )
+                return {
+                    "success": True,
+                    "skipped": True,
+                    "reason": "legacy_unquantized_broadcast_server",
+                }
+            raise
 
     def update_weight_version(self, weight_version: str):
         return self._make_request(
@@ -776,6 +835,15 @@ def _compute_server_args(
             kwargs["enable_weights_cpu_backup"] = True
             logger.info(
                 "LoRA + colocate: enabling SGLang enable_weights_cpu_backup=True; "
+                "the trainer will skip per-step base weight sync."
+            )
+        elif getattr(args, "lora_base_disk_reload", False):
+            # Preserve the exact post-processed, LoRA-wrapped base allocation
+            # without retaining a full host-RAM mirror.  TMS restores these
+            # bytes before the prepared adapter is published.
+            kwargs["enable_weights_disk_backup"] = True
+            logger.info(
+                "LoRA + colocate: enabling SGLang enable_weights_disk_backup=True; "
                 "the trainer will skip per-step base weight sync."
             )
 

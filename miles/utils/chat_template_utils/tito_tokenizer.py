@@ -34,6 +34,7 @@ VALID_APPEND_ROLES: tuple[str, ...] = ("tool", "user", "system", "assistant")
 ALL_APPEND_ROLES: frozenset[str] = frozenset(VALID_APPEND_ROLES)
 
 _DUMMY_SYSTEM: dict[str, Any] = {"role": "system", "content": "dummy system"}
+_DUMMY_USER: dict[str, Any] = {"role": "user", "content": "dummy user query"}
 
 
 @dataclass(frozen=True)
@@ -182,6 +183,14 @@ class TITOTokenizer:
             raise ValueError(f"rendered suffix diff failed for {roles}")
         return self._encode_text(text_with[len(text_without) :])
 
+    def _synthetic_base_messages(
+        self,
+        old_messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Minimal valid history used only to render the appended suffix."""
+
+        return [_DUMMY_SYSTEM, _build_dummy_assistant(old_messages[-1])]
+
     def tokenize_additional_messages(
         self,
         old_messages: list[dict[str, Any]],
@@ -207,7 +216,7 @@ class TITOTokenizer:
         assert_messages_append_only_with_allowed_role(old_messages, new_messages, self.allowed_append_roles)
         appended_messages = new_messages[len(old_messages) :]
         return self._tokenize_rendered_suffix(
-            [_DUMMY_SYSTEM, _build_dummy_assistant(old_messages[-1])],
+            self._synthetic_base_messages(old_messages),
             appended_messages,
             tools=tools,
             add_generation_prompt=True,
@@ -302,6 +311,44 @@ class Qwen35TITOTokenizer(Qwen3TITOTokenizer):
         extra_kwargs={"clear_thinking": False},
         allowed_append_roles=frozenset({"tool", "user", "assistant"}),
     )
+
+
+class Qwen38TITOTokenizer(Qwen3TITOTokenizer):
+    """Qwen3.8 with native-template, append-only thinking preservation.
+
+    Qwen3.8 retains Qwen3's ``<|im_end|>\n`` boundary behavior, but its
+    native template owns the model-specific thinking controls.  Reusing the
+    bundled Qwen3.5 template would silently discard those controls, so this
+    family deliberately registers ``template=None`` and pins the exact
+    kwargs required by the Codex xhigh rollout contract.
+    """
+
+    tool_call_parser = "qwen3_coder"
+
+    _NATIVE_XHIGH_KWARGS = {
+        "enable_thinking": True,
+        "preserve_thinking": True,
+        "reasoning_effort": "xhigh",
+    }
+
+    FIXED_TEMPLATE = FixedTemplate(
+        template=None,
+        extra_kwargs=_NATIVE_XHIGH_KWARGS,
+        allowed_append_roles=frozenset({"tool", "user"}),
+    )
+
+    def _synthetic_base_messages(
+        self,
+        old_messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        # The native Qwen3.8 template rejects an assistant turn with no prior
+        # user query.  This extra dummy turn is outside the returned suffix,
+        # so it satisfies the template grammar without changing model input.
+        return [
+            _DUMMY_SYSTEM,
+            _DUMMY_USER,
+            _build_dummy_assistant(old_messages[-1]),
+        ]
 
 
 class QwenNextTITOTokenizer(Qwen3TITOTokenizer):
@@ -763,6 +810,7 @@ class TITOTokenizerType(StrEnum):
     DEFAULT = "default"
     QWEN3 = "qwen3"
     QWEN35 = "qwen35"
+    QWEN38 = "qwen38"
     QWENNEXT = "qwennext"
     GLM47 = "glm47"
     NEMOTRON3 = "nemotron3"
@@ -784,6 +832,8 @@ class TITOTokenizerType(StrEnum):
                 return Qwen3TITOTokenizer
             case cls.QWEN35:
                 return Qwen35TITOTokenizer
+            case cls.QWEN38:
+                return Qwen38TITOTokenizer
             case cls.QWENNEXT:
                 return QwenNextTITOTokenizer
             case cls.GLM47:

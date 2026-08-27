@@ -20,8 +20,26 @@ from megatron.training.arguments import core_transformer_config_from_args
 from miles.utils.audit_utils.witness.module import install_witness
 from miles.utils.misc import load_function
 from miles.utils.replay_base import routing_replay_manager
+from miles.backends.training_utils.sao import freeze_attention_parameters
 
 logger = logging.getLogger(__name__)
+
+
+def _maybe_freeze_critic_attention(args: argparse.Namespace, model: GPTModel, role: str) -> None:
+    if role != "critic" or not getattr(args, "critic_freeze_attention", False):
+        return
+    summary = freeze_attention_parameters(model)
+    logger.info(
+        "Froze critic attention parameters: tensors=%d elements=%d",
+        summary.tensors,
+        summary.elements,
+    )
+
+
+def _value_head_output_size(args: argparse.Namespace) -> int:
+    if getattr(args, "value_loss_type", "mse") == "classification":
+        return getattr(args, "value_num_bins", 51)
+    return 1
 
 
 def _apply_bridge_runtime_config(provider, args: argparse.Namespace) -> None:
@@ -153,8 +171,11 @@ def get_model_provider_func(
             # Apply critic output layer if needed
             if post_process and role == "critic":
                 model.output_layer = LinearForLastLayer(
-                    input_size=model.config.hidden_size, output_size=1, config=model.config
+                    input_size=model.config.hidden_size,
+                    output_size=_value_head_output_size(args),
+                    config=model.config,
                 )
+            _maybe_freeze_critic_attention(args, model, role)
             _maybe_install_witness(args, model)
             return model
 
@@ -191,6 +212,13 @@ def get_model_provider_func(
                 return out[0] if isinstance(out, tuple) else out
 
             model.forward = _logits_only_forward
+            if post_process and role == "critic":
+                model.output_layer = LinearForLastLayer(
+                    input_size=model.config.hidden_size,
+                    output_size=_value_head_output_size(args),
+                    config=model.config,
+                )
+            _maybe_freeze_critic_attention(args, model, role)
             return model
 
         return wrapped_bridge_provider
@@ -319,7 +347,13 @@ def get_model_provider_func(
             model = GPTModel(**kwargs)
 
         if post_process and role == "critic":
-            model.output_layer = LinearForLastLayer(input_size=config.hidden_size, output_size=1, config=config)
+            model.output_layer = LinearForLastLayer(
+                input_size=config.hidden_size,
+                output_size=_value_head_output_size(args),
+                config=config,
+            )
+
+        _maybe_freeze_critic_attention(args, model, role)
 
         _maybe_install_witness(args, model)
 

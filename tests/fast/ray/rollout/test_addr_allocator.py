@@ -19,6 +19,9 @@ class TestPortCursors:
     def test_next_base_port_default_when_empty(self):
         assert PortCursors.empty().next_base_port() == 15000
 
+    def test_empty_accepts_per_job_base_port(self):
+        assert PortCursors.empty(24000).next_base_port() == 24000
+
     def test_next_base_port_returns_max_value(self):
         c = PortCursors(_values={0: 17000, 1: 16500, 2: 18000})
         assert c.next_base_port() == 18000

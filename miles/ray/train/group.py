@@ -165,6 +165,21 @@ class RayTrainGroup:
 
         self._test_action_executor.run_after_step(rollout_id=rollout_id)
 
+    async def evaluate_critic(self, rollout_id: int, rollout_data_pack):
+        """Run one optimizer-free critic evaluation batch on every live cell."""
+
+        _cells, results = await self._execute_all_alive_and_catch(
+            "evaluate_critic",
+            rollout_id,
+            rollout_data_pack["data_ref"],
+        )
+        flattened = []
+        for result in results:
+            if isinstance(result, BaseException):
+                raise RuntimeError("critic evaluation failed in a trainer cell") from result
+            flattened.extend(result)
+        return flattened
+
     def _allocate_witness_info(self, *, rollout_id: int, attempt: int, sample_indices):
         if self._witness_allocator is None:
             return None
@@ -267,6 +282,10 @@ class RayTrainGroup:
         )
 
         await self._maybe_log_inference_engine_weight_checksums(rollout_id=rollout_id)
+        return info
+
+    async def prepare_weight_update(self):
+        await self._execute_all_alive_and_catch("prepare_weight_update")
 
     async def _maybe_log_inference_engine_weight_checksums(self, *, rollout_id: int | None) -> None:
         if not is_event_logger_initialized():

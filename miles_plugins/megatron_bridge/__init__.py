@@ -61,6 +61,14 @@ except Exception as _e:  # best-effort
 
 
 try:
+    from .gated_canonical_lora import install as _install_gated_canonical_lora
+
+    _install_gated_canonical_lora()
+except Exception as _e:  # best-effort
+    logger.warning("miles gated CanonicalLoRA shim not applied: %s", _e)
+
+
+try:
     from miles_plugins.models.qwen3_vl import install_qwen3_vl_packed_mrope_patch
 
     install_qwen3_vl_packed_mrope_patch()

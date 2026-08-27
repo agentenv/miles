@@ -4,6 +4,7 @@ import dataclasses
 import gc
 import logging
 import math
+import time
 from argparse import Namespace
 from collections.abc import Callable, Sequence
 from contextlib import nullcontext
@@ -53,6 +54,7 @@ from .initialize import is_first_replica_megatron_main_rank
 from .lora_utils import is_lora_enabled, is_lora_model
 from .model_provider import get_model_provider_func
 from .parallel import get_packed_seq_params
+from .trainable_state import _capture_external_train_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +63,11 @@ from .bridge_lora_helpers import _ensure_model_list, _setup_lora_model_via_bridg
 from .lora_utils import save_lora_checkpoint
 
 
-def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer) -> OptimizerParamScheduler:
+def get_optimizer_param_scheduler(
+    args: Namespace,
+    optimizer: MegatronOptimizer,
+    role: str = "actor",
+) -> OptimizerParamScheduler:
     """Create and configure the optimizer learning-rate/weight-decay scheduler.
 
     This configures iteration-based schedules derived from the global batch size
@@ -75,9 +81,26 @@ def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer)
         OptimizerParamScheduler: Initialized scheduler bound to ``optimizer``.
     """
     # Iteration-based training.
-    args.train_iters = args.num_rollout * args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size
+    updates_per_batch = getattr(args, "num_critic_epochs", 1) if role == "critic" else 1
+    args.train_iters = (
+        args.num_rollout
+        * args.rollout_batch_size
+        * args.n_samples_per_prompt
+        * updates_per_batch
+        // args.global_batch_size
+    )
     if args.lr_decay_iters is None:
         args.lr_decay_iters = args.train_iters
+        if args.lr_warmup_fraction is None:
+            # Tiny online probes may intentionally execute fewer optimizer
+            # steps than a paper-defined warmup.  The scheduler horizon does
+            # not control run length, but Megatron requires it to extend past
+            # the warmup, so preserve the warmup trajectory with a valid
+            # automatically-derived horizon.
+            args.lr_decay_iters = max(
+                args.lr_decay_iters,
+                args.lr_warmup_iters + 1,
+            )
     lr_decay_steps = args.lr_decay_iters * args.global_batch_size
     wd_incr_steps = args.train_iters * args.global_batch_size
     wsd_decay_steps = None
@@ -168,7 +191,11 @@ def setup_model_and_optimizer(
         optimizer = get_megatron_muon_optimizer(
             config=config,
             model_chunks=model,
-            use_gloo_process_groups=args.enable_gloo_process_groups,
+            use_gloo_process_groups=getattr(
+                args,
+                "enable_gloo_process_groups",
+                getattr(args, "use_gloo_process_groups", False),
+            ),
             layer_wise_distributed_optimizer="dist" in config.optimizer.lower(),
         )
     elif is_multi_lora_enabled(args):
@@ -179,15 +206,18 @@ def setup_model_and_optimizer(
         optimizer = get_megatron_optimizer(
             config=config,
             model_chunks=model,
-            use_gloo_process_groups=args.enable_gloo_process_groups,
+            use_gloo_process_groups=getattr(
+                args,
+                "enable_gloo_process_groups",
+                getattr(args, "use_gloo_process_groups", False),
+            ),
         )
-
     if args.stream_optimizer_state_to_disk:
         from miles_plugins.optimizers.nvme_stream import setup_optimizer_state_streaming
 
         setup_optimizer_state_streaming(args, optimizer)
 
-    opt_param_scheduler = get_optimizer_param_scheduler(args, optimizer)
+    opt_param_scheduler = get_optimizer_param_scheduler(args, optimizer, role=role)
     return model, optimizer, opt_param_scheduler
 
 
@@ -662,6 +692,13 @@ def train(
     parallel_state = get_parallel_state()
     args = get_args()
     disable_optimizer = args.debug_disable_optimizer or optimizer is None
+    capture_external_stats = (
+        getattr(args, "external_policy_sync_path", None) is not None and is_first_replica_megatron_main_rank()
+    )
+    train_started = time.monotonic() if capture_external_stats else None
+    if capture_external_stats:
+        args._external_train_metrics = {}
+        args._external_train_seconds = None
 
     for iterator in data_iterator:
         iterator.reset()
@@ -802,6 +839,7 @@ def train(
                 extra_metrics=extra_metrics,
                 should_log=True,
             )
+            _capture_external_train_metrics(args, log_dict)
 
             if args.ci_test and not args.ci_disable_kl_checker:
                 check_kl(args, log_dict, step_id, accumulated_step_id)
@@ -822,6 +860,8 @@ def train(
     if pre_hook_enabled:
         disable_forward_pre_hook(model)
 
+    if train_started is not None:
+        args._external_train_seconds = time.monotonic() - train_started
     return train_step_outcome
 
 

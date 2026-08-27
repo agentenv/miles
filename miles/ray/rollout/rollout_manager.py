@@ -109,6 +109,30 @@ class RolloutManager:
     def get_router_address(self) -> tuple[str, int]:
         return self.args.sglang_router_ip, self.args.sglang_router_port
 
+    def set_external_policy_identity(
+        self,
+        policy_version: int,
+        policy_hash: str,
+    ) -> tuple[int, str]:
+        """Install the exact published-policy identity in this rollout process."""
+
+        setter_path = getattr(
+            self.args,
+            "external_policy_identity_setter_path",
+            None,
+        )
+        if not isinstance(setter_path, str) or not setter_path:
+            raise RuntimeError("external policy identity setter is not configured")
+        setter = load_function(setter_path)
+        identity = setter(
+            self.args,
+            policy_version=policy_version,
+            policy_hash=policy_hash,
+        )
+        if identity != (policy_version, policy_hash):
+            raise RuntimeError("external policy identity setter returned the wrong value")
+        return identity
+
     def dispose(self):
         if (close := getattr(self.data_source, "close", None)) is not None:
             close()
@@ -252,6 +276,14 @@ class RolloutManager:
             engine_gpu_offsets=srv.engine_gpu_offsets,
         )
 
+    async def get_updatable_weight_versions(self) -> list[str]:
+        """Read versions from the engines that receive actor publications."""
+
+        srv = self._get_updatable_server()
+        if srv is None:
+            return []
+        return await srv.get_weight_versions()
+
     def clear_updatable_has_new_engines(self):
         # when fault tolerance is not enabled, we need to manually clear has_new_engines after update_weights
         srv = self._get_updatable_server()
@@ -287,7 +319,7 @@ class RolloutManager:
     # -------------------------- external start/stop -----------------------------
 
     async def start_cell(self, cell_id: int):
-        port_cursors = PortCursors.empty()
+        port_cursors = PortCursors.empty(self.args.rollout_engine_base_port)
         idx = get_cell_indexer_of_id_map(self.servers)[cell_id]
         group = self.servers[idx.srv_key].server_groups[idx.group_index]
         await group.recover(port_cursors=port_cursors, filter_indices=idx.engine_indices)

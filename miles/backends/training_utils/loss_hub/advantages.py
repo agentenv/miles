@@ -3,6 +3,7 @@ from argparse import Namespace
 import torch
 
 from miles.backends.training_utils.cp_utils import get_logits_and_tokens_offset_with_cp
+from miles.backends.training_utils.loss_hub.gae_adaptive import get_gae_adaptive_advantages
 from miles.backends.training_utils.loss_hub.math_utils import (
     get_advantages_and_returns_batch,
     get_grpo_returns,
@@ -23,6 +24,9 @@ def compute_advantages(
     response_lengths: list[int],
     values: list[torch.Tensor] | None = None,
     max_seq_lens: list[int] | None = None,
+    lambd_override: float | None = None,
+    compaction_subsequent_active_tokens: list[int] | None = None,
+    compaction_trajectory_active_tokens: list[int] | None = None,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
     """Dispatch to the configured advantage estimator.
 
@@ -50,6 +54,7 @@ def compute_advantages(
         `advantages`: List length `B`; `advantages[i]` has shape `[C_i]`.
         `returns`: List length `B`; `returns[i]` has shape `[C_i]`.
     """
+    lambd = args.lambd if lambd_override is None else lambd_override
     if args.advantage_estimator in ["grpo", "gspo"]:
         rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
         returns = get_grpo_returns(rewards, kl)
@@ -73,7 +78,32 @@ def compute_advantages(
             max_seq_lens=max_seq_lens,
             loss_masks=loss_masks,
             gamma=args.gamma,
-            lambd=args.lambd,
+            lambd=lambd,
+        )
+
+    elif args.advantage_estimator == "gae_adaptive":
+        # Critic targets deliberately use a fixed lambda (normally 1.0), while
+        # actor advantages use the length-adaptive policy lambda.
+        mode = "fixed" if lambd_override is not None else args.gae_adaptive_mode
+        advantages, returns = get_gae_adaptive_advantages(
+            rewards=rewards,
+            kl=kl,
+            loss_masks=loss_masks,
+            values=values,
+            response_lengths=response_lengths,
+            total_lengths=total_lengths,
+            kl_coef=args.kl_coef,
+            gamma=args.gamma,
+            lambd=lambd,
+            mode=mode,
+            alpha=args.gae_adaptive_alpha,
+            min_length=args.gae_adaptive_min_length,
+            chunked_threshold=args.gae_adaptive_chunked_threshold,
+            chunk_size=args.gae_adaptive_chunk_size,
+            qkv_format=args.qkv_format,
+            max_seq_lens=max_seq_lens,
+            compaction_subsequent_active_tokens=compaction_subsequent_active_tokens,
+            compaction_trajectory_active_tokens=compaction_trajectory_active_tokens,
         )
 
     elif args.advantage_estimator == "reinforce_plus_plus":

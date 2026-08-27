@@ -18,7 +18,8 @@ Agent function contract:
   ) -> dict | None:
       ...
 
-  Returning None means no extra metadata to attach.
+  Returning None means no extra metadata to attach unless the function opts
+  into the fail-closed result contract via ``_miles_fail_closed_result=True``.
   Returning a dict merges it into every sample's metadata, so downstream
   reward models (--custom-rm-path) can read whatever the agent left there.
 """
@@ -35,10 +36,39 @@ from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 
 from miles.rollout.base_types import GenerateFnInput, GenerateFnOutput
 from miles.rollout.generate_utils.openai_endpoint_utils import OpenAIEndpointTracer
+from miles.rollout.session.samples.merge import merge_samples_by_compaction_segment
 from miles.utils.misc import load_function
 from miles.utils.types import Sample
 
 logger = logging.getLogger(__name__)
+_AGENT_FAILURE_DIAGNOSTIC_MAX_BYTES = 2048
+_AGENT_FAILURE_TRUNCATION_MARKER = b"...[diagnostic truncated]"
+
+
+def _bounded_agent_failure_diagnostic(error: Exception) -> str:
+    value = f"{type(error).__name__}: {error}".encode("utf-8", errors="replace")
+    if len(value) > _AGENT_FAILURE_DIAGNOSTIC_MAX_BYTES:
+        value = (
+            value[: _AGENT_FAILURE_DIAGNOSTIC_MAX_BYTES - len(_AGENT_FAILURE_TRUNCATION_MARKER)]
+            + _AGENT_FAILURE_TRUNCATION_MARKER
+        )
+    return value.decode("utf-8", errors="ignore")
+
+
+def _aborted_agent_failure(input: GenerateFnInput, error: Exception, *, records_collected: int) -> GenerateFnOutput:
+    sample = deepcopy(input.sample)
+    sample.status = Sample.Status.ABORTED
+    sample.metadata = {
+        **(sample.metadata or {}),
+        "agent_failure": {
+            "schema": "miles.agent-failure.v1",
+            "stage": "custom_agent_function",
+            "error_type": type(error).__name__[:128],
+            "diagnostic": _bounded_agent_failure_diagnostic(error),
+            "records_collected": records_collected,
+        },
+    }
+    return GenerateFnOutput(samples=sample)
 
 
 async def generate(input: GenerateFnInput) -> GenerateFnOutput:
@@ -67,6 +97,7 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
     metadata = {**metadata, "session_server_id": tracer.session_server_id}
 
     agent_metadata = None
+    agent_failure: Exception | None = None
     collect_timed_out = False
     t_start = time.monotonic()
     try:
@@ -77,9 +108,18 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
             request_kwargs=build_chat_request_kwargs(input.sampling_params),
             metadata=metadata,
         )
+        if agent_metadata is None and getattr(custom_agent_function, "_miles_fail_closed_result", False) is True:
+            raise RuntimeError("fail-closed custom agent returned null without a trustworthy outcome")
+        if agent_metadata is not None and not isinstance(agent_metadata, dict):
+            raise TypeError("custom agent result must be an object or null")
         logger.debug(f"{log_prefix} Agent function returned in {time.monotonic()-t_start:.1f}s")
     except Exception as e:
-        logger.warning(f"{log_prefix} Agent function failed: {e}", exc_info=True)
+        agent_failure = e
+        logger.warning(
+            "%s Agent function failed: %s",
+            log_prefix,
+            _bounded_agent_failure_diagnostic(e),
+        )
 
     finally:
         # Collect even if the agent failed.
@@ -103,6 +143,15 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
         sample.status = Sample.Status.ABORTED
         return GenerateFnOutput(samples=sample)
 
+    session_metadata = dict(result.session_metadata)
+    records_collected = session_metadata.pop("records_collected", 0)
+    if agent_failure is not None:
+        return _aborted_agent_failure(
+            input,
+            agent_failure,
+            records_collected=records_collected,
+        )
+
     if not result.samples:
         if result.empty_reason == "all_truncated":
             logger.warning("All samples truncated (prompt already exceeds max_seq_len)")
@@ -116,6 +165,11 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
     for s in samples:
         s.metadata.update(agent_metadata or {})
 
+    compaction_enabled = session_metadata.get("compaction_schema_version") == 1
+    if compaction_enabled:
+        for s in samples:
+            s.metadata["compaction_trajectory_id"] = tracer.session_id
+
     # If the agent function reports wall-clock time spent outside policy generation
     # (env/tool steps), surface it on Sample.non_generation_time so throughput
     # accounting subtracts it.
@@ -124,8 +178,13 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
         for s in samples:
             s.non_generation_time = ngt
 
+    if compaction_enabled:
+        samples = merge_samples_by_compaction_segment(samples, input.state.tokenizer)
+        samples[-1].metadata.update(session_metadata)
+        return GenerateFnOutput(samples=samples)
+
     (sample,) = samples
-    sample.metadata.update(result.session_metadata)
+    sample.metadata.update(session_metadata)
     return GenerateFnOutput(samples=sample)
 
 

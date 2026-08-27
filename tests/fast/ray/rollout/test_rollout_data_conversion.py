@@ -25,6 +25,22 @@ class TestComputeDynamicGlobalBatchSize:
         gbs = _compute_dynamic_global_batch_size(args, train_parallel_config={"dp_size": 4}, num_samples=2)
         assert gbs == 4
 
+    def test_compaction_indep_dp_uses_complete_local_cell_batch(self):
+        args = make_args(
+            global_batch_size=64,
+            indep_dp=True,
+            sao_compaction=True,
+        )
+
+        assert (
+            _compute_dynamic_global_batch_size(
+                args,
+                train_parallel_config={},
+                num_samples=7,
+            )
+            == 7
+        )
+
 
 class TestPostprocessRolloutData:
     def test_aligned_input_passes_through_unchanged(self):

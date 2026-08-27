@@ -2,7 +2,14 @@ import logging
 import os
 
 from megatron.training.arguments import parse_args, validate_args
-from megatron.training.tokenizer.tokenizer import _vocab_size_with_padding
+
+try:
+    from megatron.training.tokenizer.tokenizer import _vocab_size_with_padding
+except ModuleNotFoundError:
+    # Megatron miles-main moved this helper in August 2026.  Supporting both
+    # locations keeps the source checkout usable with the current public Miles
+    # image as well as the runtime it was originally developed against.
+    from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding as _vocab_size_with_padding
 
 __all__ = ["validate_args", "parse_args", "set_default_megatron_args"]
 
@@ -15,6 +22,8 @@ def set_default_megatron_args(args):
     args.use_distributed_optimizer = (args.optimizer is None or args.optimizer.lower() == "adam") and not getattr(
         args, "debug_disable_optimizer", False
     )
+    if getattr(args, "external_policy_sync_path", None) is not None:
+        args.use_distributed_optimizer = False
     # Multi-LoRA: per-slot LayerWise optimizers require plain DDP all-reduce.
     if getattr(args, "multi_lora_n_adapters", 0) > 0:
         args.use_distributed_optimizer = False
