@@ -13,6 +13,8 @@ from .rollout.rollout_manager import RolloutManager
 
 logger = logging.getLogger(__name__)
 
+_SAO_ONE_GPU_ISLAND_MIN_MEMORY_BYTES = 120 * 1024**3
+
 
 def _select_train_group_class():
     if enable_experimental_ft_trainer():
@@ -26,6 +28,15 @@ def _select_train_group_class():
 class InfoActor:
     def get_ip_and_gpu_id(self):
         return ray.util.get_node_ip_address(), ray.get_gpu_ids()[0]
+
+    def get_ip_gpu_id_and_total_memory(self):
+        import torch
+
+        return (
+            ray.util.get_node_ip_address(),
+            ray.get_gpu_ids()[0],
+            torch.cuda.get_device_properties(0).total_memory,
+        )
 
 
 def sort_key(x):
@@ -49,7 +60,26 @@ def sort_key(x):
     return (node_ip_parts, gpu_id)
 
 
-def _create_placement_group(num_gpus):
+def _require_minimum_gpu_memory(
+    gpu_infos: list[tuple[str, float, int]], minimum_bytes: int
+) -> None:
+    insufficient = [
+        (node, gpu_id, total_memory)
+        for node, gpu_id, total_memory in gpu_infos
+        if total_memory < minimum_bytes
+    ]
+    if insufficient:
+        details = ", ".join(
+            f"{node}/gpu-{gpu_id}: {total_memory / 1024**3:.1f} GiB"
+            for node, gpu_id, total_memory in insufficient
+        )
+        raise RuntimeError(
+            "--sao-one-gpu-island requires at least "
+            f"{minimum_bytes / 1024**3:.0f} GiB on every selected GPU; got {details}"
+        )
+
+
+def _create_placement_group(num_gpus, *, minimum_gpu_memory_bytes: int | None = None):
     """Create a placement group with the specified number of GPUs."""
     bundles = [{"GPU": 1, "CPU": 1} for _ in range(num_gpus)]
     pg = placement_group(bundles, strategy="PACK")
@@ -67,9 +97,23 @@ def _create_placement_group(num_gpus):
                 )
             ).remote()
         )
-    gpu_ids = ray.get([actor.get_ip_and_gpu_id.remote() for actor in info_actors])
-    for actor in info_actors:
-        ray.kill(actor)
+    try:
+        if minimum_gpu_memory_bytes is None:
+            gpu_ids = ray.get(
+                [actor.get_ip_and_gpu_id.remote() for actor in info_actors]
+            )
+        else:
+            gpu_infos = ray.get(
+                [
+                    actor.get_ip_gpu_id_and_total_memory.remote()
+                    for actor in info_actors
+                ]
+            )
+            _require_minimum_gpu_memory(gpu_infos, minimum_gpu_memory_bytes)
+            gpu_ids = [(node, gpu_id) for node, gpu_id, _total_memory in gpu_infos]
+    finally:
+        for actor in info_actors:
+            ray.kill(actor)
 
     bundle_infos = [(i, gpu_ids[i][0], gpu_ids[i][1]) for i in range(num_bundles)]
     sorted_bundle_infos = sorted(bundle_infos, key=sort_key)
@@ -91,7 +135,16 @@ def create_placement_groups(args):
     """Create placement groups for actor and rollout engines."""
 
     num_gpus = 0
-    if args.debug_train_only:
+    one_gpu_sao_island = bool(getattr(args, "sao_one_gpu_island", False))
+    if one_gpu_sao_island:
+        # This process is one complete DiLoCo learner island.  Actor and critic
+        # each reserve 0.4 of the same Ray GPU bundle and SGLang reserves the
+        # remaining 0.2.  Miles' colocated offload lifecycle time-shares
+        # inference with training; no process group crosses island boundaries.
+        num_gpus = args.actor_num_nodes * args.actor_num_gpus_per_node
+        critic_offset = 0
+        rollout_offset = 0
+    elif args.debug_train_only:
         num_gpus = args.actor_num_nodes * args.actor_num_gpus_per_node
         rollout_offset = 0
         if args.use_critic:
@@ -115,7 +168,12 @@ def create_placement_groups(args):
             rollout_offset += args.critic_num_nodes * args.critic_num_gpus_per_node
 
     logger.info(f"Creating placement group with {num_gpus} GPUs...")
-    pg, actor_pg_reordered_bundle_indices, actor_pg_reordered_gpu_ids = _create_placement_group(num_gpus)
+    pg, actor_pg_reordered_bundle_indices, actor_pg_reordered_gpu_ids = _create_placement_group(
+        num_gpus,
+        minimum_gpu_memory_bytes=(
+            _SAO_ONE_GPU_ISLAND_MIN_MEMORY_BYTES if one_gpu_sao_island else None
+        ),
+    )
 
     rollout_pg_reordered_bundle_indices = actor_pg_reordered_bundle_indices[rollout_offset:]
     rollout_pg_reordered_gpu_ids = actor_pg_reordered_gpu_ids[rollout_offset:]

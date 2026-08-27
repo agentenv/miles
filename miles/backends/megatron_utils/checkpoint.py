@@ -1,7 +1,9 @@
 import logging
 import os
 import re
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
+from typing import Any
 
 import torch.distributed as dist
 
@@ -97,6 +99,101 @@ logger = logging.getLogger(__name__)
 __all__ = ["save_checkpoint", "save_checkpoint_with_lora", "load_checkpoint"]
 
 
+_CRITIC_HEAD_STATE_KEYS = frozenset({"output_layer.weight", "output_layer.bias"})
+
+
+def _unwrap_module(module: Any) -> Any:
+    """Unwrap the DDP/precision wrappers used by Megatron without importing their types."""
+    seen: set[int] = set()
+    while hasattr(module, "module") and id(module) not in seen:
+        seen.add(id(module))
+        nested = module.module
+        if nested is module:
+            break
+        module = nested
+    return module
+
+
+def _is_critic_head_state_entry(name: object, value: object) -> bool:
+    """Return whether a sharded-state entry belongs to Miles' added critic head."""
+    candidates = (name, getattr(value, "key", None))
+    return any(
+        isinstance(candidate, str)
+        and any(candidate == key or candidate.endswith(f".{key}") for key in _CRITIC_HEAD_STATE_KEYS)
+        for candidate in candidates
+    )
+
+
+@contextmanager
+def _omit_fresh_critic_head_from_sharded_state(ddp_model):
+    """Keep a freshly initialized critic head out of an actor-checkpoint load.
+
+    Megatron distributed checkpoints validate the model's requested sharded
+    state before loading.  A Miles critic replaces the language-model output
+    layer with a value head, so an actor checkpoint correctly has no tensors for
+    that new head.  Temporarily filtering exactly those two entries preserves
+    strict validation for every backbone tensor and leaves the already-created
+    value head at its normal initialization.
+    """
+    patched: list[tuple[Any, bool, object | None]] = []
+    omitted: set[str] = set()
+    expects_head_on_rank = False
+
+    try:
+        for wrapped in ddp_model:
+            module = _unwrap_module(wrapped)
+            if getattr(module, "output_layer", None) is not None:
+                expects_head_on_rank = True
+            original = module.sharded_state_dict
+            had_instance_override = "sharded_state_dict" in vars(module)
+            prior_instance_value = vars(module).get("sharded_state_dict")
+
+            def filtered_sharded_state_dict(*args, _original=original, **kwargs):
+                state = _original(*args, **kwargs)
+                filtered = state.copy()
+                for name, value in tuple(state.items()):
+                    if _is_critic_head_state_entry(name, value):
+                        canonical_name = getattr(value, "key", None)
+                        omitted.add(canonical_name if isinstance(canonical_name, str) else str(name))
+                        filtered.pop(name)
+                return filtered
+
+            module.sharded_state_dict = filtered_sharded_state_dict
+            patched.append((module, had_instance_override, prior_instance_value))
+
+        yield omitted
+
+        if expects_head_on_rank:
+            normalized = {
+                key
+                for key in _CRITIC_HEAD_STATE_KEYS
+                if any(name == key or name.endswith(f".{key}") for name in omitted)
+            }
+            if normalized != _CRITIC_HEAD_STATE_KEYS:
+                raise RuntimeError(
+                    "critic actor-checkpoint bootstrap did not omit exactly the fresh value head; "
+                    f"expected={sorted(_CRITIC_HEAD_STATE_KEYS)} observed={sorted(omitted)}"
+                )
+        elif omitted:
+            raise RuntimeError(f"critic actor-checkpoint bootstrap omitted a head on a non-post-process rank: {omitted}")
+    finally:
+        for module, had_instance_override, prior_instance_value in reversed(patched):
+            if had_instance_override:
+                module.sharded_state_dict = prior_instance_value
+            else:
+                delattr(module, "sharded_state_dict")
+
+
+def _critic_actor_bootstrap_context(args, ddp_model):
+    enabled = bool(getattr(args, "_critic_bootstrap_from_actor_checkpoint", False))
+    if not enabled:
+        return nullcontext()
+    role = getattr(ddp_model[0], "role", None) if ddp_model else None
+    if role != "critic":
+        raise RuntimeError("actor-checkpoint critic bootstrap is only valid for the critic role")
+    return _omit_fresh_critic_head_from_sharded_state(ddp_model)
+
+
 def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_context, skip_load_to_model_and_opt):
     # ref: how megatron `load_checkpoint` gets directory
     args = get_args()
@@ -112,14 +209,20 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
         ), f"{args.load=} does not exist or is an empty directory. Did you specify the wrong folder?"
 
     if has_local_checkpoint_manager or _is_megatron_checkpoint(load_path):
-        result = _load_checkpoint_megatron(
-            ddp_model=ddp_model,
-            optimizer=optimizer,
-            opt_param_scheduler=opt_param_scheduler,
-            checkpointing_context=checkpointing_context,
-            skip_load_to_model_and_opt=skip_load_to_model_and_opt,
-        )
+        with _critic_actor_bootstrap_context(args, ddp_model):
+            result = _load_checkpoint_megatron(
+                ddp_model=ddp_model,
+                optimizer=optimizer,
+                opt_param_scheduler=opt_param_scheduler,
+                checkpointing_context=checkpointing_context,
+                skip_load_to_model_and_opt=skip_load_to_model_and_opt,
+            )
     else:
+        if getattr(args, "_critic_bootstrap_from_actor_checkpoint", False):
+            raise RuntimeError(
+                "fresh critic bootstrap currently requires a Megatron checkpoint; "
+                "convert the actor checkpoint before offline value pretraining"
+            )
         result = _load_checkpoint_hf(
             ddp_model=ddp_model,
             optimizer=optimizer,

@@ -14,6 +14,9 @@ from miles.utils.http_utils import wait_for_server_ready
 
 logger = logging.getLogger(__name__)
 
+_SESSION_SERVER_STARTUP_TIMEOUT_DEFAULT_S = 30.0
+_SESSION_SERVER_STARTUP_TIMEOUT_MAX_S = 120.0
+
 
 def start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool = False) -> tuple[str, int]:
     """Start sgl router or miles router and return (router_ip, router_port).
@@ -100,6 +103,23 @@ def _resolve_session_server_ports(raw: list[int] | None) -> list[int]:
     raise ValueError(f"--session-server-port takes one port or a start/end range, got {len(raw)} values: {raw}")
 
 
+def _resolve_session_server_startup_timeout(args) -> float:
+    """Return the bounded readiness deadline for session-server processes.
+
+    This deadline only covers process startup.  It is deliberately independent
+    from rollout/request timeouts, and remains bounded so a wedged import cannot
+    stall the driver indefinitely.
+    """
+    raw_timeout = getattr(args, "session_server_startup_timeout_secs", None)
+    timeout = _SESSION_SERVER_STARTUP_TIMEOUT_DEFAULT_S if raw_timeout is None else raw_timeout
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+        raise ValueError("--session-server-startup-timeout-secs must be a number in (0, 120].")
+    timeout = float(timeout)
+    if not 0.0 < timeout <= _SESSION_SERVER_STARTUP_TIMEOUT_MAX_S:
+        raise ValueError("--session-server-startup-timeout-secs must be a finite number in (0, 120].")
+    return timeout
+
+
 def start_session_server(args):
     """Start the standalone session servers when ``--use-session-server`` is set.
 
@@ -119,6 +139,7 @@ def start_session_server(args):
         args.session_server_ip = args.sglang_router_ip
 
     ip = args.session_server_ip
+    startup_timeout = _resolve_session_server_startup_timeout(args)
     ports = _resolve_session_server_ports(getattr(args, "session_server_port", None))
     for port in ports:
         if not is_port_available(port):
@@ -151,5 +172,7 @@ def start_session_server(args):
     # replacing the per-session /health probe.
     args.session_server_instance_ids = instance_ids
     for port, process in processes:
-        wait_for_server_ready(ip, port, process, timeout=30)
+        # Keep passing the child handle: wait_for_server_ready checks liveness
+        # on every poll and therefore still fails promptly on an early exit.
+        wait_for_server_ready(ip, port, process, timeout=startup_timeout)
     logger.info(f"Session servers launched at {ip}, ports {ports} ({len(ports)} instances)")

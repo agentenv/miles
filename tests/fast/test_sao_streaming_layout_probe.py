@@ -84,7 +84,7 @@ class _Group:
 def _set_probe_env(monkeypatch, evidence):
     values = {
         "YETO_SAO_STREAMING_LAYOUT_EVIDENCE": str(evidence),
-        "YETO_SAO_SECRLENV_CONTEXT_SHA256": "9" * 64,
+        "YETO_SAO_CONTEXT_SHA256": "9" * 64,
         "YETO_SAO_ACTOR_MODEL_REVISION": "a" * 40,
         "YETO_SAO_ACTOR_CONFIG_SHA256": "1" * 64,
         "YETO_SAO_CRITIC_MODEL_REVISION": "b" * 40,
@@ -177,7 +177,7 @@ async def test_two_role_probe_is_metadata_only_and_feeds_runtime_config(
     assert stat.S_IMODE(evidence_path.stat().st_mode) == 0o600
     assert probe.evidence_sha256 == hashlib.sha256(evidence_path.read_bytes()).hexdigest()
     evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
-    assert evidence["schema"] == "miles.sao-streaming-layouts.v1"
+    assert evidence["schema"] == "miles.sao-streaming-layouts.v2"
     assert evidence["actor"]["expected_fragments"] == 2
     assert evidence["critic"]["expected_fragments"] == 2
     assert evidence["settings"]["minimum_fragments"] == 2
@@ -187,9 +187,13 @@ async def test_two_role_probe_is_metadata_only_and_feeds_runtime_config(
     assert max(fragment["payload_bytes"] for fragment in evidence["critic"]["fragments"]) <= 32
 
     runtime_payload = {
-        "schema": "yeto.sao-streaming-runtime.v1",
-        "sao_secrlenv_context_sha256": "9" * 64,
-        "trajectory_evidence_dir": str(tmp_path / "trajectory-evidence"),
+        "schema": "yeto.sao-streaming-runtime.v2",
+        "sao_context_sha256": "9" * 64,
+        "trajectory_evidence": {
+            "directory": str(tmp_path / "trajectory-evidence"),
+            "kind": "secrlenv",
+            "schema_version": 2,
+        },
         "layout_attestation": {
             "path": str(evidence_path),
             "sha256": probe.evidence_sha256,

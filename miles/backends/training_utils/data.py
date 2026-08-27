@@ -554,12 +554,35 @@ def sync_actor_critic_data(
     if not values and not log_probs:
         return
 
+    use_cpu_transport = dist.get_backend(group) == "gloo"
+    if bool(getattr(args, "sao_one_gpu_island", False)) and not use_cpu_transport:
+        raise RuntimeError("--sao-one-gpu-island requires a Gloo actor-critic process group")
+
+    # The actor/critic group is a standalone process group layered on top of
+    # two independent Megatron worlds whose default rank is 0 in both
+    # processes.  ``dist.get_rank(group)`` translates through that default
+    # world and therefore reports 0 for the critic as well.  Query the custom
+    # process group directly so its critic rank remains 1.
+    rank = group.rank() if use_cpu_transport and group is not None else None
     handles = []
+    wire_tensors: list[torch.Tensor] = []
+    receive_copies: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def queue_broadcast(tensor: torch.Tensor, *, src: int) -> None:
+        if use_cpu_transport:
+            if rank == src:
+                wire_tensor = tensor.detach().to(device="cpu", copy=True).contiguous()
+            else:
+                wire_tensor = torch.empty_like(tensor, device="cpu")
+                receive_copies.append((tensor, wire_tensor))
+            wire_tensors.append(wire_tensor)
+            tensor = wire_tensor
+        handles.append(dist.broadcast(tensor, src=src, group=group, async_op=True))
 
     if not values:
         values = [torch.empty_like(log_prob) for log_prob in log_probs]
     for value in values:
-        handles.append(dist.broadcast(value, src=1, group=group, async_op=True))
+        queue_broadcast(value, src=1)
 
     if args.kl_coef != 0 or args.use_kl_loss:
         if not log_probs:
@@ -567,11 +590,13 @@ def sync_actor_critic_data(
         if not ref_log_probs:
             ref_log_probs = [torch.empty_like(value) for value in values]
         for ref_log_prob, log_prob in zip(ref_log_probs, log_probs, strict=False):
-            handles.append(dist.broadcast(log_prob, src=0, group=group, async_op=True))
-            handles.append(dist.broadcast(ref_log_prob, src=0, group=group, async_op=True))
+            queue_broadcast(log_prob, src=0)
+            queue_broadcast(ref_log_prob, src=0)
 
     for handle in handles:
         handle.wait()
+    for destination, wire_tensor in receive_copies:
+        destination.copy_(wire_tensor)
 
     rollout_data.update(
         {

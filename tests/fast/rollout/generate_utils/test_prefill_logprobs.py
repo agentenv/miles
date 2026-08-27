@@ -114,6 +114,65 @@ async def test_recompute_samples_flushes_each_batch_and_batches_prefill_score(mo
 
 
 @pytest.mark.asyncio
+async def test_recompute_samples_flattens_compacted_trajectory_segments(monkeypatch):
+    execution = Sample(
+        tokens=[10, 11, 20],
+        response_length=1,
+        status=Sample.Status.COMPLETED,
+    )
+    summary = Sample(
+        tokens=[30, 31, 40],
+        response_length=1,
+        status=Sample.Status.COMPLETED,
+    )
+    args = SimpleNamespace(
+        recompute_logprobs_via_prefill=True,
+        sglang_enable_lora=False,
+        sglang_router_policy="round_robin",
+    )
+
+    async def fake_post(url, payload, action="post", headers=None):
+        if url.endswith("/flush_cache"):
+            return {}
+        return [
+            {
+                "meta_info": {
+                    "input_token_logprobs": [
+                        (None, tokens[-2]),
+                        (-float(tokens[-1]), tokens[-1]),
+                    ]
+                }
+            }
+            for tokens in payload["input_ids"]
+        ]
+
+    monkeypatch.setattr(prefill_logprobs, "post", fake_post)
+
+    await prefill_logprobs.recompute_samples_rollout_logprobs_via_prefill(
+        args,
+        [[execution, summary]],
+        url="http://localhost/generate",
+        sampling_params={},
+    )
+
+    assert execution.rollout_log_probs == [-20.0]
+    assert summary.rollout_log_probs == [-40.0]
+
+
+@pytest.mark.asyncio
+async def test_recompute_samples_rejects_empty_compacted_trajectory():
+    args = SimpleNamespace(recompute_logprobs_via_prefill=True)
+
+    with pytest.raises(ValueError, match="empty compacted trajectory"):
+        await prefill_logprobs.recompute_samples_rollout_logprobs_via_prefill(
+            args,
+            [[]],
+            url="http://localhost/generate",
+            sampling_params={},
+        )
+
+
+@pytest.mark.asyncio
 async def test_recompute_uses_per_sample_adapter_lora_path(monkeypatch):
     """Multi-LoRA: the scoring request must go to the sample's own slot adapter,
     not the single-adapter name (which is never registered on those engines)."""

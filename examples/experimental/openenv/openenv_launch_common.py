@@ -100,17 +100,28 @@ def optimizer_args() -> str:
     )
 
 
-def agent_args(tito_model: str, daytona_sandboxes: bool = False) -> str:
+def agent_args(
+    tito_model: str,
+    daytona_sandboxes: bool = False,
+    agent_function: str | None = None,
+    dynamic_sampling_filter_path: str = (
+        "miles.rollout.filter_hub.dynamic_sampling_filters.check_no_aborted"
+    ),
+) -> str:
     """Agentic-rollout wiring. The TITO surface differs across models; the
     agent function decides where episodes run — the shared env server by
     default, Daytona sandboxes (openenv_daytona_agent_function)
     when the launcher runs with openenv_tb2_tasks_dir set."""
-    agent_fn = "openenv_daytona_agent_function.run" if daytona_sandboxes else "openenv_agent_function.run"
+    agent_fn = agent_function or (
+        "openenv_daytona_agent_function.run"
+        if daytona_sandboxes
+        else "openenv_agent_function.run"
+    )
     return (
         "--custom-generate-function-path miles.rollout.generate_hub.agentic_tool_call.generate "
         f"--custom-agent-function-path {agent_fn} "
         "--custom-rm-path openenv_generate.reward_func "
-        "--dynamic-sampling-filter-path miles.rollout.filter_hub.dynamic_sampling_filters.check_no_aborted "
+        f"--dynamic-sampling-filter-path {dynamic_sampling_filter_path} "
         f"--tito-model {tito_model} "
         "--use-session-server "
         "--session-server-port 30000 "

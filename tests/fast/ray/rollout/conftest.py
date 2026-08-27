@@ -81,6 +81,7 @@ def make_args(**overrides: Any) -> Namespace:
         use_session_server=False,
         session_server_ip=None,
         session_server_port=None,
+        session_server_startup_timeout_secs=120.0,
         # external rollout
         rollout_external=False,
         rollout_external_engine_addrs=None,

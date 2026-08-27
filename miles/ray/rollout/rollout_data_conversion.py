@@ -60,8 +60,23 @@ def _compute_dynamic_global_batch_size(args, train_parallel_config, num_samples:
     Strategy: global_batch_size = num_samples rounded down to a multiple of dp_size
     This ensures num_steps_per_rollout = num_samples // global_batch_size = 1
     """
-    dp_size = train_parallel_config["dp_size"]
+    dp_size = train_parallel_config.get("dp_size")
+    if dp_size is None:
+        if not getattr(args, "indep_dp", False):
+            raise ValueError("rollout train parallel config is missing dp_size")
+        # Native indep_dp deliberately hides its cross-cell topology from the
+        # rollout manager and requires every cell's intra-DP size to be one.
+        # The outer cells therefore each consume one complete local batch.
+        dp_size = 1
     original_gbs = args.global_batch_size
+
+    if getattr(args, "sao_compaction", False):
+        if num_samples % dp_size != 0:
+            raise ValueError(
+                "CompactionRL cannot split its complete segment batch evenly: "
+                f"num_samples={num_samples}, dp_size={dp_size}"
+            )
+        return num_samples
 
     if is_multi_lora_enabled(args):
         # Batches take groups in multiples of each adapter's

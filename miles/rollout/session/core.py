@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from starlette.responses import Response
 
 from miles.rollout.session.errors import (
+    ContextBudgetError,
     MessageValidationError,
     SessionNotFoundError,
     TokenizationError,
@@ -30,6 +31,33 @@ JSON_MEDIA_TYPE = "application/json"
 # Hop-by-hop / length-framing headers dropped from the upstream response so the
 # transport layer recomputes them from the body we actually send.
 _DROP_RESPONSE_HEADERS = ("content-length", "transfer-encoding", "content-encoding")
+
+_COMPACTION_HEADER_NAMES = {
+    "schema_version": "x-miles-compaction-schema-version",
+    "context_window": "x-miles-compaction-context-window",
+    "segment_index": "x-miles-compaction-segment-index",
+    "segment_type": "x-miles-compaction-segment-type",
+    "context_budget": "x-miles-compaction-context-budget",
+}
+
+
+def _parse_compaction_headers(headers: dict) -> dict[str, int | str | None]:
+    """Parse the internal, all-or-nothing CompactionRL request contract."""
+    raw = {key: headers.get(name) for key, name in _COMPACTION_HEADER_NAMES.items()}
+    if all(value is None for value in raw.values()):
+        return {key: None for key in raw}
+    if any(value is None for value in raw.values()):
+        raise MessageValidationError("compaction requests require all internal headers")
+
+    parsed: dict[str, int | str | None] = {"segment_type": raw["segment_type"]}
+    for key in ("schema_version", "context_window", "segment_index", "context_budget"):
+        value = raw[key]
+        if not isinstance(value, str) or not value.isascii() or not value.isdecimal():
+            raise MessageValidationError(f"invalid compaction header {key}")
+        parsed[key] = int(value)
+    if parsed["context_budget"] <= 0:
+        raise MessageValidationError("compaction context budget must be positive")
+    return parsed
 
 
 @dataclass
@@ -160,6 +188,15 @@ class SessionCore:
             metadata["tito_session_mismatch"] = mismatch
         metadata["accumulated_token_ids"] = session.token_ids
         metadata["max_trim_tokens"] = self.registry.tito_tokenizer.max_trim_tokens
+        if session.compaction_schema_version is not None:
+            metadata["compaction_schema_version"] = session.compaction_schema_version
+            metadata["compaction_context_budget"] = session.compaction_context_budget
+            metadata["accumulated_token_ids_by_context_window"] = {
+                str(key): value
+                for key, value in session.accumulated_token_ids_by_context_window().items()
+            }
+            metadata["compaction_context_window_count"] = session.compaction_context_window + 1
+            metadata["compaction_segment_count"] = session.compaction_segment_index + 1
         payload = GetSessionResponse(session_id=session_id, records=session.records, metadata=metadata)
         return Response(
             content=_render_json(payload.model_dump(mode="json")), status_code=200, media_type=JSON_MEDIA_TYPE
@@ -210,6 +247,25 @@ class SessionCore:
             client_stream = bool(request_body.pop("stream", False))
             request_body.pop("stream_options", None)
 
+            compaction = _parse_compaction_headers(headers)
+            transition_checkpoint = (
+                session.compaction_transition_checkpoint()
+                if compaction["schema_version"] is not None
+                else None
+            )
+            try:
+                session.prepare_compaction_segment(
+                    schema_version=compaction["schema_version"],
+                    context_window=compaction["context_window"],
+                    segment_index=compaction["segment_index"],
+                    segment_type=compaction["segment_type"],
+                    context_budget=compaction["context_budget"],
+                )
+            except Exception:
+                if transition_checkpoint is not None:
+                    session.restore_compaction_transition(transition_checkpoint)
+                raise
+
             # TITO token tracking needs Miles-owned input_ids plus SGLang output
             # metadata: logprobs=True populates meta_info.output_token_logprobs and
             # return_meta_info wraps it in choice.meta_info. Hardcoded (not
@@ -233,19 +289,46 @@ class SessionCore:
                 }
 
             request_messages = request_body.get("messages", [])
-            prompt_token_ids = session.prepare_pretokenized(
-                request_messages,
-                tools=request_body.get("tools"),
-                tito_tokenizer=self.registry.tito_tokenizer,
-            )
-            request_body["input_ids"] = prompt_token_ids
-            logger.debug("Using TITO input_ids: %d tokens", len(prompt_token_ids))
+            try:
+                prompt_token_ids = session.prepare_pretokenized(
+                    request_messages,
+                    tools=request_body.get("tools"),
+                    tito_tokenizer=self.registry.tito_tokenizer,
+                )
+                request_body["input_ids"] = prompt_token_ids
+                logger.debug("Using TITO input_ids: %d tokens", len(prompt_token_ids))
+
+                context_budget = compaction["context_budget"]
+                if context_budget is not None:
+                    max_tokens = request_body.get("max_tokens")
+                    if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens <= 0:
+                        raise MessageValidationError("compaction request max_tokens must be a positive integer")
+                    if len(prompt_token_ids) + max_tokens > context_budget:
+                        raise ContextBudgetError(
+                            "compaction context does not fit declared budget: "
+                            f"prompt_tokens={len(prompt_token_ids)}, max_tokens={max_tokens}, "
+                            f"context_budget={context_budget}"
+                        )
+            except Exception:
+                if transition_checkpoint is not None:
+                    session.restore_compaction_transition(transition_checkpoint)
+                raise
 
             proxy_body = json.dumps(request_body).encode()
             expected_num_assistant = session.num_assistant
+            expected_compaction_state = (
+                session.compaction_context_window,
+                session.compaction_segment_index,
+                session.compaction_segment_type,
+            )
         # --- lock released ---
 
         # --- Phase 2: proxy to backend (NO lock held) ---
+        headers = {
+            key: value
+            for key, value in headers.items()
+            if key.lower() not in _COMPACTION_HEADER_NAMES.values()
+        }
         headers = {**headers, "X-SMG-Routing-Key": session_id}
         result = await self.backend.do_proxy(
             ProxyRequest(method=method, query=query), "v1/chat/completions", body=proxy_body, headers=headers
@@ -254,6 +337,18 @@ class SessionCore:
         # Non-200 (e.g. 400 context too long) passes through unrecorded so the
         # agent can retry or handle the error.
         if result["status_code"] != 200:
+            if transition_checkpoint is not None:
+                async with session.lock:
+                    actual_compaction_state = (
+                        session.compaction_context_window,
+                        session.compaction_segment_index,
+                        session.compaction_segment_type,
+                    )
+                    if (
+                        session.num_assistant == expected_num_assistant
+                        and actual_compaction_state == expected_compaction_state
+                    ):
+                        session.restore_compaction_transition(transition_checkpoint)
             return proxy_result_to_response(result)
 
         response = json.loads(result["response_body"])
@@ -298,6 +393,20 @@ class SessionCore:
                     f"got {session.num_assistant}), skipping state update"
                 )
                 return _chat_client_response(result, response, client_stream)
+            actual_compaction_state = (
+                session.compaction_context_window,
+                session.compaction_segment_index,
+                session.compaction_segment_type,
+            )
+            if actual_compaction_state != expected_compaction_state:
+                logger.warning(
+                    "Session %s compaction state changed during proxy (expected=%r, got=%r), "
+                    "skipping state update",
+                    session_id,
+                    expected_compaction_state,
+                    actual_compaction_state,
+                )
+                return _chat_client_response(result, response, client_stream)
 
             session.update_pretokenized_state(
                 request_messages,
@@ -315,6 +424,27 @@ class SessionCore:
                 status_code=result["status_code"],
                 request=request_body,
                 response=response,
+                compaction_schema_version=session.compaction_schema_version,
+                compaction_context_window=(
+                    session.compaction_context_window
+                    if session.compaction_schema_version is not None
+                    else None
+                ),
+                compaction_segment_index=(
+                    session.compaction_segment_index
+                    if session.compaction_schema_version is not None
+                    else None
+                ),
+                compaction_segment_type=(
+                    session.compaction_segment_type
+                    if session.compaction_schema_version is not None
+                    else None
+                ),
+                compaction_context_budget=(
+                    session.compaction_context_budget
+                    if session.compaction_schema_version is not None
+                    else None
+                ),
             )
             session.append_record(record)
         # --- lock released ---

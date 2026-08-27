@@ -37,18 +37,32 @@ Run it in a separate shell (or off-node — see note). Docker mode gives real TB
 fidelity; it needs the Docker socket and pulls the per-task images on first use:
 
 ```bash
-# Raise the open-file limit first (see Notes): the WebSocket env server holds an
-# FD per live session + Docker connection and leaks sockets on unclean
-# disconnects, so the default 1024 soft limit is exhausted on a long run.
+# Raise the open-file limit first (see Notes). Use one unique, lowercase run ID
+# for the server and its CPU preflight; never start multiple uvicorn workers.
 ulimit -n 1048576
-TB2_MODE=docker TB2_TASKS_DIR=/workspace/terminal-bench-2 MAX_CONCURRENT_ENVS=32 \
-    python -m tbench2_env.server.app --port 8003
+export MILES_TBENCH_RUN_ID=tbench21-20260826
+TB2_TASKS_DIR=/workspace/terminal-bench-2 MAX_CONCURRENT_ENVS=304 \
+    python managed_tbench21_server.py --port 8003 --run-id "$MILES_TBENCH_RUN_ID"
+
+# Before allocating GPUs, prove the exact run scope is idle, exercise one real
+# task container and verifier, and prove teardown returned to zero residue.
+python preflight_tbench21_shared_server.py \
+    --url http://127.0.0.1:8003 --run-id "$MILES_TBENCH_RUN_ID"
 ```
 
 `MAX_CONCURRENT_ENVS` caps live sandboxes; keep it at or below the rollout batch
 concurrency. Per-task containers are heavy on disk — if you'd rather not colocate
 them with the GPU workload, run the env server on a separate Docker host and point
 the launcher at it via `--openenv-env-url http://<env-host>:8003`.
+
+The Miles wrapper labels every task container with both
+`miles.tbench21.managed=true` and the exact run ID. It force-removes containers
+with bounded retries on reset/disconnect, refuses to create another container
+after a failed cleanup, and sweeps only that exact two-label scope at startup,
+shutdown, and on a bounded janitor interval. `GET /miles/managed-status` reports
+active sessions plus managed/orphan counts. Containers lacking either exact
+label—including persistent infrastructure and rollout-island containers—are
+never swept.
 
 ### 2b. Alternative: Daytona cloud sandboxes (no Docker host)
 
@@ -74,7 +88,8 @@ from upstream main (editable: the recipe embeds the package source, which
 needs `pyproject.toml` present next to the package):
 
 ```bash
-git clone https://github.com/huggingface/OpenEnv.git   # >= the #965/#972 merge (39c91bfd); pin that sha if you need frozen reward semantics across a long run
+git clone https://github.com/huggingface/OpenEnv.git
+git -C OpenEnv checkout d2d4754b333ac285913d113e26c2126207434956
 pip install -e OpenEnv/envs/tbench2_env
 ```
 
@@ -128,11 +143,11 @@ Common overrides:
 - **`_step` vs. rollout.** W&B `_step` is an internal log-call index that advances
   several times per rollout; it is **not** the training step. Read the driver log's
   `rollout N:` counter for true progress.
-- **Sandbox leakage.** Upstream OpenEnv creates task containers with `remove=False`
-  and only tears them down on a clean session close (the idle reaper is off by
-  default), so an unclean disconnect (trainer crash) can orphan containers. Sweep
-  stale TB2 containers between runs, e.g. `docker rm -f` of any older than the
-  episode wall-cap.
+- **Sandbox lifecycle.** Do not launch the upstream `tbench2_env.server.app`
+  directly for shared Docker runs. It creates unlabeled `remove=False`
+  containers and swallows teardown failures. The Miles-managed wrapper makes
+  failed cleanup visible and recovers same-run orphans without broad Docker
+  sweeps.
 - **Open-file limit.** The same unclean disconnects also leak socket FDs in the
   env server process. On a long run under the default 1024 soft limit the accept
   loop eventually fails every connection with `OSError: [Errno 24] Too many open

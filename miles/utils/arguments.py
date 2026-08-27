@@ -104,6 +104,18 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--sao-one-gpu-island",
+                action="store_true",
+                default=False,
+                help=(
+                    "Guarded Qwen3.5-0.8B SAO topology: place the full-parameter "
+                    "actor, critic, and one TP1 SGLang engine in one GPU bundle. "
+                    "Training and inference time-share the GPU through colocated "
+                    "offload. This is intended for one isolated Miles process per "
+                    "H200 and is rejected for every other model/topology."
+                ),
+            )
+            parser.add_argument(
                 "--offload",
                 action="store_true",
                 default=False,
@@ -468,6 +480,17 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "Regardless of whether partial rollout is used or filters are applied, "
                     "the sampling granularity is always determined by this value. "
                     "If this value is None, rollout_batch_size will be used as the default over_sampling_batch_size."
+                ),
+            )
+            parser.add_argument(
+                "--rollout-one-pass-no-replacement",
+                action="store_true",
+                default=False,
+                help=(
+                    "Submit one immutable global-dataset rollout batch exactly once. "
+                    "The inference rollout fails instead of refilling when generation "
+                    "raises, aborts, is filtered, or returns a short result. This is a "
+                    "rollout-only audit mode; normal online training should leave it disabled."
                 ),
             )
             parser.add_argument(
@@ -1053,6 +1076,15 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--sao-compaction",
+                action="store_true",
+                default=False,
+                help=(
+                    "Train paper-backed compacted SAO trajectories. Requires the "
+                    "Codex/Miles compaction protocol and enables token-level loss normalization."
+                ),
+            )
+            parser.add_argument(
                 "--ref-load",
                 type=str,
                 default=None,
@@ -1212,6 +1244,14 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 type=int,
                 default=1,
                 help="Number of deterministic passes over the offline value dataset.",
+            )
+            parser.add_argument(
+                "--value-pretrain-canary-one-step",
+                action="store_true",
+                help=(
+                    "Run exactly one deterministic offline value-pretraining optimizer step "
+                    "without publishing a production value-pretraining contract."
+                ),
             )
             parser.add_argument(
                 "--critic-value-pretrain-contract-sha256",
@@ -2366,6 +2406,13 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 "Auto-allocates a single port if not set.",
             )
             parser.add_argument(
+                "--session-server-startup-timeout-secs",
+                type=float,
+                default=30.0,
+                help="Maximum time to wait for a session-server process to start (default: 30; max: 120). "
+                "This does not change rollout or episode timeouts.",
+            )
+            parser.add_argument(
                 "--tito-model",
                 type=str,
                 default="default",
@@ -2625,6 +2672,156 @@ def _validate_rollout_weight_version_format(args: argparse.Namespace) -> None:
         and not isinstance(args.start_rollout_id, bool)
         and args.start_rollout_id >= 0
     ), "--rollout-weight-version-format=yeto-policy requires a non-negative integer start rollout ID"
+
+
+_SAO_ONE_GPU_ISLAND_MODEL_SHAPE = {
+    "num_layers": 24,
+    "hidden_size": 1024,
+    "ffn_hidden_size": 3584,
+    "num_attention_heads": 8,
+    "num_query_groups": 2,
+    "kv_channels": 256,
+    "vocab_size": 248320,
+}
+_SAO_ONE_GPU_ISLAND_MAX_CONTEXT = 8192
+_SAO_ONE_GPU_ISLAND_MAX_INFERENCE_CONCURRENCY = 64
+
+
+def _validate_sao_one_gpu_island(args: argparse.Namespace) -> None:
+    """Fail closed around the one-H200, one-process SAO island profile.
+
+    Ray's fractional-GPU actors make it possible to bind the actor (0.4),
+    critic (0.4), and SGLang engine (0.2) to one placement bundle.  That is a
+    scheduling mechanism, not a general memory guarantee, so this profile is
+    intentionally restricted to the exact Qwen3.5-0.8B shape and the measured
+    8k-context deployment envelope.  The placement layer independently checks
+    the physical GPU memory before it starts any model actor.
+    """
+
+    if not getattr(args, "sao_one_gpu_island", False):
+        return
+
+    requirements = {
+        "colocate": True,
+        "use_critic": True,
+        "actor_num_nodes": 1,
+        "actor_num_gpus_per_node": 1,
+        "critic_num_nodes": 1,
+        "critic_num_gpus_per_node": 1,
+        "rollout_num_gpus": 1,
+        "rollout_num_gpus_per_engine": 1,
+        "num_gpus_per_node": 1,
+        "tensor_model_parallel_size": 1,
+        "pipeline_model_parallel_size": 1,
+        "context_parallel_size": 1,
+        "expert_model_parallel_size": 1,
+        "offload_train": True,
+        "offload_rollout": True,
+        "train_backend": "megatron",
+        "model_name": "qwen3_5",
+        "sao_online_recipe": "coding",
+        "n_samples_per_prompt": 1,
+    }
+    mismatches = [
+        f"{name}={getattr(args, name, None)!r} (required {expected!r})"
+        for name, expected in requirements.items()
+        if getattr(args, name, None) != expected
+    ]
+    for name, expected in _SAO_ONE_GPU_ISLAND_MODEL_SHAPE.items():
+        if getattr(args, name, None) != expected:
+            mismatches.append(
+                f"{name}={getattr(args, name, None)!r} (required {expected!r})"
+            )
+
+    if getattr(args, "lora_rank", 0) > 0:
+        mismatches.append("lora_rank must be <= 0 for full-parameter SAO")
+    if getattr(args, "bridge_distributed_weight_sync", False):
+        mismatches.append("bridge_distributed_weight_sync must be disabled")
+    if getattr(args, "rollout_weight_version_format", "counter") != "counter":
+        mismatches.append("rollout_weight_version_format must be 'counter'")
+
+    for name in ("seq_length", "max_seq_len", "sglang_context_length"):
+        value = getattr(args, name, None)
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or not 1 <= value <= _SAO_ONE_GPU_ISLAND_MAX_CONTEXT
+        ):
+            mismatches.append(
+                f"{name}={value!r} (required 1..{_SAO_ONE_GPU_ISLAND_MAX_CONTEXT})"
+            )
+
+    max_running = getattr(args, "sglang_max_running_requests", None)
+    if (
+        not isinstance(max_running, int)
+        or isinstance(max_running, bool)
+        or not 1 <= max_running <= _SAO_ONE_GPU_ISLAND_MAX_INFERENCE_CONCURRENCY
+    ):
+        mismatches.append(
+            "sglang_max_running_requests must be in "
+            f"1..{_SAO_ONE_GPU_ISLAND_MAX_INFERENCE_CONCURRENCY}"
+        )
+    async_concurrency = getattr(args, "async_max_concurrent_samples", None)
+    if async_concurrency is not None and (
+        not isinstance(async_concurrency, int)
+        or isinstance(async_concurrency, bool)
+        or not 1
+        <= async_concurrency
+        <= _SAO_ONE_GPU_ISLAND_MAX_INFERENCE_CONCURRENCY
+    ):
+        mismatches.append(
+            "async_max_concurrent_samples must be unset or in "
+            f"1..{_SAO_ONE_GPU_ISLAND_MAX_INFERENCE_CONCURRENCY}"
+        )
+    memory_fraction = getattr(args, "sglang_mem_fraction_static", None)
+    if not isinstance(memory_fraction, (int, float)) or isinstance(
+        memory_fraction, bool
+    ) or not 0.0 < float(memory_fraction) <= 0.50:
+        mismatches.append("sglang_mem_fraction_static must be in (0, 0.50]")
+    if mismatches:
+        raise ValueError(
+            "--sao-one-gpu-island rejected an unvalidated topology: "
+            + "; ".join(mismatches)
+        )
+
+
+def _validate_rollout_one_pass_no_replacement(args) -> None:
+    if not args.rollout_one_pass_no_replacement:
+        return
+
+    required_rollout_function = (
+        "miles.rollout.inference_rollout.inference_rollout_common.InferenceRolloutFn"
+    )
+    permitted_data_sources = {
+        "miles.rollout.data_source.RolloutDataSource",
+        "miles.rollout.data_source.RolloutDataSourceWithBuffer",
+    }
+    mismatches = []
+    if not args.rollout_global_dataset:
+        mismatches.append("the global rollout dataset must be enabled")
+    if args.rollout_function_path != required_rollout_function:
+        mismatches.append(
+            f"rollout_function_path must be {required_rollout_function}"
+        )
+    if args.data_source_path not in permitted_data_sources:
+        mismatches.append("data_source_path must be a built-in rollout data source")
+    if args.num_epoch is not None or args.num_rollout != 1:
+        mismatches.append("num_epoch must be unset and num_rollout must equal 1")
+    if args.start_rollout_id not in (None, 0):
+        mismatches.append("start_rollout_id must equal 0")
+    if args.rollout_shuffle:
+        mismatches.append("rollout_shuffle must be disabled")
+    if args.partial_rollout:
+        mismatches.append("partial_rollout must be disabled")
+    if args.over_sampling_batch_size != args.rollout_batch_size:
+        mismatches.append("over_sampling_batch_size must equal rollout_batch_size")
+    if args.rollout_all_samples_process_path is not None:
+        mismatches.append("rollout_all_samples_process_path must be unset")
+    if mismatches:
+        raise ValueError(
+            "--rollout-one-pass-no-replacement rejected an unsafe configuration: "
+            + "; ".join(mismatches)
+        )
 
 
 def miles_validate_args(args):
@@ -2976,8 +3173,12 @@ def miles_validate_args(args):
 
     if args.value_pretrain_manifest_sha256 is not None and not value_pretrain:
         raise ValueError("--value-pretrain-manifest-sha256 requires --value-pretrain-manifest")
+    if args.value_pretrain_canary_one_step and not value_pretrain:
+        raise ValueError("--value-pretrain-canary-one-step requires --value-pretrain-manifest")
     if args.value_pretrain_epochs < 1:
         raise ValueError("--value-pretrain-epochs must be positive")
+    if args.value_pretrain_canary_one_step and args.value_pretrain_epochs != 1:
+        raise ValueError("--value-pretrain-canary-one-step requires --value-pretrain-epochs 1")
     if args.value_loss_type == "classification":
         if args.value_num_bins < 2:
             raise ValueError("classification value loss requires --value-num-bins >= 2")
@@ -3011,11 +3212,32 @@ def miles_validate_args(args):
             expected_sha256=args.value_pretrain_manifest_sha256,
         )
         apply_objective_to_args(args, manifest.objective)
-        args.num_rollout = value_pretrain_num_steps(
+        args.value_pretrain_full_steps = value_pretrain_num_steps(
             num_samples=manifest.train.num_samples,
             global_batch_size=args.global_batch_size,
             epochs=args.value_pretrain_epochs,
         )
+        if args.value_pretrain_canary_one_step:
+            if args.save_interval != 1:
+                raise ValueError("--value-pretrain-canary-one-step requires --save-interval 1")
+            if args.critic_value_pretrain_contract_sha256 is not None:
+                raise ValueError(
+                    "--value-pretrain-canary-one-step cannot resume from a contracted critic"
+                )
+            if args.critic_load is None:
+                raise ValueError("--value-pretrain-canary-one-step requires --critic-load")
+            if os.path.lexists(os.path.join(args.critic_load, "value_pretrain_contract.json")):
+                raise ValueError(
+                    "--value-pretrain-canary-one-step requires an actor bootstrap checkpoint, "
+                    "not a contracted critic"
+                )
+            if os.path.lexists(args.critic_save):
+                raise ValueError(
+                    "--value-pretrain-canary-one-step requires a fresh --critic-save path"
+                )
+            args.num_rollout = 1
+        else:
+            args.num_rollout = args.value_pretrain_full_steps
         # One exact global batch is one critic optimizer step.  These values
         # keep Miles' existing LR scheduler and logging step math correct.
         args.rollout_batch_size = args.global_batch_size
@@ -3158,6 +3380,8 @@ def miles_validate_args(args):
     if args.offload_rollout is None:
         args.offload_rollout = False
 
+    _validate_sao_one_gpu_island(args)
+
     if args.offload_train:
         args.disable_grad_buffers_cpu_backup = True
         args.disable_param_buffers_cpu_backup = args.enable_weights_backuper
@@ -3195,6 +3419,8 @@ def miles_validate_args(args):
         f"over_sampling_batch_size {args.over_sampling_batch_size} should be greater than or equal to "
         f"rollout_batch_size {args.rollout_batch_size}"
     )
+
+    _validate_rollout_one_pass_no_replacement(args)
 
     if args.num_epoch is not None:
         if args.num_rollout is not None:

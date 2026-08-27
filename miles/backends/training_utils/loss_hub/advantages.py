@@ -25,6 +25,8 @@ def compute_advantages(
     values: list[torch.Tensor] | None = None,
     max_seq_lens: list[int] | None = None,
     lambd_override: float | None = None,
+    compaction_subsequent_active_tokens: list[int] | None = None,
+    compaction_trajectory_active_tokens: list[int] | None = None,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
     """Dispatch to the configured advantage estimator.
 
@@ -73,6 +75,8 @@ def compute_advantages(
             chunk_size=args.gae_adaptive_chunk_size,
             qkv_format=args.qkv_format,
             max_seq_lens=max_seq_lens,
+            compaction_subsequent_active_tokens=compaction_subsequent_active_tokens,
+            compaction_trajectory_active_tokens=compaction_trajectory_active_tokens,
         )
 
     elif args.advantage_estimator == "reinforce_plus_plus":

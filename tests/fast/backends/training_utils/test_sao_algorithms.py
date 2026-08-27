@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from miles.backends.training_utils.loss_hub.gae_adaptive import (
@@ -16,6 +17,8 @@ from miles.backends.training_utils.sao import (
     freeze_attention_parameters,
     validate_sao_train_data,
 )
+from miles.ray.rollout.train_data_conversion import _attach_compaction_train_fields
+from miles.utils.types import Sample
 
 
 def test_adaptive_lambda_matches_paper_formula() -> None:
@@ -51,6 +54,115 @@ def test_terminal_reward_lands_on_last_action_not_trailing_observation() -> None
 
     torch.testing.assert_close(advantages[0], torch.tensor([0.5, 0.0, 1.0, 0.0]))
     torch.testing.assert_close(returns[0], advantages[0])
+
+
+def test_compaction_cross_segment_gae_restores_future_token_distance() -> None:
+    advantages, returns = get_gae_adaptive_advantages(
+        rewards=[1.0, 1.0],
+        kl=[torch.zeros(2), torch.zeros(2)],
+        loss_masks=[torch.ones(2), torch.ones(2)],
+        values=[torch.zeros(2), torch.zeros(2)],
+        response_lengths=[2, 2],
+        total_lengths=[4, 4],
+        mode="fixed",
+        gamma=1.0,
+        lambd=0.5,
+        compaction_subsequent_active_tokens=[2, 0],
+        compaction_trajectory_active_tokens=[4, 4],
+    )
+
+    # Local segment GAE is [0.5, 1.0].  Equation 14 multiplies the first
+    # segment by (gamma * lambda)^2 because two optimized tokens follow it.
+    torch.testing.assert_close(advantages[0], torch.tensor([0.125, 0.25]))
+    torch.testing.assert_close(advantages[1], torch.tensor([0.5, 1.0]))
+    torch.testing.assert_close(returns[0], advantages[0])
+    torch.testing.assert_close(returns[1], advantages[1])
+
+
+def test_compaction_adaptive_lambda_uses_logical_trajectory_length() -> None:
+    advantages, _returns = get_gae_adaptive_advantages(
+        rewards=[1.0, 1.0],
+        kl=[torch.zeros(1), torch.zeros(3)],
+        loss_masks=[torch.ones(1), torch.ones(3)],
+        values=[torch.zeros(1), torch.zeros(3)],
+        response_lengths=[1, 3],
+        total_lengths=[2, 4],
+        mode="adaptive",
+        alpha=1.0,
+        gamma=1.0,
+        lambd=1.0,
+        compaction_subsequent_active_tokens=[3, 0],
+        compaction_trajectory_active_tokens=[4, 4],
+    )
+
+    # The shared logical length gives lambda=1-1/4=0.75.  Segmenting the
+    # first action must not change lambda to the one-token value of zero.
+    torch.testing.assert_close(advantages[0], torch.tensor([0.75**3]))
+    torch.testing.assert_close(
+        advantages[1],
+        torch.tensor([0.75**2, 0.75, 1.0]),
+    )
+
+
+def test_compaction_train_fields_count_all_later_optimized_tokens() -> None:
+    samples = []
+    for index, segment_type in enumerate(("execution", "summary", "execution")):
+        samples.append(
+            Sample(
+                metadata={
+                    "compaction_schema_version": 1,
+                    "compaction_trajectory_id": "trajectory-a",
+                    "compaction_segment_index": index,
+                    "compaction_segment_type": segment_type,
+                    "compaction_context_budget": 8192,
+                }
+            )
+        )
+    train_data = {
+        "rewards": [1.0, 1.0, 1.0],
+        "loss_masks": [[1, 0, 1], [1], [0, 1, 1, 1]],
+    }
+
+    _attach_compaction_train_fields(
+        SimpleNamespace(sao_compaction=True),
+        samples,
+        train_data,
+    )
+
+    assert train_data["compaction_subsequent_active_tokens"] == [4, 3, 0]
+    assert train_data["compaction_trajectory_active_tokens"] == [6, 6, 6]
+    assert train_data["compaction_segment_indices"] == [0, 1, 2]
+    assert train_data["compaction_segment_types"] == [
+        "execution",
+        "summary",
+        "execution",
+    ]
+
+
+def test_sao_compaction_contract_recomputes_future_token_proof() -> None:
+    data = {
+        "tokens": [[1, 2], [3], [4, 5]],
+        "response_lengths": [2, 1, 2],
+        "rewards": [1.0, 1.0, 1.0],
+        "loss_masks": [[1, 1], [1], [1, 1]],
+        "rollout_log_probs": [[-0.1, -0.2], [-0.3], [-0.4, -0.5]],
+        "compaction_trajectory_ids": ["trajectory-a"] * 3,
+        "compaction_segment_indices": [0, 1, 2],
+        "compaction_segment_types": ["execution", "summary", "execution"],
+        "compaction_subsequent_active_tokens": [3, 2, 0],
+        "compaction_trajectory_active_tokens": [5, 5, 5],
+    }
+    args = SimpleNamespace(
+        policy_objective="sao_dis",
+        sao_compaction=True,
+        calculate_per_token_loss=True,
+    )
+
+    assert validate_sao_train_data(args, data).active_action_tokens == 5
+
+    data["compaction_subsequent_active_tokens"][0] = 2
+    with pytest.raises(ValueError, match="future-token count"):
+        validate_sao_train_data(args, data)
 
 
 def test_sao_dis_uses_direct_ratio_and_rejects_outside_tokens() -> None:
@@ -180,6 +292,41 @@ def test_coding_online_recipe_applies_complete_sao_structure() -> None:
     assert args.entropy_coef == 0.0
     assert args.sao_dis_eps_low == 0.8
     assert args.sao_dis_eps_high == 3.0
+
+
+def test_compaction_recipe_enables_token_global_dynamic_batch() -> None:
+    args = SimpleNamespace(
+        sao_online_recipe="coding",
+        sao_compaction=True,
+        generate_multi_samples=False,
+        calculate_per_token_loss=False,
+        use_dynamic_global_batch_size=False,
+        value_pretrain_manifest=None,
+        n_samples_per_prompt=1,
+        advantage_estimator="grpo",
+        policy_objective="ppo",
+        gae_adaptive_mode="fixed",
+        gae_adaptive_alpha=1.0,
+        gae_adaptive_min_length=2,
+        gamma=0.99,
+        critic_lambd=0.9,
+        num_critic_epochs=1,
+        critic_freeze_attention=False,
+        lr=2e-6,
+        critic_lr=7e-6,
+        critic_lr_warmup_iters=5,
+        kl_coef=0.1,
+        kl_loss_coef=0.2,
+        use_kl_loss=True,
+        entropy_coef=0.01,
+        sao_dis_eps_low=0.3,
+        sao_dis_eps_high=5.0,
+    )
+
+    apply_sao_online_recipe(args)
+
+    assert args.calculate_per_token_loss is True
+    assert args.use_dynamic_global_batch_size is True
 
 
 def test_online_recipe_rejects_grouped_rollouts() -> None:

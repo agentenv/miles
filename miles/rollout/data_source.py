@@ -53,6 +53,7 @@ class RolloutDataSource(DataSource):
         self.sample_group_index = 0
         self.sample_index = 0
         self.sample_offset = 0
+        self._one_pass_consumed = False
         # TODO remove this
         self.metadata = {}
 
@@ -90,7 +91,21 @@ class RolloutDataSource(DataSource):
     def get_samples(self, num_samples):
         # TODO further improve code
         if self.dataset is not None:
-            if self.sample_offset + num_samples <= len(self.dataset):
+            if getattr(self.args, "rollout_one_pass_no_replacement", False):
+                if self._one_pass_consumed:
+                    raise RuntimeError(
+                        "one-pass rollout data source was requested more than once"
+                    )
+                # Consume the source before validating it so a caught error cannot
+                # turn into a second attempt against a mutable/cycling data source.
+                self._one_pass_consumed = True
+                if self.sample_offset != 0 or num_samples != len(self.dataset):
+                    raise RuntimeError(
+                        "one-pass rollout must consume the complete immutable dataset exactly once"
+                    )
+                prompt_samples = self.dataset.samples[:]
+                self.sample_offset = len(self.dataset)
+            elif self.sample_offset + num_samples <= len(self.dataset):
                 prompt_samples = self.dataset.samples[self.sample_offset : self.sample_offset + num_samples]
                 self.sample_offset += num_samples
             else:
@@ -173,6 +188,13 @@ class RolloutDataSourceWithBuffer(RolloutDataSource):
         """
         Return num_samples samples
         """
+
+        if getattr(self.args, "rollout_one_pass_no_replacement", False):
+            if self.buffer:
+                raise RuntimeError(
+                    "one-pass rollout refuses recycled samples from the data buffer"
+                )
+            return super().get_samples(num_samples=num_samples)
 
         samples = self._get_samples_from_buffer(num_samples)
         num_samples -= len(samples)

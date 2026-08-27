@@ -12,6 +12,7 @@ from miles.utils.arguments import (
     _maybe_apply_dumper_overrides,
     _resolve_ft_components,
     _validate_rollout_weight_version_format,
+    _validate_sao_one_gpu_island,
     get_miles_extra_args_provider,
     miles_validate_args,
 )
@@ -195,6 +196,74 @@ def test_sao_online_algorithm_flags_are_parsed():
     assert args.gae_adaptive_min_length == 1
     assert args.num_critic_epochs == 2
     assert args.critic_freeze_attention is True
+
+
+def _sao_one_gpu_args(**overrides):
+    values = {
+        "sao_one_gpu_island": True,
+        "colocate": True,
+        "use_critic": True,
+        "actor_num_nodes": 1,
+        "actor_num_gpus_per_node": 1,
+        "critic_num_nodes": 1,
+        "critic_num_gpus_per_node": 1,
+        "rollout_num_gpus": 1,
+        "rollout_num_gpus_per_engine": 1,
+        "num_gpus_per_node": 1,
+        "tensor_model_parallel_size": 1,
+        "pipeline_model_parallel_size": 1,
+        "context_parallel_size": 1,
+        "expert_model_parallel_size": 1,
+        "offload_train": True,
+        "offload_rollout": True,
+        "train_backend": "megatron",
+        "model_name": "qwen3_5",
+        "sao_online_recipe": "coding",
+        "n_samples_per_prompt": 1,
+        "num_layers": 24,
+        "hidden_size": 1024,
+        "ffn_hidden_size": 3584,
+        "num_attention_heads": 8,
+        "num_query_groups": 2,
+        "kv_channels": 256,
+        "vocab_size": 248320,
+        "lora_rank": 0,
+        "bridge_distributed_weight_sync": False,
+        "rollout_weight_version_format": "counter",
+        "seq_length": 8192,
+        "max_seq_len": 8192,
+        "sglang_context_length": 8192,
+        "sglang_max_running_requests": 38,
+        "async_max_concurrent_samples": 38,
+        "sglang_mem_fraction_static": 0.50,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def test_sao_one_gpu_island_accepts_exact_qwen08_profile():
+    _validate_sao_one_gpu_island(_sao_one_gpu_args())
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"colocate": False}, "colocate=False"),
+        ({"critic_num_gpus_per_node": 2}, "critic_num_gpus_per_node=2"),
+        ({"hidden_size": 2048}, "hidden_size=2048"),
+        ({"seq_length": 8193}, "seq_length=8193"),
+        ({"sglang_max_running_requests": 65}, "sglang_max_running_requests"),
+        ({"sglang_mem_fraction_static": 0.6}, "sglang_mem_fraction_static"),
+        ({"rollout_weight_version_format": "yeto-policy"}, "counter"),
+    ],
+)
+def test_sao_one_gpu_island_rejects_unvalidated_profiles(overrides, message):
+    with pytest.raises(ValueError, match=message):
+        _validate_sao_one_gpu_island(_sao_one_gpu_args(**overrides))
+
+
+def test_sao_one_gpu_island_flag_is_opt_in():
+    _validate_sao_one_gpu_island(SimpleNamespace(sao_one_gpu_island=False))
 
 
 def test_legacy_unquantized_weight_hook_compatibility_flag_is_parsed():

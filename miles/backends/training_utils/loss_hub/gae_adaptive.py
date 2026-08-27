@@ -106,6 +106,8 @@ def get_gae_adaptive_advantages(
     chunk_size: int = 128,
     qkv_format: str = "thd",
     max_seq_lens: list[int] | None = None,
+    compaction_subsequent_active_tokens: list[int] | None = None,
+    compaction_trajectory_active_tokens: list[int] | None = None,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
     """Compute per-token advantages and returns for single-rollout SAO."""
     if mode not in {"fixed", "adaptive"}:
@@ -121,6 +123,26 @@ def get_gae_adaptive_advantages(
     fields = (kl, loss_masks, values, response_lengths, total_lengths)
     if any(len(field) != batch_size for field in fields):
         raise ValueError("all adaptive GAE inputs must have the same batch size")
+    if compaction_subsequent_active_tokens is not None:
+        if len(compaction_subsequent_active_tokens) != batch_size:
+            raise ValueError("compaction future-token counts must match the batch size")
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in compaction_subsequent_active_tokens
+        ):
+            raise ValueError("compaction future-token counts must be non-negative integers")
+        if compaction_trajectory_active_tokens is None:
+            raise ValueError("compaction trajectories require total active-token counts")
+    if compaction_trajectory_active_tokens is not None:
+        if compaction_subsequent_active_tokens is None:
+            raise ValueError("compaction total-token counts require future-token counts")
+        if len(compaction_trajectory_active_tokens) != batch_size:
+            raise ValueError("compaction total-token counts must match the batch size")
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in compaction_trajectory_active_tokens
+        ):
+            raise ValueError("compaction total-token counts must be positive integers")
 
     try:
         cp_size = get_parallel_state().cp.size
@@ -163,8 +185,13 @@ def get_gae_adaptive_advantages(
             raise ValueError(f"KL/value length mismatch for sample {index}")
 
         effective_length = int(full_mask.bool().sum().item())
+        adaptive_length = (
+            compaction_trajectory_active_tokens[index]
+            if compaction_trajectory_active_tokens is not None
+            else effective_length
+        )
         sample_lambd = (
-            compute_adaptive_lambd(effective_length, alpha, min_length)
+            compute_adaptive_lambd(adaptive_length, alpha, min_length)
             if mode == "adaptive"
             else lambd
         )
@@ -190,6 +217,17 @@ def get_gae_adaptive_advantages(
                 gamma,
                 sample_lambd,
             )
+
+        if compaction_subsequent_active_tokens is not None:
+            # CompactionRL Eq. 14: restore the token distance to the one final
+            # task reward after independently computing each segment's GAE.
+            future_tokens = compaction_subsequent_active_tokens[index]
+            correction = (gamma * sample_lambd) ** future_tokens
+            advantages = advantages * correction
+            corrected_returns = torch.zeros_like(returns)
+            active = full_mask.bool()
+            corrected_returns[active] = advantages[active] + full_values[active]
+            returns = corrected_returns
 
         if cp_size > 1:
             advantages = slice_log_prob_with_cp(

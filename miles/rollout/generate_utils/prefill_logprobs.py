@@ -12,6 +12,33 @@ from miles.utils.processing_utils import encode_image_for_rollout_engine
 from miles.utils.types import Sample
 
 
+def _flatten_samples(samples: list[Any]) -> list[Sample]:
+    """Flatten compacted logical trajectories without accepting malformed leaves."""
+    flattened: list[Sample] = []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, Sample):
+            flattened.append(value)
+            return
+        if not isinstance(value, list):
+            raise TypeError(
+                "Prefill logprob recomputation expected Sample leaves, got "
+                f"{type(value).__name__}"
+            )
+        if not value:
+            raise ValueError(
+                "Prefill logprob recomputation received an empty compacted trajectory"
+            )
+        for child in value:
+            visit(child)
+
+    if not isinstance(samples, list):
+        raise TypeError("Prefill logprob recomputation expected a sample list")
+    for sample in samples:
+        visit(sample)
+    return flattened
+
+
 def _lora_path_for_sample(args: Any, sample: Sample) -> str | None:
     """Adapter name to score under: the sample slot's __miles_slot_{N} name, the fixed single-LoRA name, or None."""
     if sample.adapter is not None:
@@ -136,7 +163,7 @@ async def recompute_rollout_logprobs_via_prefill(
 
 async def recompute_samples_rollout_logprobs_via_prefill(
     args: Any,
-    samples: list[Sample],
+    samples: list[Any],
     *,
     url: str,
     sampling_params: Mapping[str, Any],
@@ -144,8 +171,11 @@ async def recompute_samples_rollout_logprobs_via_prefill(
     if not getattr(args, "recompute_logprobs_via_prefill", False):
         return
 
+    flat_samples = _flatten_samples(samples)
     samples_to_score = [
-        sample for sample in samples if sample.response_length != 0 and sample.status != Sample.Status.ABORTED
+        sample
+        for sample in flat_samples
+        if sample.response_length != 0 and sample.status != Sample.Status.ABORTED
     ]
     if not samples_to_score:
         return

@@ -1,5 +1,10 @@
 # SAO value pretraining
 
+> **Production validation:** the exact Qwen3.5-0.8B value dataset, Qwen3.8-27B
+> teacher provenance, checkpoint contract, launch sequence, and measured results
+> are documented in
+> [Qwen3.5-0.8B Terminal-Bench 2.1 SAO + Streaming DiLoCo Validation](TBENCH21_SAO_QWEN35_08B_VALIDATION_20260826.md).
+
 `train_value.py` is a standalone offline critic-training job. It allocates only
 the critic model, never starts an actor or SGLang, and writes a normal Miles
 critic checkpoint that the online SAO job can load with `--critic-load`.

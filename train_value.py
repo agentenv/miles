@@ -2,6 +2,8 @@
 
 import asyncio
 import logging
+import os
+from itertools import islice
 from pathlib import Path
 
 from miles.ray.placement_group import create_value_pretraining_group
@@ -27,6 +29,12 @@ async def train_value(args) -> None:
         raise ValueError("train_value.py requires --value-pretrain-manifest")
     if args.train_backend != "megatron":
         raise ValueError("offline SAO value pretraining currently requires --train-backend megatron")
+    canary_one_step = bool(args.value_pretrain_canary_one_step)
+    output_contract = Path(args.critic_save) / VALUE_PRETRAIN_CONTRACT_NAME
+    if canary_one_step and os.path.lexists(output_contract):
+        raise RuntimeError(
+            "one-step value-pretraining canary output already contains a production contract"
+        )
 
     configure_logger(args, source=MainProcessIdentity())
     manifest = load_value_pretrain_manifest(
@@ -52,6 +60,10 @@ async def train_value(args) -> None:
         }
         if resume_contract["batch_plan"] != expected_batch_plan:
             raise ValueError("critic resume checkpoint used a different deterministic batch plan")
+    # A fresh offline critic starts from an actor checkpoint: load the backbone
+    # strictly while retaining the newly initialized value head.  Contracted
+    # resumes must load the trained critic head as part of the checkpoint.
+    args._critic_bootstrap_from_actor_checkpoint = resume_contract is None
     model_parallel_size = compute_megatron_world_size_except_dp(args)
     total_gpus = args.critic_num_nodes * args.critic_num_gpus_per_node
     if total_gpus % model_parallel_size != 0:
@@ -88,6 +100,10 @@ async def train_value(args) -> None:
     )
 
     def publish_contract(completed_steps: int) -> None:
+        if canary_one_step:
+            raise RuntimeError(
+                "one-step value-pretraining canaries must not publish a production contract"
+            )
         contract_path, contract_sha256 = write_value_pretrain_contract(
             args.critic_save,
             manifest=manifest,
@@ -110,6 +126,8 @@ async def train_value(args) -> None:
         epochs=args.value_pretrain_epochs,
         seed=args.seed,
     )
+    if canary_one_step:
+        batch_indices = islice(batch_indices, 1)
     for iteration, indices in enumerate(batch_indices, start=1):
         if iteration <= resume_after:
             continue
@@ -125,14 +143,25 @@ async def train_value(args) -> None:
         last_completed = iteration
         if args.save_interval is not None and iteration % args.save_interval == 0:
             await critic_model.save_model(iteration, force_sync=True)
-            publish_contract(iteration)
+            if not canary_one_step:
+                publish_contract(iteration)
             last_saved = iteration
 
     if last_completed < 1:
         raise RuntimeError("value pretraining completed no optimizer steps")
     if last_saved != last_completed:
         await critic_model.save_model(last_completed, force_sync=True)
-        publish_contract(last_completed)
+        if not canary_one_step:
+            publish_contract(last_completed)
+    if canary_one_step:
+        if last_completed != 1:
+            raise RuntimeError(
+                f"one-step value-pretraining canary completed {last_completed} optimizer steps"
+            )
+        if os.path.lexists(output_contract):
+            raise RuntimeError(
+                "one-step value-pretraining canary published a production contract"
+            )
     logger.info("SAO value checkpoint ready at %s", args.critic_save)
 
 

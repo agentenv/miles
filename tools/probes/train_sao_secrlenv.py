@@ -12,15 +12,17 @@ import asyncio
 import hashlib
 import json
 import re
+import stat
 import sys
 from pathlib import Path
 from typing import Any
 
 
-_SCHEMA = "miles.sao-secrlenv.v1"
+_LEGACY_SCHEMA = "miles.sao-secrlenv.v1"
+_SCHEMA = "miles.sao-runtime.v2"
 _HASH = re.compile(r"[0-9a-f]{64}")
 _REVISION = re.compile(r"[0-9a-f]{40,64}")
-_REQUIRED = {
+_COMMON_REQUIRED = {
     "schema",
     "model",
     "data",
@@ -32,11 +34,12 @@ _REQUIRED = {
     "lora_config_hash",
     "reward_sha256",
     "dynamic_sampling_max_replacements",
-    "secrlenv_max_infrastructure_replacements",
     "completed_groups_path",
     "event_tape",
     "learner_id",
 }
+_LEGACY_REQUIRED = _COMMON_REQUIRED | {"secrlenv_max_infrastructure_replacements"}
+_REQUIRED = _COMMON_REQUIRED | {"benchmark"}
 
 
 def _sha256(path: Path) -> str:
@@ -48,45 +51,65 @@ def _sha256(path: Path) -> str:
 
 
 def load_context(path: str | Path, expected_sha256: str | None = None) -> dict[str, Any]:
-    source = Path(path).expanduser().resolve()
+    candidate = Path(path).expanduser()
+    try:
+        info = candidate.lstat()
+    except OSError as error:
+        raise ValueError(
+            "SAO context is not a private regular non-symlink file"
+        ) from error
+    if (
+        not candidate.is_absolute()
+        or candidate.is_symlink()
+        or not stat.S_ISREG(info.st_mode)
+        or stat.S_IMODE(info.st_mode) & 0o077
+    ):
+        raise ValueError("SAO context is not a private regular non-symlink file")
+    source = candidate.resolve(strict=True)
     if expected_sha256 is not None and (not _HASH.fullmatch(expected_sha256) or _sha256(source) != expected_sha256):
         raise ValueError("SAO SecRLEnv context SHA256 mismatch")
     try:
         context = json.loads(source.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise ValueError("SAO SecRLEnv context is unreadable or malformed") from error
-    if not isinstance(context, dict) or set(context) != _REQUIRED:
-        raise ValueError("SAO SecRLEnv context fields do not match the v1 schema")
-    if context["schema"] != _SCHEMA:
-        raise ValueError(f"unsupported SAO SecRLEnv context schema: {context['schema']!r}")
+    if not isinstance(context, dict):
+        raise TypeError("SAO context must be an object")
+    schema = context.get("schema")
+    required = _LEGACY_REQUIRED if schema == _LEGACY_SCHEMA else _REQUIRED
+    if set(context) != required or schema not in {_LEGACY_SCHEMA, _SCHEMA}:
+        raise ValueError("SAO context fields do not match a supported schema")
+    if schema == _SCHEMA and context["benchmark"] not in {
+        "secrlenv",
+        "terminal-bench-2.1",
+    }:
+        raise ValueError("SAO benchmark identity is unsupported")
     if not isinstance(context["model"], str) or not context["model"]:
-        raise ValueError("SAO SecRLEnv model identity is missing")
+        raise ValueError("SAO model identity is missing")
     for name in ("base_model_revision", "rollout_model_revision"):
         value = context[name]
         if not isinstance(value, str) or not _REVISION.fullmatch(value):
-            raise ValueError(f"SAO SecRLEnv {name} must be an immutable lowercase revision")
+            raise ValueError(f"SAO {name} must be an immutable lowercase revision")
     for name in ("data_sha256", "layout_hash", "reward_sha256"):
         value = context[name]
         if not isinstance(value, str) or not _HASH.fullmatch(value):
-            raise ValueError(f"SAO SecRLEnv {name} must be a lowercase SHA256")
+            raise ValueError(f"SAO {name} must be a lowercase SHA256")
     if context["data_revision"] is not None and not isinstance(context["data_revision"], str):
-        raise ValueError("SAO SecRLEnv data_revision must be a string or null")
+        raise ValueError("SAO data_revision must be a string or null")
     if not isinstance(context["lora_config_hash"], str) or not context["lora_config_hash"]:
-        raise ValueError("SAO SecRLEnv lora_config_hash is missing")
-    for name in (
-        "dynamic_sampling_max_replacements",
-        "secrlenv_max_infrastructure_replacements",
-        "learner_id",
-    ):
+        raise ValueError("SAO lora_config_hash is missing")
+    integer_fields = ["dynamic_sampling_max_replacements", "learner_id"]
+    if schema == _LEGACY_SCHEMA:
+        integer_fields.append("secrlenv_max_infrastructure_replacements")
+    for name in integer_fields:
         value = context[name]
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            raise ValueError(f"SAO SecRLEnv {name} must be a non-negative integer")
+            raise ValueError(f"SAO {name} must be a non-negative integer")
 
     data = Path(context["data"])
     if not data.is_absolute() or not data.is_file() or data.is_symlink():
-        raise ValueError("SAO SecRLEnv data must be an absolute regular non-symlink file")
+        raise ValueError("SAO data must be an absolute regular non-symlink file")
     if _sha256(data) != context["data_sha256"]:
-        raise ValueError("SAO SecRLEnv dataset SHA256 mismatch")
+        raise ValueError("SAO dataset SHA256 mismatch")
     for name in ("completed_groups_path", "event_tape"):
         output = Path(context[name])
         if not output.is_absolute() or output.is_symlink():
@@ -107,9 +130,11 @@ def bind_context(args: Any, context: dict[str, Any]) -> None:
     args.yeto_rl_dynamic_sampling_max_replacements = context[
         "dynamic_sampling_max_replacements"
     ]
-    args.yeto_rl_secrlenv_max_infrastructure_replacements = context[
-        "secrlenv_max_infrastructure_replacements"
-    ]
+    args.yeto_rl_benchmark = context.get("benchmark", "secrlenv")
+    if context["schema"] == _LEGACY_SCHEMA:
+        args.yeto_rl_secrlenv_max_infrastructure_replacements = context[
+            "secrlenv_max_infrastructure_replacements"
+        ]
     args.yeto_rl_completed_groups_path = context["completed_groups_path"]
     args.yeto_rl_event_tape = context["event_tape"]
     args.yeto_rl_learner_id = context["learner_id"]

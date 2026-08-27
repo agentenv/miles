@@ -11,11 +11,12 @@ set -euo pipefail
 : "${YETO_SAO_CRITIC_CONFIG_SHA256:?missing critic config SHA256}"
 : "${YETO_SAO_STREAMING_MAX_FRAGMENT_BYTES:?missing max fragment bytes}"
 : "${YETO_SAO_STREAMING_MAX_CHUNK_BYTES:?missing max chunk bytes}"
+: "${YETO_SAO_SYNCER_PROFILE_JSON:?missing syncer profile JSON}"
 
-CONTEXT=/root/run/sao-context.json
-CRITIC=/root/checkpoints/Qwen3.5-4B_value_smoke
-MODEL=/root/models/Qwen3.5-4B
-ACTOR=/root/checkpoints/Qwen3.5-4B_torch_dist
+CONTEXT=${YETO_SAO_CONTEXT_PATH:-/root/run/sao-context.json}
+CRITIC=${YETO_SAO_CRITIC_CHECKPOINT:-/root/checkpoints/Qwen3.5-0.8B_value_tbench21_full}
+MODEL=${YETO_SAO_MODEL_PATH:-/root/models/Qwen3.5-0.8B}
+ACTOR=${YETO_SAO_ACTOR_CHECKPOINT:-/root/checkpoints/Qwen3.5-0.8B_torch_dist}
 DATA=/root/yeto/tests/fixtures/qwen35_full_parameter_probe.jsonl
 
 test -d /root/miles
@@ -34,7 +35,7 @@ export PYTHONDONTWRITEBYTECODE=1
 export PYTHONUNBUFFERED=1
 export PYTHONPATH=/root/Megatron-LM:/root/miles:/root/yeto
 export CUDA_DEVICE_MAX_CONNECTIONS=1
-export NCCL_NVLS_ENABLE=1
+export NCCL_NVLS_ENABLE=0
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export MILES_EXPERIMENTAL_FT_TRAINER=0
 export MILES_EXPERIMENTAL_ROLLOUT_REFACTOR=0
@@ -55,6 +56,7 @@ names = (
     "MILES_EXPERIMENTAL_FT_TRAINER",
     "MILES_EXPERIMENTAL_ROLLOUT_REFACTOR",
     "YETO_SAO_STREAMING_LAYOUT_EVIDENCE",
+    "YETO_SAO_CONTEXT_SHA256",
     "YETO_SAO_SECRLENV_CONTEXT_SHA256",
     "YETO_SAO_ACTOR_MODEL_REVISION",
     "YETO_SAO_ACTOR_CONFIG_SHA256",
@@ -62,6 +64,7 @@ names = (
     "YETO_SAO_CRITIC_CONFIG_SHA256",
     "YETO_SAO_STREAMING_MAX_FRAGMENT_BYTES",
     "YETO_SAO_STREAMING_MAX_CHUNK_BYTES",
+    "YETO_SAO_SYNCER_PROFILE_JSON",
 )
 print(json.dumps({"env_vars": {name: os.environ[name] for name in names}}))
 '
@@ -69,7 +72,7 @@ print(json.dumps({"env_vars": {name: os.environ[name] for name in names}}))
 
 cd /root/miles
 # shellcheck source=/dev/null
-source scripts/models/qwen3.5-4B.sh
+source scripts/models/qwen3.5-0.8B.sh
 
 ray job submit \
   --address=http://127.0.0.1:8265 \

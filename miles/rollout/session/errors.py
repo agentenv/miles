@@ -5,6 +5,7 @@ Hierarchy
 SessionError (base)
 ├── SessionNotFoundError       → 404  session does not exist
 ├── MessageValidationError     → 400  messages structure/content invalid
+├── ContextBudgetError         → 413  declared context budget exceeded
 ├── TokenizationError          → 500  TITO tokenizer / prefix mismatch
 └── UpstreamResponseError      → 502  SGLang response invalid or unexpected
 """
@@ -30,6 +31,12 @@ class MessageValidationError(SessionError):
     """
 
     status_code: int = 400
+
+
+class ContextBudgetError(SessionError):
+    """A compaction-aware request cannot fit its declared context budget."""
+
+    status_code: int = 413
 
 
 class TokenizationError(SessionError):

@@ -974,8 +974,9 @@ class MegatronTrainRayActor(TrainRayActor):
 
         group_name = "actor_critic"
         world_size = 2
+        backend = "gloo" if bool(getattr(self.args, "sao_one_gpu_island", False)) else "nccl"
         self._actor_critic_groups = init_process_group(
-            backend="nccl",
+            backend=backend,
             init_method=f"tcp://{master_address}:{master_port}",
             world_size=world_size,
             rank=0 if self.role == "actor" else 1,

@@ -17,7 +17,8 @@ Agent function contract:
   ) -> dict | None:
       ...
 
-  Returning None means no extra metadata to attach.
+  Returning None means no extra metadata to attach unless the function opts
+  into the fail-closed result contract via ``_miles_fail_closed_result=True``.
   Returning a dict merges it into every sample's metadata, so downstream
   reward models (--custom-rm-path) can read whatever the agent left there.
 """
@@ -34,11 +35,48 @@ from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from miles.rollout.base_types import GenerateFnInput, GenerateFnOutput
 from miles.rollout.generate_utils.openai_endpoint_utils import OpenAIEndpointTracer
 from miles.rollout.generate_utils.sample_utils import merge_samples
-from miles.rollout.session.samples.merge import compute_samples_from_openai_records, truncate_samples_by_total_tokens
+from miles.rollout.session.samples.merge import (
+    compute_samples_from_openai_records,
+    merge_samples_by_compaction_segment,
+    truncate_samples_by_total_tokens,
+)
 from miles.utils.misc import load_function
 from miles.utils.types import Sample
 
 logger = logging.getLogger(__name__)
+_AGENT_FAILURE_DIAGNOSTIC_MAX_BYTES = 2048
+_AGENT_FAILURE_TRUNCATION_MARKER = b"...[diagnostic truncated]"
+
+
+def _bounded_agent_failure_diagnostic(error: Exception) -> str:
+    value = f"{type(error).__name__}: {error}".encode("utf-8", errors="replace")
+    if len(value) > _AGENT_FAILURE_DIAGNOSTIC_MAX_BYTES:
+        value = (
+            value[
+                : _AGENT_FAILURE_DIAGNOSTIC_MAX_BYTES
+                - len(_AGENT_FAILURE_TRUNCATION_MARKER)
+            ]
+            + _AGENT_FAILURE_TRUNCATION_MARKER
+        )
+    return value.decode("utf-8", errors="ignore")
+
+
+def _aborted_agent_failure(
+    input: GenerateFnInput, error: Exception, *, records_collected: int
+) -> GenerateFnOutput:
+    sample = deepcopy(input.sample)
+    sample.status = Sample.Status.ABORTED
+    sample.metadata = {
+        **(sample.metadata or {}),
+        "agent_failure": {
+            "schema": "miles.agent-failure.v1",
+            "stage": "custom_agent_function",
+            "error_type": type(error).__name__[:128],
+            "diagnostic": _bounded_agent_failure_diagnostic(error),
+            "records_collected": records_collected,
+        },
+    }
+    return GenerateFnOutput(samples=sample)
 
 
 async def generate(input: GenerateFnInput) -> GenerateFnOutput:
@@ -67,6 +105,7 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
     metadata = {**metadata, "session_server_id": tracer.session_server_id}
 
     agent_metadata = None
+    agent_failure: Exception | None = None
     t_start = time.monotonic()
     try:
         logger.debug(f"{log_prefix} Starting agent function call")
@@ -76,14 +115,34 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
             request_kwargs=build_chat_request_kwargs(input.sampling_params),
             metadata=metadata,
         )
+        if agent_metadata is None and getattr(
+            custom_agent_function, "_miles_fail_closed_result", False
+        ) is True:
+            raise RuntimeError(
+                "fail-closed custom agent returned null without a trustworthy outcome"
+            )
+        if agent_metadata is not None and not isinstance(agent_metadata, dict):
+            raise TypeError("custom agent result must be an object or null")
         logger.debug(f"{log_prefix} Agent function returned in {time.monotonic()-t_start:.1f}s")
     except Exception as e:
-        logger.warning(f"{log_prefix} Agent function failed: {e}", exc_info=True)
+        agent_failure = e
+        logger.warning(
+            "%s Agent function failed: %s",
+            log_prefix,
+            _bounded_agent_failure_diagnostic(e),
+        )
 
     finally:
         logger.debug(f"{log_prefix} Calling collect_records...")
         records, session_metadata = await tracer.collect_records()
         logger.debug(f"{log_prefix} collect_records done: {len(records)} records")
+
+    if agent_failure is not None:
+        return _aborted_agent_failure(
+            input,
+            agent_failure,
+            records_collected=len(records),
+        )
 
     if not records:
         logger.warning("No model calls recorded for sample")
@@ -98,6 +157,9 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
         records,
         input.state.tokenizer,
         accumulated_token_ids=session_metadata.get("accumulated_token_ids"),
+        accumulated_token_ids_by_context_window=session_metadata.get(
+            "accumulated_token_ids_by_context_window"
+        ),
         max_trim_tokens=session_metadata.get("max_trim_tokens", 0),
     )
 
@@ -106,6 +168,11 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
     )
     for s in samples:
         s.metadata.update(agent_metadata or {})
+
+    compaction_enabled = session_metadata.get("compaction_schema_version") == 1
+    if compaction_enabled:
+        for s in samples:
+            s.metadata["compaction_trajectory_id"] = tracer.session_id
 
     # If the agent function reports wall-clock time spent outside policy generation
     # (env/tool steps), surface it on Sample.non_generation_time so throughput
@@ -126,9 +193,15 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
         return GenerateFnOutput(samples=sample)
 
     if not input.args.generate_multi_samples:
-        samples = merge_samples(samples, input.state.tokenizer)
-        samples.metadata.update(session_metadata)
+        if compaction_enabled:
+            samples = merge_samples_by_compaction_segment(samples, input.state.tokenizer)
+            samples[-1].metadata.update(session_metadata)
+        else:
+            samples = merge_samples(samples, input.state.tokenizer)
+            samples.metadata.update(session_metadata)
     else:
+        if compaction_enabled:
+            raise ValueError("CompactionRL owns segment assembly; do not use --generate-multi-samples")
         samples[-1].metadata.update(session_metadata)
     return GenerateFnOutput(samples=samples)
 

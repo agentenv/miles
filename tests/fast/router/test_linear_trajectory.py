@@ -127,6 +127,133 @@ class TestSessionCRUD:
             registry.get_session("missing")
 
 
+class TestCompactionSegments:
+    def test_compaction_preserves_records_and_resets_only_tito_context(
+        self, registry_with_user: SessionRegistry
+    ):
+        session = registry_with_user.get_session(registry_with_user.create_session())
+        session.prepare_compaction_segment(
+            schema_version=1,
+            context_window=0,
+            segment_index=0,
+            segment_type="execution",
+            context_budget=8192,
+        )
+        session.update_pretokenized_state(
+            [SYS_MSG, USER_MSG],
+            ASSISTANT_MSG_1,
+            [1, 2],
+            [10],
+            max_trim_tokens=0,
+        )
+        session.append_record(
+            SessionRecord(
+                timestamp=0.0,
+                method="POST",
+                path="/v1/chat/completions",
+                status_code=200,
+                request={},
+                response={},
+                compaction_schema_version=1,
+                compaction_context_window=0,
+                compaction_segment_index=0,
+                compaction_segment_type="execution",
+                compaction_context_budget=8192,
+            )
+        )
+
+        session.prepare_compaction_segment(
+            schema_version=1,
+            context_window=0,
+            segment_index=1,
+            segment_type="summary",
+            context_budget=8192,
+        )
+        summary_messages = [
+            SYS_MSG,
+            USER_MSG,
+            ASSISTANT_MSG_1,
+            TOOL_MSG_1,
+            {"role": "user", "content": "summarize"},
+        ]
+        session.update_pretokenized_state(
+            summary_messages,
+            {"role": "assistant", "content": "state"},
+            [1, 2, 10, 20, 21],
+            [30],
+            max_trim_tokens=0,
+        )
+        session.append_record(
+            SessionRecord(
+                timestamp=1.0,
+                method="POST",
+                path="/v1/chat/completions",
+                status_code=200,
+                request={},
+                response={},
+                compaction_schema_version=1,
+                compaction_context_window=0,
+                compaction_segment_index=1,
+                compaction_segment_type="summary",
+                compaction_context_budget=8192,
+            )
+        )
+        first_window_tokens = list(session.token_ids)
+
+        session.prepare_compaction_segment(
+            schema_version=1,
+            context_window=1,
+            segment_index=2,
+            segment_type="execution",
+            context_budget=8192,
+        )
+
+        assert session.messages == []
+        assert session.token_ids == []
+        assert session.num_assistant == 0
+        assert len(session.records) == 2
+        assert session.accumulated_token_ids_by_context_window() == {
+            0: first_window_tokens
+        }
+
+    def test_compaction_rejects_skipped_or_disappearing_markers(
+        self, registry: SessionRegistry
+    ):
+        session = registry.get_session(registry.create_session())
+        session.prepare_compaction_segment(
+            schema_version=1,
+            context_window=0,
+            segment_index=0,
+            segment_type="execution",
+            context_budget=8192,
+        )
+
+        with pytest.raises(MessageValidationError, match="illegal compaction"):
+            session.prepare_compaction_segment(
+                schema_version=1,
+                context_window=1,
+                segment_index=2,
+                segment_type="execution",
+                context_budget=8192,
+            )
+        with pytest.raises(MessageValidationError, match="markers disappeared"):
+            session.prepare_compaction_segment(
+                schema_version=None,
+                context_window=None,
+                segment_index=None,
+                segment_type=None,
+                context_budget=None,
+            )
+        with pytest.raises(MessageValidationError, match="context budget changed"):
+            session.prepare_compaction_segment(
+                schema_version=1,
+                context_window=0,
+                segment_index=0,
+                segment_type="execution",
+                context_budget=4096,
+            )
+
+
 # ---------------------------------------------------------------------------
 # Messages for multi-turn pretokenized tests
 # ---------------------------------------------------------------------------

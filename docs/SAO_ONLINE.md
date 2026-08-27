@@ -1,9 +1,15 @@
 # SAO online training
 
+> **Production validation:** this page preserves the earlier centralized probe
+> and generic interface notes. The validated Codex + learned-compaction +
+> one-GPU-island streaming-DiLoCo recipe, exact run procedure, and results are in
+> [Qwen3.5-0.8B Terminal-Bench 2.1 SAO + Streaming DiLoCo Validation](TBENCH21_SAO_QWEN35_08B_VALIDATION_20260826.md).
+
 Algorithm settings follow [Single-Rollout Asynchronous Optimization for
 Agentic Reinforcement Learning](https://arxiv.org/abs/2607.07508).
 
-The first online validation uses Miles' centralized publication path:
+The first online validation described on this page uses Miles' centralized
+publication path:
 
 ```text
 SecRLEnv + SGLang

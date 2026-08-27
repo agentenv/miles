@@ -39,6 +39,7 @@ from .generate_utils.generate_endpoint_utils import (
     policy_uses_routing_key,
 )
 from .generate_utils.prefill_logprobs import recompute_samples_rollout_logprobs_via_prefill
+from .generate_utils.sample_utils import is_compaction_trajectory
 from .rm_hub import async_rm, batched_async_rm
 
 __all__ = ["generate_rollout", "get_model_url"]
@@ -320,11 +321,22 @@ async def generate_and_rm(
         if any([sample.status == Sample.Status.ABORTED for sample in samples]):
             return samples
 
-        # for multi agent system, the reward of some sample is calculated during generation.
-        samples_need_reward = [sample for sample in samples if sample.reward is None]
-        rewards = await batched_async_rm(args, samples_need_reward)
-        for sample, reward in zip(samples_need_reward, rewards, strict=False):
-            sample.reward = reward
+        if is_compaction_trajectory(samples):
+            # CompactionRL assigns one terminal task reward to every segment.
+            # Score the logical rollout once, then copy that exact result.
+            terminal = samples[-1]
+            if terminal.reward is None:
+                terminal.reward = await async_rm(args, terminal)
+            if any(value.reward is not None and value.reward != terminal.reward for value in samples):
+                raise ValueError("compaction segments disagree on task reward")
+            for value in samples:
+                value.reward = terminal.reward
+        else:
+            # for multi agent system, the reward of some sample is calculated during generation.
+            samples_need_reward = [sample for sample in samples if sample.reward is None]
+            rewards = await batched_async_rm(args, samples_need_reward)
+            for sample, reward in zip(samples_need_reward, rewards, strict=False):
+                sample.reward = reward
         return samples
     else:
         if sample.status == Sample.Status.ABORTED:
@@ -629,7 +641,9 @@ async def eval_rollout_single_dataset(
                 f"reward={logged_sample.reward}"
             )
             do_print = False
-        if isinstance(sample, list):
+        if isinstance(sample, list) and is_compaction_trajectory(sample):
+            data.append(sample[-1])
+        elif isinstance(sample, list):
             data.extend(sample)
         else:
             data.append(sample)

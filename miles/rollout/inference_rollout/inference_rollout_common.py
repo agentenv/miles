@@ -17,6 +17,7 @@ from miles.rollout.base_types import (
 )
 from miles.rollout.generate_hub.single_turn import generate
 from miles.rollout.generate_utils.generate_endpoint_utils import policy_uses_routing_key
+from miles.rollout.generate_utils.sample_utils import is_compaction_trajectory
 from miles.rollout.inference_rollout.compatibility import load_generate_function
 from miles.rollout.rm_hub import async_rm, batched_async_rm
 from miles.utils.processing_utils import load_processor, load_tokenizer
@@ -104,9 +105,18 @@ async def generate_and_rm(
         if any([sample.status == Sample.Status.ABORTED for sample in samples]):
             return samples
 
-        # for multi agent system, the reward of some sample is calculated during generation.
-        samples_need_reward = [sample for sample in samples if sample.reward is None]
-        await batched_async_rm(args, samples_need_reward, inplace_set_reward_field=True)
+        if is_compaction_trajectory(samples):
+            terminal = samples[-1]
+            if terminal.reward is None:
+                terminal.reward = await async_rm(args, terminal)
+            if any(value.reward is not None and value.reward != terminal.reward for value in samples):
+                raise ValueError("compaction segments disagree on task reward")
+            for value in samples:
+                value.reward = terminal.reward
+        else:
+            # for multi agent system, the reward of some sample is calculated during generation.
+            samples_need_reward = [sample for sample in samples if sample.reward is None]
+            await batched_async_rm(args, samples_need_reward, inplace_set_reward_field=True)
         return samples
     else:
         if sample.status == Sample.Status.ABORTED:
@@ -193,7 +203,13 @@ class InferenceRolloutFn:
         output, aborted_samples = await generate_rollout_async(
             self.state, input.rollout_id, self.data_source.get_samples
         )
-        self.data_source.add_samples(aborted_samples)
+        if getattr(self.state.args, "rollout_one_pass_no_replacement", False):
+            if aborted_samples:
+                raise RuntimeError(
+                    "one-pass rollout attempted to recycle aborted samples"
+                )
+        else:
+            self.data_source.add_samples(aborted_samples)
         return output
 
     async def _call_eval(self, input: RolloutFnEvalInput) -> RolloutFnEvalOutput:

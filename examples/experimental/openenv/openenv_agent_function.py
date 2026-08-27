@@ -25,6 +25,10 @@ Env vars:
                      prefix. Needed because upstream OpenEnv defaults to /task.
   OPENENV_TB2_TESTS_SRC  where the upstream env stages the task's tests inside the
                      container (default: /task/tests); copied to /tests for test.sh.
+  OPENENV_NATIVE_EVALUATE  set to 1 when the shared env server implements the
+                     canonical Terminal-Bench verifier in its evaluate action.
+                     Leave unset for older servers that need the adapter-side
+                     tests/test.sh compatibility path.
 
 Daytona-sandbox variant: ``openenv_daytona_agent_function`` (sibling module)
 is a drop-in ``--custom-agent-function-path`` alternative that runs every
@@ -34,6 +38,7 @@ episode-wiring note below); its env vars are documented there.
 """
 
 import asyncio
+import inspect
 import logging
 import os
 import random
@@ -53,6 +58,12 @@ logger = logging.getLogger(__name__)
 # full. Both are transient -- episodes hold a slot only for their rollout -- so
 # jittered backoff + retry serializes the surplus rather than failing it.
 #
+# Retrying is safe only before an episode starts.  A WebSocket can also close
+# after reset/tool execution has created and mutated a task container.  Replaying
+# ``body`` in that case duplicates one immutable sample id and can leak the first
+# container.  _with_env therefore performs a side-effect-free state request as
+# an admission handshake and never retries once that handshake succeeds.
+#
 # A rollout fans out more episodes than the server has slots (e.g. ~32 episodes
 # vs a 16-session cap), so a queued episode must outwait a full episode ahead of
 # it -- minutes, not seconds. The wait deadline is sized for that; the backoff
@@ -60,6 +71,8 @@ logger = logging.getLogger(__name__)
 # reconnects while they wait.
 _CAPACITY_MAX_WAIT_S = 1800.0
 _CAPACITY_BACKOFF_S = (1.0, 5.0)
+_WEBSOCKET_PING_INTERVAL_S = 60.0
+_WEBSOCKET_PING_TIMEOUT_S = 300.0
 
 # Strip a single fenced block: ```python / ```bash / ``` ... ```.
 _FENCE_RE = re.compile(r"```(?:python|py|bash|sh)?\s*\n?(.*?)```", re.DOTALL | re.IGNORECASE)
@@ -230,6 +243,16 @@ def _load_tbench2() -> dict[str, Any]:
 _DEFAULT_ENV_URL = "http://localhost:8003"
 
 
+def _shared_native_evaluate_enabled() -> bool:
+    """Select the shared-server scoring contract without changing legacy runs."""
+    value = os.getenv("OPENENV_NATIVE_EVALUATE", "0").strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off", ""}:
+        return False
+    raise ValueError("OPENENV_NATIVE_EVALUATE must be one of 1/0, true/false, yes/no, or on/off")
+
+
 # --- Episode wiring -------------------------------------------------------------
 # The agent loop (_multi_turn) is shared; everything that differs between the
 # episode legs enters it as three keyword parameters, filled in only by each
@@ -286,10 +309,7 @@ async def _purge_trial_dirs(env: Any, action_cls: Any) -> None:
         await env.step(
             action_cls(
                 action_type="exec",
-                command=(
-                    "find /tmp/tbench2_env_runs -mindepth 1 -maxdepth 1 "
-                    "! -name repo_cache -exec rm -rf {} + 2>/dev/null || true"
-                ),
+                command=("find /tmp/tbench2_env_runs -mindepth 1 -maxdepth 1 ! -name repo_cache -exec rm -rf {} + 2>/dev/null || true"),
             )
         )
     except Exception:
@@ -297,14 +317,30 @@ async def _purge_trial_dirs(env: Any, action_cls: Any) -> None:
 
 
 async def _with_env(env_cls: Any, env_url: str, body: Callable[[Any], Any]) -> Any:
-    """Open an env session and run ``body(env)``, retrying while a slot is busy."""
+    """Open one admitted env session and run ``body`` exactly once.
+
+    Capacity failures are retried only during connection/admission.  Once the
+    side-effect-free state handshake succeeds, every exception belongs to that
+    logical episode and must propagate; replaying it would create a replacement
+    trajectory under the same sample id.
+    """
     deadline = asyncio.get_event_loop().time() + _CAPACITY_MAX_WAIT_S
     while True:
+        admitted = False
         try:
-            async with env_cls(base_url=env_url, message_timeout_s=_MESSAGE_TIMEOUT_S) as env:
+            async with env_cls(
+                base_url=env_url,
+                message_timeout_s=_MESSAGE_TIMEOUT_S,
+                websocket_ping_interval_s=_WEBSOCKET_PING_INTERVAL_S,
+                websocket_ping_timeout_s=_WEBSOCKET_PING_TIMEOUT_S,
+            ) as env:
+                state = env.state()
+                if inspect.isawaitable(state):
+                    await state
+                admitted = True
                 return await body(env)
         except Exception as e:
-            if _is_retryable_env_error(e) and asyncio.get_event_loop().time() < deadline:
+            if not admitted and _is_retryable_env_error(e) and asyncio.get_event_loop().time() < deadline:
                 await asyncio.sleep(random.uniform(*_CAPACITY_BACKOFF_S))
                 continue
             raise
@@ -360,9 +396,7 @@ async def _multi_turn(
         while turns < max_turns:
             turns += 1
             t0 = time.monotonic()
-            completion = await policy.chat.completions.create(
-                model=model_name, messages=convo, extra_body=request_kwargs
-            )
+            completion = await policy.chat.completions.create(model=model_name, messages=convo, extra_body=request_kwargs)
             gen_times.append(time.monotonic() - t0)
             message = completion.choices[0].message
             reply = message.content or ""
@@ -473,7 +507,7 @@ async def run_episode(
         request_kwargs,
         metadata,
         run_body=_shared_run_body,
-        native_evaluate=False,
+        native_evaluate=_shared_native_evaluate_enabled(),
         post_episode=_purge_trial_dirs,
     )
 
@@ -509,7 +543,7 @@ async def _run_for_training(
             timeout=_MAX_ROLLOUT_TIME_S,
         )
     except asyncio.TimeoutError:
-        logger.warning(f"OpenEnv tbench2 episode exceeded {_MAX_ROLLOUT_TIME_S:.0f}s; " "terminating with reward 0")
+        logger.warning(f"OpenEnv tbench2 episode exceeded {_MAX_ROLLOUT_TIME_S:.0f}s; terminating with reward 0")
         # eval_report empty: the episode was cancelled before the canonical
         # eval ever ran, so there is no pytest report to surface.
         return {
@@ -528,11 +562,7 @@ async def _run_for_training(
     # (infra/harness failure, not a legitimate task failure). Drop the sample --
     # returning it as reward 0.0 would inject a false negative into training.
     if reward is None:
-        logger.warning(
-            "OpenEnv tbench2 episode produced no canonical reward "
-            f"(test.sh exit code={agent_metrics.get('testsh_rc')}); "
-            "infra/harness failure, dropping sample"
-        )
+        logger.warning(f"OpenEnv tbench2 episode produced no canonical reward (test.sh exit code={agent_metrics.get('testsh_rc')}); infra/harness failure, dropping sample")
         return None
 
     # eval_report is intentionally empty: the canonical-eval marker protocol

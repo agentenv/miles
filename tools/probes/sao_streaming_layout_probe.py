@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 _EVIDENCE_ENV = "YETO_SAO_STREAMING_LAYOUT_EVIDENCE"
-_SECRLENV_CONTEXT_SHA_ENV = "YETO_SAO_SECRLENV_CONTEXT_SHA256"
+_CONTEXT_SHA_ENV = "YETO_SAO_CONTEXT_SHA256"
 _ACTOR_REVISION_ENV = "YETO_SAO_ACTOR_MODEL_REVISION"
 _ACTOR_CONFIG_ENV = "YETO_SAO_ACTOR_CONFIG_SHA256"
 _CRITIC_REVISION_ENV = "YETO_SAO_CRITIC_MODEL_REVISION"
@@ -123,7 +123,7 @@ class SAOStreamingLayoutProbe:
     def __init__(self, args: Any) -> None:
         self.args = args
         self.evidence_path = Path(_required_env(_EVIDENCE_ENV))
-        self.secrlenv_context_sha256 = _hash_env(_SECRLENV_CONTEXT_SHA_ENV)
+        self.sao_context_sha256 = _hash_env(_CONTEXT_SHA_ENV)
         self.actor_revision = _revision_env(_ACTOR_REVISION_ENV)
         self.actor_config_sha256 = _hash_env(_ACTOR_CONFIG_ENV)
         self.critic_revision = _revision_env(_CRITIC_REVISION_ENV)
@@ -214,7 +214,7 @@ class SAOStreamingLayoutProbe:
             raise RuntimeError("SAO actor and critic did not derive distinct lockstep layouts")
         self.evidence = {
             "schema": streaming_layout_attestation_schema(),
-            "sao_secrlenv_context_sha256": self.secrlenv_context_sha256,
+            "sao_context_sha256": self.sao_context_sha256,
             "settings": {
                 "algorithm": "sao",
                 "fragment_strategy": "owner_affine",
