@@ -40,6 +40,7 @@ TICK_INTERVAL_SECONDS = 5.0
 CELL_TICK_TIMEOUT_SECONDS = 120.0
 CELLS_READY_POLL_INTERVAL_SECONDS = 2.0
 CELLS_READY_TIMEOUT_SECONDS = 3600.0
+DRAIN_POLL_INTERVAL_SECONDS = 0.5
 
 
 class MembershipEpochMismatchError(RuntimeError):
@@ -151,6 +152,62 @@ class InferenceController:
         self._last_membership_op = (op, ids)
         logger.info(f"{op}_cells {list(ids)} committed membership epoch {self._membership_epoch}")
         return self._membership_epoch
+
+    # -------------------------- cordon / drain -----------------------------
+
+    @with_lock
+    async def cordon_cells(self, cell_ids: list[str]) -> None:
+        await asyncio.gather(*[cell.cordon() for cell in self._find_cells(cell_ids)])
+
+    @with_lock
+    async def uncordon_cells(self, cell_ids: list[str]) -> None:
+        await asyncio.gather(*[cell.uncordon() for cell in self._find_cells(cell_ids)])
+
+    @with_lock
+    async def drain_cells(
+        self,
+        cell_ids: list[str],
+        *,
+        timeout_seconds: float,
+        poll_interval_seconds: float = DRAIN_POLL_INTERVAL_SECONDS,
+    ) -> bool:
+        """Cordon the cells, then wait until the router counts no in-flight request on any of them.
+
+        Returns False when the deadline passes first; nothing is aborted and the cells stay cordoned (uncordon them
+        to cancel). The controller lock is released while waiting. A cell that disappears meanwhile has left the
+        router (or was replaced by a cell that is not serving yet), so it holds no in-flight request any more.
+        """
+        cells = self._find_cells(cell_ids)
+        await asyncio.gather(*[cell.cordon() for cell in cells])
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            remaining = [
+                cell for cell in map(self._find_cell_or_none, cell_ids) if cell is not None and cell.is_serving
+            ]
+            counts = await asyncio.gather(*[cell.get_inflight() for cell in remaining])
+            busy = {cell.meta.cell_id: n for cell, n in zip(remaining, counts, strict=True) if n > 0}
+            if not busy:
+                return True
+            if time.monotonic() >= deadline:
+                logger.warning(f"drain of {cell_ids} timed out after {timeout_seconds}s; still in flight: {busy}")
+                return False
+            async with self.context_lock.with_released():
+                await asyncio.sleep(poll_interval_seconds)
+
+    @requires_lock
+    def _find_cell_or_none(self, cell_id: str) -> ServerCell | None:
+        for srv in self.servers.values():
+            if (cell := srv.server_cells.get(cell_id)) is not None:
+                return cell
+        return None
+
+    @requires_lock
+    def _find_cells(self, cell_ids: list[str]) -> list[ServerCell]:
+        cells = [self._find_cell_or_none(cell_id) for cell_id in cell_ids]
+        unknown = [cell_id for cell_id, cell in zip(cell_ids, cells, strict=True) if cell is None]
+        if unknown:
+            raise KeyError(f"cells {unknown} are not tracked by this controller")
+        return cells
 
     # TEMPORARY: exists only so a suspend can take this lock, reverted with the weight-update fault tolerance work
     @with_lock

@@ -48,6 +48,26 @@ class SGLangRouterApiClient:
             )
         response.raise_for_status()
 
+    # Cordon / in-flight are Miles-router endpoints (see miles/router/router.py); the sglang router has neither.
+    async def cordon_worker(self, worker_url: str) -> None:
+        response = await GeneralHttpClientProvider.client().post(
+            f"{self.router_url}/cordon_worker", json={"url": worker_url}, timeout=ROUTER_REQUEST_TIMEOUT
+        )
+        response.raise_for_status()
+
+    async def uncordon_worker(self, worker_url: str) -> None:
+        response = await GeneralHttpClientProvider.client().post(
+            f"{self.router_url}/uncordon_worker", json={"url": worker_url}, timeout=ROUTER_REQUEST_TIMEOUT
+        )
+        response.raise_for_status()
+
+    async def get_worker_inflight(self) -> dict[str, int]:
+        response = await GeneralHttpClientProvider.client().get(
+            f"{self.router_url}/worker_inflight", timeout=ROUTER_REQUEST_TIMEOUT
+        )
+        response.raise_for_status()
+        return response.json()["inflight"]
+
     async def remove_worker(self, worker_url: str, use_legacy_api: bool):
         response = None
         if use_legacy_api:

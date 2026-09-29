@@ -216,6 +216,39 @@ class ServerCell:
             bootstrap_port=addr_info.bootstrap_port,
         )
 
+    # -------------------------- cordon / drain (Miles router only) -----------------------------
+
+    async def cordon(self) -> None:
+        """Stop the router from selecting this cell for new requests; it stays registered and keeps serving."""
+        self._assert_cordonable()
+        await self.router_api_client.cordon_worker(worker_url=self.server_url)
+
+    async def uncordon(self) -> None:
+        self._assert_cordonable()
+        await self.router_api_client.uncordon_worker(worker_url=self.server_url)
+
+    async def get_inflight(self) -> int:
+        """Requests the router proxied to this cell and has not seen finish."""
+        self._assert_cordonable()
+        return (await self.router_api_client.get_worker_inflight()).get(self.server_url, 0)
+
+    async def wait_drained(self, *, timeout_seconds: float, poll_interval_seconds: float = 0.5) -> bool:
+        """Poll until the router counts no in-flight request for this cell; False at the deadline. Never aborts."""
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            if (inflight := await self.get_inflight()) == 0:
+                return True
+            if time.monotonic() >= deadline:
+                logger.warning(f"Cell {self.meta.cell_id} still has {inflight} in-flight requests at the deadline")
+                return False
+            await asyncio.sleep(poll_interval_seconds)
+
+    def _assert_cordonable(self) -> None:
+        assert self.args.use_miles_router, "cordon and in-flight counts need the Miles router (--use-miles-router)"
+        assert isinstance(
+            self._state, StateServing
+        ), f"only a serving cell is registered with the router ({self._state=})"
+
     async def dispose(self) -> None:
         self._health_checker.stop()
 
