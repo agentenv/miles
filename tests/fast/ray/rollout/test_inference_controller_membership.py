@@ -135,14 +135,24 @@ class TestHalfFailedStop:
             await controller.stop_cells(["engine-0"], expected_epoch=0)
 
         assert "engine-0" not in srv.server_cells
-        assert await controller.get_membership_status() == dict(epoch=0, incomplete=["stop", ["engine-0"]])
+        assert await controller.get_membership_status() == dict(
+            epoch=0,
+            incomplete=["stop", ["engine-0"]],
+            incomplete_reason="stop_failed",
+            retry_advances_epoch=True,
+        )
         with pytest.raises(MembershipIncompleteError, match="retry it before"):
             await controller.start_cells(["engine-2"], expected_epoch=0)
         with pytest.raises(MembershipIncompleteError):
             await controller.start_update_weights(members=["engine-1"], expected_epoch=0)
 
         assert await controller.stop_cells(["engine-0"], expected_epoch=0) == 1
-        assert await controller.get_membership_status() == dict(epoch=1, incomplete=None)
+        assert await controller.get_membership_status() == dict(
+            epoch=1,
+            incomplete=None,
+            incomplete_reason=None,
+            retry_advances_epoch=False,
+        )
 
 
 class _TrackedCell:

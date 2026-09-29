@@ -76,6 +76,10 @@ class InferenceController:
     _membership_incomplete: tuple[str, tuple[str, ...]] | None = None
     # set by start_update_weights(admit_cordoned=True) for the end_update_weights of that same publish
     _admit_cordoned: bool = False
+    # cell id -> cell registered cordoned by an admit_cordoned publish and not admitted yet (only admit_cells opens it)
+    _awaiting_admission: dict[str, Any] = {}
+    # why membership is incomplete: "stop_failed", "start_rollback_failed" or "restored"
+    _membership_incomplete_reason: str | None = None
     # cells a drain_cells call is waiting on; if one becomes Serving meanwhile it is registered cordoned
     _draining_cell_ids: frozenset[str] = frozenset()
 
@@ -131,11 +135,19 @@ class InferenceController:
 
     @lock_exempt
     async def get_membership_status(self) -> dict[str, Any]:
-        """The epoch plus the change that failed half way (``[op, cell_ids]``) and must be retried, if any."""
+        """The epoch plus the change that failed half way (``[op, cell_ids]``) and must be retried, if any.
+
+        ``incomplete_reason`` says why (``stop_failed``, ``start_rollback_failed`` or ``restored``). A successful retry
+        of the incomplete change is a normal membership change and advances the epoch by one -- also after
+        ``start_rollback_failed``, where the retry is a stop of cells that never joined; ``retry_advances_epoch``
+        states this explicitly for the caller's journal.
+        """
         incomplete = self._membership_incomplete
         return dict(
             epoch=self._membership_epoch,
             incomplete=None if incomplete is None else [incomplete[0], list(incomplete[1])],
+            incomplete_reason=None if incomplete is None else self._membership_incomplete_reason,
+            retry_advances_epoch=incomplete is not None,
         )
 
     @with_lock
@@ -172,6 +184,7 @@ class InferenceController:
             return op, tuple(sorted(set(cell_ids)))
 
         self._membership_incomplete = _op(incomplete, "incomplete")
+        self._membership_incomplete_reason = None if incomplete is None else "restored"
         self._last_membership_op = _op(last_op, "last_op")
         self._membership_epoch = epoch
         logger.info(
@@ -234,7 +247,8 @@ class InferenceController:
         TimeoutError then leaves the epoch committed and the caller may wait again. A repeated call with the same
         cells right after it committed returns the same epoch without acting again; any other epoch mismatch is
         refused. If the start fails and the worker manager's rollback fails too, the cells may be half running:
-        membership is marked incomplete as ``["stop", cell_ids]`` and only a stop of those cells is accepted next.
+        membership is marked incomplete as ``["stop", cell_ids]`` (reason ``start_rollback_failed``) and only a stop
+        of those cells is accepted next; that stop, when it succeeds, advances the epoch by one like any stop.
         """
         epoch = await self._change_membership("start", cell_ids, expected_epoch=expected_epoch)
         if wait_tracked_timeout_seconds is not None:
@@ -286,6 +300,7 @@ class InferenceController:
                 await provider.stop_cells(cell_ids=list(ids))
             except BaseException:
                 self._membership_incomplete = (op, ids)
+                self._membership_incomplete_reason = "stop_failed"
                 logger.error(f"stop_cells {list(ids)} failed half way at epoch {current}; retry the same stop")
                 raise
         else:
@@ -296,13 +311,17 @@ class InferenceController:
             except BaseException as error:
                 if _is_start_rollback_failure(error):
                     self._membership_incomplete = ("stop", ids)
+                    self._membership_incomplete_reason = "start_rollback_failed"
                     logger.error(
                         f"start_cells {list(ids)} failed and its rollback failed at epoch {current}; "
                         f"stop these cells before any other membership change"
                     )
                 raise
 
+        if op == "stop":
+            self._awaiting_admission = {k: v for k, v in self._awaiting_admission.items() if k not in ids}
         self._membership_incomplete = None
+        self._membership_incomplete_reason = None
         self._membership_epoch = current + 1
         self._last_membership_op = (op, ids)
         logger.info(f"{op}_cells {list(ids)} committed membership epoch {self._membership_epoch}")
@@ -316,14 +335,27 @@ class InferenceController:
 
     @with_lock
     async def uncordon_cells(self, cell_ids: list[str]) -> None:
-        await asyncio.gather(*[cell.uncordon() for cell in self._find_cells(cell_ids)])
+        """Undo a cordon (e.g. cancel a drain). Cells waiting for ``admit_cells`` are refused: only an admission,
+        which checks their weight version, may open them."""
+        cells = self._find_cells(cell_ids)
+        waiting = [cell.meta.cell_id for cell in cells if self._is_awaiting_admission(cell)]
+        if waiting:
+            raise RuntimeError(f"cells {waiting} await admission after a cordoned publish; use admit_cells")
+        await asyncio.gather(*[cell.uncordon() for cell in cells])
+
+    @requires_lock
+    def _is_awaiting_admission(self, cell) -> bool:
+        return self._awaiting_admission.get(cell.meta.cell_id) is cell
 
     @with_lock
-    async def admit_cells(self, cell_ids: list[str], *, expected_epoch: int) -> None:
+    async def admit_cells(
+        self, cell_ids: list[str], *, expected_epoch: int, expected_weight_version: str | int
+    ) -> None:
         """Let cells published with ``admit_cordoned=True`` take traffic, after the caller verified their weights.
 
-        The cells must be Serving (i.e. registered cordoned by ``end_update_weights``) and the membership epoch must
-        still be the one the publish was planned for, so an admission cannot outlive a membership change.
+        The cells must be awaiting admission (registered cordoned by that publish's ``end_update_weights``), the
+        membership epoch must still be the one the publish was planned for, and every cell must report
+        ``expected_weight_version`` (the version the caller's read-back verified); otherwise nothing is admitted.
         """
         if expected_epoch != self._membership_epoch:
             raise MembershipEpochMismatchError(
@@ -337,7 +369,20 @@ class InferenceController:
         not_serving = [cell.meta.cell_id for cell in cells if not cell.is_serving]
         if not_serving:
             raise RuntimeError(f"cells {not_serving} are not serving (weights not published yet); nothing to admit")
+        not_waiting = [cell.meta.cell_id for cell in cells if not self._is_awaiting_admission(cell)]
+        if not_waiting:
+            raise RuntimeError(f"cells {not_waiting} were not published with admit_cordoned; nothing to admit")
+        versions = await asyncio.gather(*[cell.api_client.get_weight_version() for cell in cells])
+        wrong = {
+            cell.meta.cell_id: str(v)
+            for cell, v in zip(cells, versions, strict=True)
+            if str(v) != str(expected_weight_version)
+        }
+        if wrong:
+            raise RuntimeError(f"cells {wrong} do not report weight version {expected_weight_version}; not admitted")
         await asyncio.gather(*[cell.uncordon() for cell in cells])
+        admitted = {cell.meta.cell_id for cell in cells}
+        self._awaiting_admission = {k: v for k, v in self._awaiting_admission.items() if k not in admitted}
 
     @with_lock
     async def drain_cells(
@@ -651,12 +696,49 @@ class InferenceController:
                 for cell_id, cell in ready
             ]
         )
+        if admit_cordoned:
+            self._awaiting_admission = {**self._awaiting_admission, **{cell_id: cell for cell_id, cell in ready}}
 
     # -------------------------- weight versions -----------------------------
+
+    @acquires_lock
+    async def start_commit_weight_version(
+        self, *, weight_version: int, expected_epoch: int, model_id: str | None = None
+    ) -> dict[str, str]:
+        """Check, under the controller lock, that the executor may take ``weight_version``; keeps the lock held.
+
+        The caller sets the executor's version and then calls ``end_commit_weight_version`` (always, also on
+        failure). While the lock is held no membership change, publish or re-stamp can run, so the epoch and the
+        versions checked here are still true when the executor's version is set. Returns cell id -> version.
+        """
+        if expected_epoch != self._membership_epoch:
+            raise MembershipEpochMismatchError(
+                f"weight version commit expected membership epoch {expected_epoch}, "
+                f"but it is {self._membership_epoch}"
+            )
+        if (incomplete := self._membership_incomplete) is not None:
+            raise MembershipIncompleteError(
+                f"{incomplete[0]}_cells {list(incomplete[1])} failed half way; retry it first"
+            )
+        versions = await self._cells_weight_versions(model_id)
+        if not versions:
+            raise RuntimeError("no serving engine reports a weight version; nothing to commit")
+        stale = {cell_id: v for cell_id, v in versions.items() if v != str(weight_version)}
+        if stale:
+            raise RuntimeError(f"serving engines {stale} do not report weight version {weight_version} yet")
+        return versions
+
+    @releases_lock
+    async def end_commit_weight_version(self) -> None:
+        pass
 
     @with_lock
     async def get_cells_weight_versions(self, model_id: str | None = None) -> dict[str, str]:
         """The weight version each Serving cell of the updatable server reports (cell id -> version string)."""
+        return await self._cells_weight_versions(model_id)
+
+    @requires_lock
+    async def _cells_weight_versions(self, model_id: str | None) -> dict[str, str]:
         srv = self._get_updatable_server(model_id=model_id)
         if srv is None:
             return {}
@@ -678,6 +760,10 @@ class InferenceController:
             raise MembershipEpochMismatchError(
                 f"re-stamping {cell_ids} expected membership epoch {expected_epoch}, "
                 f"but it is {self._membership_epoch}"
+            )
+        if (incomplete := self._membership_incomplete) is not None:
+            raise MembershipIncompleteError(
+                f"{incomplete[0]}_cells {list(incomplete[1])} failed half way; retry it first"
             )
         srv = self._get_updatable_server(model_id=model_id)
         assert srv is not None, "no updatable server"

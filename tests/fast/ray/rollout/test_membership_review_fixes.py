@@ -76,7 +76,12 @@ class TestRestoreMembershipFromTheJournal:
         status = await controller.restore_membership_state(
             epoch=7, incomplete=["stop", ["engine-1"]], expected_current_epoch=0
         )
-        assert status == dict(epoch=7, incomplete=["stop", ["engine-1"]])
+        assert status == dict(
+            epoch=7,
+            incomplete=["stop", ["engine-1"]],
+            incomplete_reason="restored",
+            retry_advances_epoch=True,
+        )
 
         with pytest.raises(MembershipIncompleteError):
             await controller.start_cells(["engine-2"], expected_epoch=7)
@@ -104,7 +109,12 @@ class TestRestoreMembershipFromTheJournal:
         controller, _, _ = _controller()
         with pytest.raises(ValueError):
             await controller.restore_membership_state(**{"epoch": 1, **bad}, expected_current_epoch=0)
-        assert await controller.get_membership_status() == dict(epoch=0, incomplete=None)
+        assert await controller.get_membership_status() == dict(
+            epoch=0,
+            incomplete=None,
+            incomplete_reason=None,
+            retry_advances_epoch=False,
+        )
 
 
 class _RayTaskErrorLike(RuntimeError):
@@ -123,17 +133,29 @@ class TestStartRollbackFailure:
         with pytest.raises(RuntimeError):
             await controller.start_cells(["engine-1"], expected_epoch=0)
 
-        assert await controller.get_membership_status() == dict(epoch=0, incomplete=["stop", ["engine-1"]])
+        assert await controller.get_membership_status() == dict(
+            epoch=0,
+            incomplete=["stop", ["engine-1"]],
+            incomplete_reason="start_rollback_failed",
+            retry_advances_epoch=True,
+        )
         with pytest.raises(MembershipIncompleteError):
             await controller.start_cells(["engine-1"], expected_epoch=0)
+        # the stop that clears it is a normal membership change: the epoch advances by one
         assert await controller.stop_cells(["engine-1"], expected_epoch=0) == 1
+        assert (await controller.get_membership_status())["retry_advances_epoch"] is False
 
     async def test_a_clean_rollback_leaves_membership_complete(self):
         controller, provider, _ = _controller()
         provider.fail_next = RuntimeError("start failed, rolled back")
         with pytest.raises(RuntimeError):
             await controller.start_cells(["engine-1"], expected_epoch=0)
-        assert await controller.get_membership_status() == dict(epoch=0, incomplete=None)
+        assert await controller.get_membership_status() == dict(
+            epoch=0,
+            incomplete=None,
+            incomplete_reason=None,
+            retry_advances_epoch=False,
+        )
 
 
 # ----------------------------------------------------------------------------- B4
@@ -222,17 +244,42 @@ class TestValidateBeforePause:
 
 
 class TestCordonedAdmission:
+    async def _publish_cordoned(self, controller, cell_id="engine-1"):
+        info = await controller.start_update_weights(members=[cell_id], expected_epoch=0, admit_cordoned=True)
+        await controller.end_update_weights(snapshot_cell_id_to_hashes=info.snapshot_cell_id_to_hashes)
+
     async def test_new_members_join_cordoned_and_take_traffic_only_after_admit(self):
-        new, old = _Cell("engine-1", gpu_offset=1), _Cell("engine-0", serving=True)
+        new, old = _Cell("engine-1", gpu_offset=1, version="4"), _Cell("engine-0", serving=True)
         controller, _ = _publish_setup(old, new)
 
-        info = await controller.start_update_weights(members=["engine-1"], expected_epoch=0, admit_cordoned=True)
-        await controller.end_update_weights(snapshot_cell_id_to_hashes=info.snapshot_cell_id_to_hashes)
+        await self._publish_cordoned(controller)
 
         assert new.is_serving and new.registered_cordoned is True and new.cordoned
         assert not old.cordoned
-        # the caller reads the weights back here (check_weights), then admits
-        await controller.admit_cells(["engine-1"], expected_epoch=0)
+        # the caller reads the weights back here (check_weights), then admits with the verified version
+        await controller.admit_cells(["engine-1"], expected_epoch=0, expected_weight_version=4)
+        assert not new.cordoned
+
+    async def test_a_wrong_weight_version_is_not_admitted(self):
+        new = _Cell("engine-1", version="3")
+        controller, _ = _publish_setup(new)
+        await self._publish_cordoned(controller)
+
+        with pytest.raises(RuntimeError, match="do not report weight version 4"):
+            await controller.admit_cells(["engine-1"], expected_epoch=0, expected_weight_version=4)
+        assert new.cordoned
+
+    async def test_uncordon_cannot_bypass_the_admission(self):
+        new = _Cell("engine-1", version="4")
+        controller, _ = _publish_setup(new)
+        await self._publish_cordoned(controller)
+
+        with pytest.raises(RuntimeError, match="use admit_cells"):
+            await controller.uncordon_cells(["engine-1"])
+        assert new.cordoned
+        await controller.admit_cells(["engine-1"], expected_epoch=0, expected_weight_version="4")
+        await controller.cordon_cells(["engine-1"])
+        await controller.uncordon_cells(["engine-1"])  # an ordinary cordon after admission is undone freely
         assert not new.cordoned
 
     async def test_the_flag_applies_to_one_publish_only(self):
@@ -244,13 +291,15 @@ class TestCordonedAdmission:
         await controller.end_update_weights(snapshot_cell_id_to_hashes=info.snapshot_cell_id_to_hashes)
         assert b.registered_cordoned is False
 
-    async def test_admit_checks_epoch_and_serving(self):
+    async def test_admit_checks_epoch_serving_and_that_the_cell_awaits_admission(self):
         pending, serving = _Cell("engine-1"), _Cell("engine-0", serving=True)
         controller, _ = _publish_setup(pending, serving)
         with pytest.raises(MembershipEpochMismatchError):
-            await controller.admit_cells(["engine-0"], expected_epoch=1)
+            await controller.admit_cells(["engine-0"], expected_epoch=1, expected_weight_version=3)
         with pytest.raises(RuntimeError, match="not serving"):
-            await controller.admit_cells(["engine-1"], expected_epoch=0)
+            await controller.admit_cells(["engine-1"], expected_epoch=0, expected_weight_version=3)
+        with pytest.raises(RuntimeError, match="not published with admit_cordoned"):
+            await controller.admit_cells(["engine-0"], expected_epoch=0, expected_weight_version=3)
 
     async def test_cordoned_admission_needs_the_miles_router(self):
         controller, srv = _publish_setup(_Cell("engine-0"), miles_router=False)
@@ -274,7 +323,98 @@ class _Executor:
         self.versions.append((version, trainer_model_id))
 
 
+class TestUpdateWeightsEndToEnd:
+    """placement_group.update_weights(admit_cordoned=True) -> read-back -> admit_cells on a real controller."""
+
+    async def test_a_cordoned_member_publish_then_admission(self, monkeypatch):
+        from argparse import Namespace
+        from unittest.mock import AsyncMock, MagicMock
+
+        monkeypatch.setattr(
+            placement_group_module,
+            "FTTestActionOrchestrationExecutor",
+            MagicMock(from_args=MagicMock(return_value=MagicMock(run_after_step=AsyncMock()))),
+        )
+        new, old = _Cell("engine-1", gpu_offset=1, version="3"), _Cell("engine-0", serving=True, version="3")
+        controller, _ = _publish_setup(old, new)
+
+        async def _actor_update_weights(info, rollout_id):
+            assert [c.meta.cell_id for c in (new,)] == list(info.snapshot_cell_id_to_hashes)
+            new.version = "4"  # what the trainer's publish stamps on the member
+            return 4
+
+        actor = MagicMock(update_weights=_actor_update_weights)
+        executor = _Executor()
+        version = await placement_group_module.update_weights(
+            Namespace(debug_train_only=True, debug_rollout_only=False),
+            actor,
+            executor,
+            controller,
+            members=["engine-1"],
+            expected_epoch=0,
+            admit_cordoned=True,
+        )
+
+        assert version == 4 and new.is_serving and new.cordoned and executor.versions == []
+        with pytest.raises(RuntimeError, match="use admit_cells"):
+            await controller.uncordon_cells(["engine-1"])
+        await controller.admit_cells(["engine-1"], expected_epoch=0, expected_weight_version=version)
+        assert not new.cordoned
+
+        await controller.set_cells_weight_version(["engine-0"], weight_version=version, expected_epoch=0)
+        await placement_group_module.commit_weight_version(
+            executor, controller, weight_version=version, expected_epoch=0
+        )
+        assert executor.versions == [(4, None)]
+
+
 class TestWeightVersionCommit:
+    async def test_the_executor_is_set_while_the_controller_lock_is_held(self):
+        cell = _Cell("engine-0", serving=True, version="4")
+        controller, _ = _publish_setup(cell)
+        seen = []
+
+        class _CheckingExecutor(_Executor):
+            async def set_weight_version(self, version, trainer_model_id=None):
+                # a membership change or re-stamp now would have to wait for the lock
+                racer = asyncio.create_task(
+                    controller.set_cells_weight_version(["engine-0"], weight_version=5, expected_epoch=0)
+                )
+                await asyncio.sleep(0.01)
+                seen.append(racer.done())
+                await super().set_weight_version(version, trainer_model_id)
+                self.racer = racer
+
+        executor = _CheckingExecutor()
+        await placement_group_module.commit_weight_version(
+            executor, controller, weight_version=4, expected_epoch=0
+        )
+        await executor.racer
+        assert seen == [False] and executor.versions == [(4, None)] and cell.version == "5"
+
+    async def test_a_failed_executor_update_releases_the_lock(self):
+        controller, _ = _publish_setup(_Cell("engine-0", serving=True, version="4"))
+
+        class _Failing(_Executor):
+            async def set_weight_version(self, version, trainer_model_id=None):
+                raise RuntimeError("executor gone")
+
+        with pytest.raises(RuntimeError, match="executor gone"):
+            await placement_group_module.commit_weight_version(
+                _Failing(), controller, weight_version=4, expected_epoch=0
+            )
+        await controller.set_cells_weight_version(["engine-0"], weight_version=5, expected_epoch=0)
+
+    async def test_incomplete_membership_blocks_restamp_and_commit(self):
+        controller, _ = _publish_setup(_Cell("engine-0", serving=True, version="4"))
+        await controller.restore_membership_state(epoch=0, incomplete=["stop", ["x"]], expected_current_epoch=0)
+        with pytest.raises(MembershipIncompleteError):
+            await controller.set_cells_weight_version(["engine-0"], weight_version=5, expected_epoch=0)
+        with pytest.raises(MembershipIncompleteError):
+            await placement_group_module.commit_weight_version(
+                _Executor(), controller, weight_version=4, expected_epoch=0
+            )
+
     async def test_members_first_then_restamp_then_commit(self):
         """Member publish (v4 to the new cell), re-stamp the old cells carrying the same policy, then commit."""
         old, new = _Cell("engine-0", serving=True, version="3"), _Cell("engine-1", serving=True, version="4")
