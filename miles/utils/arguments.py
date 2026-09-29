@@ -175,6 +175,17 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--yeto-placement-map",
+                type=str,
+                default=None,
+                help=(
+                    "Optional JSON object naming the placement group bundles of each role explicitly, e.g. "
+                    '\'{"trainer": [0, 1], "rollout": [2, 3], "standby": [4]}\'. Indices are logical bundle '
+                    "positions in (node, gpu) order and together must cover 0..N-1 exactly once. Unset keeps the "
+                    "single trainer-then-rollout offset split. Rejected with --colocate."
+                ),
+            )
+            parser.add_argument(
                 "--worker-comm-backend",
                 type=str,
                 default=None,

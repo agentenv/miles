@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import socket
 from typing import NamedTuple
@@ -143,10 +144,83 @@ def _compute_trainer_num_gpus(args) -> int:
     return args.actor_num_nodes * args.actor_num_gpus_per_node * num_policies
 
 
-def create_placement_groups(args) -> dict[str, PlacementGroupInfo]:
-    """Create placement groups for actor and rollout engines."""
+STANDBY_PG_NAME = "standby"
+_PLACEMENT_MAP_ROLES = ("trainer", "rollout", "standby")
 
+
+class PlacementMap(NamedTuple):
+    """Explicit role -> logical bundle positions (indices into the (node, gpu) sorted bundle order)."""
+
+    trainer: tuple[int, ...]
+    rollout: tuple[int, ...]
+    standby: tuple[int, ...] = ()
+
+    @property
+    def num_bundles(self) -> int:
+        return len(self.trainer) + len(self.rollout) + len(self.standby)
+
+
+def parse_placement_map(raw: "str | dict | PlacementMap | None") -> PlacementMap | None:
+    if raw is None or isinstance(raw, PlacementMap):
+        return raw
+    data = json.loads(raw) if isinstance(raw, str) else raw
+    assert isinstance(data, dict), f"a placement map is a JSON object keyed by role, got {data!r}"
+    unknown = set(data) - set(_PLACEMENT_MAP_ROLES)
+    assert not unknown, f"placement map names unknown roles {sorted(unknown)}; known: {list(_PLACEMENT_MAP_ROLES)}"
+    fields = {}
+    for role in _PLACEMENT_MAP_ROLES:
+        indices = data.get(role, [])
+        assert isinstance(indices, list) and all(
+            isinstance(i, int) and not isinstance(i, bool) for i in indices
+        ), f"placement map role {role!r} must be a list of ints, got {indices!r}"
+        fields[role] = tuple(indices)
+    return PlacementMap(**fields)
+
+
+def validate_placement_map(pm: PlacementMap, *, trainer_num_gpus: int, rollout_num_gpus: int) -> None:
+    """Reject duplicates, out-of-range or overlapping indices, gaps, and role sizes that disagree with the args."""
+    n = pm.num_bundles
+    for role in _PLACEMENT_MAP_ROLES:
+        indices = getattr(pm, role)
+        dups = sorted({i for i in indices if indices.count(i) > 1})
+        assert not dups, f"placement map role {role!r} repeats bundles {dups}"
+        out_of_range = sorted(i for i in indices if not 0 <= i < n)
+        assert not out_of_range, f"placement map role {role!r} names bundles {out_of_range} outside 0..{n - 1}"
+    for a_index, a in enumerate(_PLACEMENT_MAP_ROLES):
+        for b in _PLACEMENT_MAP_ROLES[a_index + 1 :]:
+            overlap = sorted(set(getattr(pm, a)) & set(getattr(pm, b)))
+            assert not overlap, f"placement map roles {a!r} and {b!r} share bundles {overlap}"
+    assert (
+        len(pm.trainer) == trainer_num_gpus
+    ), f"placement map gives the trainer {len(pm.trainer)} bundles but the args ask for {trainer_num_gpus}"
+    assert (
+        len(pm.rollout) == rollout_num_gpus
+    ), f"placement map gives rollout {len(pm.rollout)} bundles but the args ask for {rollout_num_gpus}"
+
+
+def _slice_pg_info(info: PlacementGroupInfo, indices: tuple[int, ...]) -> PlacementGroupInfo:
+    return PlacementGroupInfo(
+        info.pg,
+        [info.pg_reordered_bundle_indices[i] for i in indices],
+        [info.pg_reordered_gpu_ids[i] for i in indices],
+    )
+
+
+def create_placement_groups(
+    args, *, placement_map: "PlacementMap | str | dict | None" = None
+) -> dict[str, PlacementGroupInfo]:
+    """Create placement groups for actor and rollout engines.
+
+    With an explicit ``placement_map`` (or ``--yeto-placement-map``) every role gets exactly the logical bundles
+    the map names, and a ``standby`` entry holds the reserved bundles no role starts on. Without one the layout is
+    the trainer-then-rollout offset split.
+    """
     num_gpus, rollout_offset = _get_placement_group_layout(args)
+
+    if placement_map is None:
+        placement_map = getattr(args, "yeto_placement_map", None)
+    if (pm := parse_placement_map(placement_map)) is not None:
+        return _create_placement_groups_from_map(args, pm, num_gpus=num_gpus, rollout_offset=rollout_offset)
 
     logger.info(f"Creating placement group with {num_gpus} GPUs...")
     pg, actor_pg_reordered_bundle_indices, actor_pg_reordered_gpu_ids = _create_placement_group(num_gpus)
@@ -156,6 +230,24 @@ def create_placement_groups(args) -> dict[str, PlacementGroupInfo]:
     ans = {
         "actor": PlacementGroupInfo(pg, actor_pg_reordered_bundle_indices, actor_pg_reordered_gpu_ids),
         "rollout": PlacementGroupInfo(pg, rollout_pg_reordered_bundle_indices, rollout_pg_reordered_gpu_ids),
+    }
+    if args.use_critic:
+        ans["critic"] = ans["actor"]
+    return ans
+
+
+def _create_placement_groups_from_map(
+    args, pm: PlacementMap, *, num_gpus: int, rollout_offset: int
+) -> dict[str, PlacementGroupInfo]:
+    assert not args.colocate, "--yeto-placement-map splits GPUs between roles and cannot be combined with --colocate"
+    validate_placement_map(pm, trainer_num_gpus=rollout_offset, rollout_num_gpus=num_gpus - rollout_offset)
+
+    logger.info(f"Creating placement group with {pm.num_bundles} GPUs from explicit map {pm}...")
+    full = PlacementGroupInfo(*_create_placement_group(pm.num_bundles))
+    ans = {
+        "actor": _slice_pg_info(full, pm.trainer),
+        "rollout": _slice_pg_info(full, pm.rollout),
+        STANDBY_PG_NAME: _slice_pg_info(full, pm.standby),
     }
     if args.use_critic:
         ans["critic"] = ans["actor"]
