@@ -309,16 +309,26 @@ def _load_dp_invariant_state(
     named = [s["optimizer_named"] for s in shards.values() if s.get("optimizer_named") is not None]
     merged = None
     if optimizer is not None and load_optimizer and named:
-        # Gather (and validate coverage) before any write as well.
+        # Gather and validate against this optimizer before any write as well.
         merged = dp_invariant_state.merge_named_optimizer_states(named)
+        dp_invariant_state.check_named_optimizer_state(optimizer, _named_parameters(model), merged)
 
+    backup = {name: p.detach().clone() for name, p in _named_parameters(model) if _is_adapter_param_name(name)}
     _copy_adapter_state(model, torch.load(adapter_file, map_location="cpu", weights_only=True), source=adapter_file)
     if not shards:
         return True, None, False
     reference = own if own is not None else shards[min(shards)]
     optimizer_restored = False
     if merged is not None:
-        dp_invariant_state.load_named_optimizer_state(optimizer, _named_parameters(model), merged)
+        try:
+            dp_invariant_state.load_named_optimizer_state(optimizer, _named_parameters(model), merged)
+        except BaseException:
+            # validated above, so this is unexpected: put the adapter back so the model is as before the load;
+            # the optimizer may be partly written and must not be used
+            for name, p in _named_parameters(model):
+                if name in backup:
+                    p.data.copy_(backup[name])
+            raise
         optimizer_restored = True
     if opt_param_scheduler is not None and reference.get("opt_param_scheduler") is not None:
         opt_param_scheduler.load_state_dict(reference["opt_param_scheduler"])

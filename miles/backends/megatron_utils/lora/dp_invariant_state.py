@@ -259,7 +259,7 @@ def merge_named_optimizer_states(shards: Sequence[Mapping[str, Any]]) -> dict[st
                 raise DpInvariantStateError(f"DP shards disagree on the state keys of {name!r}")
             if not _equal(target["scalars"], entry["scalars"]):
                 raise DpInvariantStateError(f"DP shards disagree on the scalar state (e.g. step) of {name!r}")
-            if target["hyper"] != entry["hyper"]:
+            if not _equal(target["hyper"], entry["hyper"]):
                 raise DpInvariantStateError(f"DP shards disagree on the hyperparameters of {name!r}")
             overlap = covered[name][start:end]
             for key, piece in entry["tensors"].items():
@@ -276,33 +276,49 @@ def merge_named_optimizer_states(shards: Sequence[Mapping[str, Any]]) -> dict[st
     return merged
 
 
-def load_named_optimizer_state(optimizer: Any, named_params, merged: Mapping[str, Mapping[str, Any]]) -> None:
-    """Scatter the merged (gathered) state onto the ranges this rank's optimizer owns."""
-    for leaf in _optimizer_leaves(optimizer):
-        if _is_distributed(leaf) and not leaf.optimizer.state:
-            # A freshly built DistOpt has no state tensors yet; Megatron's own loaders initialize them first.
-            leaf._init_optimizer_states_with_dummy_values()
+def check_named_optimizer_state(optimizer: Any, named_params, merged: Mapping[str, Mapping[str, Any]]) -> None:
+    """Validate that ``merged`` fits this rank's optimizer without writing anything (names, sizes, groups)."""
     slots = optimizer_slots(optimizer, named_params)
     missing = sorted(slot.name for slot in slots if slot.name not in merged)
     if missing:
         raise KeyError(f"named optimizer state lacks parameters {missing}")
     for slot in slots:
-        full = merged[slot.name]
-        if full["numel"] != slot.model_param.numel():
+        if merged[slot.name]["numel"] != slot.model_param.numel():
             raise DpInvariantStateError(
-                f"{slot.name!r} has {slot.model_param.numel()} elements, the checkpoint {full['numel']}"
+                f"{slot.name!r} has {slot.model_param.numel()} elements, the checkpoint {merged[slot.name]['numel']}"
             )
-        tensors = {k: v[slot.start : slot.end] for k, v in full["tensors"].items()}
-        tensors.update({k: v.clone() for k, v in full["scalars"].items()})
-        slot.set(tensors)
+    for names in _names_by_group(slots).values():
+        hypers = [merged[n]["hyper"] for n in names[1]]
+        if any(not _equal(h, hypers[0]) for h in hypers):
+            raise DpInvariantStateError(f"parameters {names[1]} come from groups with different hyperparameters")
+
+
+def _names_by_group(slots) -> dict[int, tuple[dict, list[str]]]:
     groups: dict[int, tuple[dict, list[str]]] = {}
     for slot in slots:
         groups.setdefault(id(slot.group), (slot.group, []))[1].append(slot.name)
-    for group, names in groups.values():
-        hypers = [merged[n]["hyper"] for n in names]
-        if any(h != hypers[0] for h in hypers):
-            raise DpInvariantStateError(f"parameters {names} come from groups with different hyperparameters")
-        group.update(copy.deepcopy(hypers[0]))
+    return groups
+
+
+def load_named_optimizer_state(optimizer: Any, named_params, merged: Mapping[str, Mapping[str, Any]]) -> None:
+    """Scatter the merged (gathered) state onto the ranges this rank's optimizer owns.
+
+    Everything is validated (``check_named_optimizer_state``) before the optimizer is touched.
+    """
+    named_params = list(named_params)
+    check_named_optimizer_state(optimizer, named_params, merged)
+    for leaf in _optimizer_leaves(optimizer):
+        if _is_distributed(leaf) and not leaf.optimizer.state:
+            # A freshly built DistOpt has no state tensors yet; Megatron's own loaders initialize them first.
+            leaf._init_optimizer_states_with_dummy_values()
+    slots = optimizer_slots(optimizer, named_params)
+    for slot in slots:
+        full = merged[slot.name]
+        tensors = {k: v[slot.start : slot.end] for k, v in full["tensors"].items()}
+        tensors.update({k: v.clone() for k, v in full["scalars"].items()})
+        slot.set(tensors)
+    for group, names in _names_by_group(slots).values():
+        group.update(copy.deepcopy(merged[names[0]]["hyper"]))
 
 
 def _equal(a: Any, b: Any) -> bool:

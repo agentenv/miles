@@ -508,6 +508,64 @@ class TestDistributedOptimizerEndToEnd:
         assert torch.equal(target.lora_A.data, torch.zeros(2, 2))
 
 
+class TestLoadValidatesBeforeWriting:
+    def _save_bf16_dist(self, tmp_path, monkeypatch):
+        model = _Bf16Model(0)
+        init = {p: p.detach().float() for p in _params_of(model)}
+        opt = _DistOpt(_params_of(model), init, dp_rank=0, dp_size=1)
+        opt.step(_grads(model, 1))
+        _patch_parallel_state(monkeypatch, dp_rank=0, dp_size=1)
+        args = Namespace(megatron_to_hf_mode="bridge", no_save_optim=False, lora_dp_invariant_state=True)
+        lora_utils.save_lora_checkpoint(
+            [model],
+            args,
+            str(tmp_path / "ckpt"),
+            publisher=SimpleNamespace(write_adapter=lambda *_: None),
+            optimizer=opt,
+            opt_param_scheduler=None,
+            iteration=1,
+        )
+        return tmp_path / "ckpt"
+
+    def test_an_optimizer_that_does_not_fit_leaves_the_adapter_untouched(self, tmp_path, monkeypatch):
+        ckpt = self._save_bf16_dist(tmp_path, monkeypatch)
+        target = _Bf16Model(5)
+        before = {n: p.detach().clone() for n, p in target.named_parameters()}
+        # the target optimizer also updates a parameter the checkpoint does not have
+        extra = torch.nn.Parameter(torch.zeros(3))
+        target.register_parameter("lora_C", extra)
+        opt = torch.optim.AdamW(list(target.parameters()))
+
+        with pytest.raises(KeyError, match="lacks parameters"):
+            lora_utils.load_lora_adapter([target], str(ckpt), optimizer=opt, dp_invariant=True)
+        for n, p in target.named_parameters():
+            if n in before:
+                assert torch.equal(p, before[n])
+
+    def test_a_failing_optimizer_write_restores_the_adapter(self, tmp_path, monkeypatch):
+        ckpt = self._save_bf16_dist(tmp_path, monkeypatch)
+        target = _Bf16Model(5)
+        before = {n: p.detach().clone() for n, p in target.named_parameters()}
+        zeros = {p: torch.zeros(p.shape) for p in _params_of(target)}
+        opt = _DistOpt(_params_of(target), zeros, dp_rank=0, dp_size=1)
+        monkeypatch.setattr(
+            dps, "load_named_optimizer_state", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("write failed"))
+        )
+
+        with pytest.raises(RuntimeError, match="write failed"):
+            lora_utils.load_lora_adapter([target], str(ckpt), optimizer=opt, dp_invariant=True)
+        for n, p in target.named_parameters():
+            assert torch.equal(p, before[n])
+
+    def test_tensor_valued_hyperparameters_are_compared_by_value(self):
+        model = _Model(0)
+        opt = torch.optim.Adam([{"params": list(model.params.values()), "lr": torch.tensor(0.1)}])
+        _step(model, opt, 1)
+        a, b = _export(model, opt), _export(model, opt)  # separate tensor objects, equal values
+        merged = dps.merge_named_optimizer_states([a, b])
+        dps.load_named_optimizer_state(opt, _named(model), merged)
+
+
 class TestArgumentFailFast:
     """Validation runs on the args as ``parse_args`` leaves them, i.e. after ``set_default_megatron_args``."""
 
