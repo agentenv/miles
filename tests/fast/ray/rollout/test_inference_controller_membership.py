@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pytest
 from tests.fast.ray.rollout.test_inference_controller import _FakeWorkerProvider, _make_controller, _RecordingServer
 
-from miles.ray.rollout.inference_controller import MembershipEpochMismatchError
+from miles.ray.rollout.inference_controller import MembershipEpochMismatchError, MembershipIncompleteError
 
 _DECLARED = ["engine-0", "engine-1", "engine-2"]
 
@@ -123,3 +123,60 @@ class TestExplicitCellMembership:
         controller, _, _ = _controller()
         with pytest.raises(AssertionError, match="at least one cell"):
             await controller.stop_cells([], expected_epoch=0)
+
+
+class TestHalfFailedStop:
+    async def test_a_failed_stop_is_recorded_and_only_its_retry_is_accepted(self):
+        srv = _RecordingServer(server_cells={"engine-0": SimpleNamespace(), "engine-1": SimpleNamespace()})
+        controller, provider, _ = _controller(servers={"default": srv})
+        provider.fail_next = RuntimeError("kill failed")
+
+        with pytest.raises(RuntimeError, match="kill failed"):
+            await controller.stop_cells(["engine-0"], expected_epoch=0)
+
+        assert "engine-0" not in srv.server_cells
+        assert await controller.get_membership_status() == dict(epoch=0, incomplete=["stop", ["engine-0"]])
+        with pytest.raises(MembershipIncompleteError, match="retry it before"):
+            await controller.start_cells(["engine-2"], expected_epoch=0)
+        with pytest.raises(MembershipIncompleteError):
+            await controller.start_update_weights(members=["engine-1"], expected_epoch=0)
+
+        assert await controller.stop_cells(["engine-0"], expected_epoch=0) == 1
+        assert await controller.get_membership_status() == dict(epoch=1, incomplete=None)
+
+
+class _TrackedCell:
+    def __init__(self, ready: bool) -> None:
+        self.is_pending_weights_or_serving = ready
+
+
+class TestWaitCellsTracked:
+    async def test_it_returns_once_the_watch_has_added_the_started_cells(self):
+        srv = _RecordingServer(server_cells={})
+        controller, _, _ = _controller(servers={"default": srv})
+        polls = 0
+
+        def _watch_step() -> None:
+            nonlocal polls
+            polls += 1
+            if polls == 1:
+                srv.server_cells["engine-1"] = _TrackedCell(ready=False)
+            else:
+                srv.server_cells["engine-1"].is_pending_weights_or_serving = True
+
+        original_find = controller._find_cell_or_none
+
+        def _find_after_a_watch_step(cell_id):
+            _watch_step()
+            return original_find(cell_id)
+
+        controller._find_cell_or_none = _find_after_a_watch_step
+
+        await controller.wait_cells_tracked(["engine-1"], timeout_seconds=10, poll_interval_seconds=0)
+        assert polls == 2
+
+    async def test_it_times_out_with_the_missing_cells(self):
+        controller, _, _ = _controller(servers={"default": _RecordingServer(server_cells={})})
+
+        with pytest.raises(TimeoutError, match="engine-7"):
+            await controller.wait_cells_tracked(["engine-7"], timeout_seconds=0, poll_interval_seconds=0)

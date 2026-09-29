@@ -47,11 +47,16 @@ class MembershipEpochMismatchError(RuntimeError):
     pass
 
 
+class MembershipIncompleteError(RuntimeError):
+    """A membership change failed half way; only a retry of that same change is accepted until it succeeds."""
+
+
 @enforce_lock_discipline
 class InferenceController:
     # class-level defaults so a controller built without __init__ (tests) still has a membership epoch
     _membership_epoch: int = 0
     _last_membership_op: tuple[str, tuple[str, ...]] | None = None
+    _membership_incomplete: tuple[str, tuple[str, ...]] | None = None
 
     @lock_exempt
     def __init__(
@@ -103,6 +108,42 @@ class InferenceController:
     async def get_membership_epoch(self) -> int:
         return self._membership_epoch
 
+    @lock_exempt
+    async def get_membership_status(self) -> dict[str, Any]:
+        """The epoch plus the change that failed half way (``[op, cell_ids]``) and must be retried, if any."""
+        incomplete = self._membership_incomplete
+        return dict(
+            epoch=self._membership_epoch,
+            incomplete=None if incomplete is None else [incomplete[0], list(incomplete[1])],
+        )
+
+    @with_lock
+    async def wait_cells_tracked(
+        self,
+        cell_ids: list[str],
+        *,
+        timeout_seconds: float = CELLS_READY_TIMEOUT_SECONDS,
+        poll_interval_seconds: float = CELLS_READY_POLL_INTERVAL_SECONDS,
+    ) -> None:
+        """Wait until every cell was taken in by a server and is PendingWeights or Serving.
+
+        start_cells returns once the workers run; the cells join the servers through the provider watch later, so a
+        member publish right after start_cells must wait here first.
+        """
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            missing = [
+                cell_id
+                for cell_id in cell_ids
+                if (cell := self._find_cell_or_none(cell_id)) is None or not cell.is_pending_weights_or_serving
+            ]
+            if not missing:
+                return
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"cells {missing} were not ready to take weights after {timeout_seconds}s")
+            async with self.context_lock.with_released():
+                await asyncio.sleep(poll_interval_seconds)
+
     @with_lock
     async def start_cells(self, cell_ids: list[str], *, expected_epoch: int) -> int:
         """Start pre-declared engine cells and return the new membership epoch.
@@ -126,6 +167,11 @@ class InferenceController:
         if self._last_membership_op == (op, ids) and expected_epoch == current - 1:
             logger.info(f"{op}_cells {list(ids)} already committed as epoch {current}; not acting again")
             return current
+        if (incomplete := self._membership_incomplete) is not None and incomplete != (op, ids):
+            raise MembershipIncompleteError(
+                f"{incomplete[0]}_cells {list(incomplete[1])} failed half way at epoch {current}; retry it before "
+                f"asking for {op}_cells {list(ids)}"
+            )
         if expected_epoch != current:
             raise MembershipEpochMismatchError(
                 f"{op}_cells {list(ids)} expected membership epoch {expected_epoch}, but it is {current}"
@@ -140,14 +186,24 @@ class InferenceController:
             raise KeyError(f"cells {unknown} were not declared at startup; declared cells are {sorted(declared)}")
 
         if op == "stop":
-            for srv in self.servers.values():
-                for cell_id in ids:
-                    if cell_id in srv.server_cells:
-                        await srv.remove_cell(cell_id)
-            await provider.stop_cells(cell_ids=list(ids))
+            # Deregistering first keeps traffic off cells that are going away. If stopping then fails, the cells are
+            # out of routing but may still run (the watch re-adds them as PendingWeights, not routed); the epoch
+            # stays and only this same stop is accepted until it succeeds.
+            try:
+                for srv in self.servers.values():
+                    for cell_id in ids:
+                        if cell_id in srv.server_cells:
+                            await srv.remove_cell(cell_id)
+                await provider.stop_cells(cell_ids=list(ids))
+            except BaseException:
+                self._membership_incomplete = (op, ids)
+                logger.error(f"stop_cells {list(ids)} failed half way at epoch {current}; retry the same stop")
+                raise
         else:
+            # the worker manager rolls a failed start back, so a failed start leaves membership unchanged
             await provider.start_cells(cell_ids=list(ids))
 
+        self._membership_incomplete = None
         self._membership_epoch = current + 1
         self._last_membership_op = (op, ids)
         logger.info(f"{op}_cells {list(ids)} committed membership epoch {self._membership_epoch}")
@@ -339,17 +395,21 @@ class InferenceController:
 
     @acquires_lock
     async def start_update_weights(
-        self, model_id: str | None = None, members: list[str] | None = None
+        self, model_id: str | None = None, members: list[str] | None = None, expected_epoch: int | None = None
     ) -> "UpdatableEngines":
         """Return engines eligible for weight updates.
 
         ``members`` restricts the update to exactly these cell ids of the updatable server: only they are waited for,
         returned, and snapshotted, so ``end_update_weights`` marks only them ready and every other cell keeps its
-        state. ``None`` (the default) means every cell.
+        state. ``None`` (the default) means every cell. A member publish must name the membership ``expected_epoch``
+        it was planned for; the returned engines carry that epoch, and since membership changes take this lock the
+        epoch cannot move before ``end_update_weights``.
         """
         await self._health_monitoring_pause(model_id)
         if members is not None:
-            return await self._start_member_update_weights(model_id=model_id, members=members)
+            return await self._start_member_update_weights(
+                model_id=model_id, members=members, expected_epoch=expected_epoch
+            )
         await self._ensure_cells_ready(model_id=model_id)
 
         srv = self._get_updatable_server(model_id=model_id)
@@ -369,14 +429,27 @@ class InferenceController:
         )
 
     @requires_lock
-    async def _start_member_update_weights(self, *, model_id: str | None, members: list[str]) -> "UpdatableEngines":
+    async def _start_member_update_weights(
+        self, *, model_id: str | None, members: list[str], expected_epoch: int | None
+    ) -> "UpdatableEngines":
+        if expected_epoch is None:
+            raise ValueError("a member publish needs the membership expected_epoch it was planned for")
+        if expected_epoch != self._membership_epoch:
+            raise MembershipEpochMismatchError(
+                f"publish to {members} expected membership epoch {expected_epoch}, but it is {self._membership_epoch}"
+            )
+        if (incomplete := self._membership_incomplete) is not None:
+            raise MembershipIncompleteError(
+                f"{incomplete[0]}_cells {list(incomplete[1])} failed half way; retry it first"
+            )
         srv = self._get_updatable_server(model_id=model_id)
         assert srv is not None, f"no updatable server to publish members {members} to"
         wanted = set(members)
         unknown = sorted(wanted - set(srv.server_cells))
         if unknown:
             raise KeyError(
-                f"members {unknown} are not cells of {srv.model_name}; its cells are {sorted(srv.server_cells)}"
+                f"members {unknown} are not cells of {srv.model_name} (yet); its cells are "
+                f"{sorted(srv.server_cells)}. After start_cells, call wait_cells_tracked before publishing to them"
             )
         await self._ensure_cells_ready(model_id=model_id, cell_ids=wanted)
         cells = sorted(
@@ -388,6 +461,7 @@ class InferenceController:
             engine_gpu_counts=[cell.meta.num_gpus_per_engine for cell in cells],
             engine_gpu_offsets=[cell.meta.gpu_offset for cell in cells],
             snapshot_cell_id_to_hashes={cell.meta.cell_id: cell.meta.workers_hash for cell in cells},
+            membership_epoch=expected_epoch,
         )
 
     @releases_lock
@@ -556,6 +630,8 @@ class UpdatableEngines:
     engine_gpu_counts: list[int]
     engine_gpu_offsets: list[int]
     snapshot_cell_id_to_hashes: dict[str, str]
+    # set only for a member publish: the membership epoch the member set belongs to
+    membership_epoch: int | None = None
 
 
 # TODO may move and generalize later

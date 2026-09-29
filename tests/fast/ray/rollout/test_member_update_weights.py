@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from tests.fast.ray.rollout.test_inference_controller import _make_controller, _RecordingServer
 
-from miles.ray.rollout.inference_controller import UpdatableEngines
+from miles.ray.rollout.inference_controller import MembershipEpochMismatchError, UpdatableEngines
 
 
 class _Cell:
@@ -39,7 +39,7 @@ class TestMemberFilteredUpdateWeights:
         """A not-ready cell outside the member set must not block the publish either."""
         controller, _, cells = _setup()
 
-        info = await controller.start_update_weights(members=["e1", "e0"])
+        info = await controller.start_update_weights(members=["e1", "e0"], expected_epoch=0)
         await controller.end_update_weights(snapshot_cell_id_to_hashes=info.snapshot_cell_id_to_hashes)
 
         assert info == UpdatableEngines(
@@ -47,13 +47,14 @@ class TestMemberFilteredUpdateWeights:
             engine_gpu_counts=[1, 1],
             engine_gpu_offsets=[0, 1],
             snapshot_cell_id_to_hashes={"e0": "h0", "e1": "h1"},
+            membership_epoch=0,
         )
 
     async def test_end_marks_only_members_ready_and_leaves_the_rest_untouched(self):
         controller, _, cells = _setup()
         cells["e2"].is_pending_weights_or_serving = True
 
-        info = await controller.start_update_weights(members=["e2"])
+        info = await controller.start_update_weights(members=["e2"], expected_epoch=0)
         await controller.end_update_weights(snapshot_cell_id_to_hashes=info.snapshot_cell_id_to_hashes)
 
         assert {cid: c.marked_ready for cid, c in cells.items()} == {"e0": 0, "e1": 0, "e2": 1}
@@ -62,7 +63,7 @@ class TestMemberFilteredUpdateWeights:
         controller, _, _ = _setup()
 
         with pytest.raises(KeyError, match="e9"):
-            await controller.start_update_weights(members=["e0", "e9"])
+            await controller.start_update_weights(members=["e0", "e9"], expected_epoch=0)
 
         assert not controller.context_lock._lock.locked()
 
@@ -82,6 +83,23 @@ class TestMemberFilteredUpdateWeights:
         assert set(info.snapshot_cell_id_to_hashes) == {"e0", "e1", "e2"}
 
 
+class TestMemberPublishEpoch:
+    async def test_a_member_publish_needs_an_epoch(self):
+        controller, _, _ = _setup()
+        with pytest.raises(ValueError, match="expected_epoch"):
+            await controller.start_update_weights(members=["e0"])
+        assert not controller.context_lock._lock.locked()
+
+    async def test_a_stale_epoch_is_refused(self):
+        controller, _, cells = _setup()
+        controller._membership_epoch = 2
+
+        with pytest.raises(MembershipEpochMismatchError, match="expected membership epoch 1, but it is 2"):
+            await controller.start_update_weights(members=["e0"], expected_epoch=1)
+        assert not controller.context_lock._lock.locked()
+        assert cells["e0"].marked_ready == 0
+
+
 class TestUpdateWeightsForwardsMembers:
     async def test_members_reach_the_controller_only_when_given(self, monkeypatch):
         from argparse import Namespace
@@ -99,7 +117,34 @@ class TestUpdateWeightsForwardsMembers:
         controller = MagicMock(start_update_weights=AsyncMock(), end_update_weights=AsyncMock())
 
         await update_weights(args, actor, MagicMock(), controller)
-        await update_weights(args, actor, MagicMock(), controller, members=["e1"])
+        await update_weights(args, actor, MagicMock(), controller, members=["e1"], expected_epoch=3)
 
         assert controller.start_update_weights.await_args_list[0].kwargs == {"model_id": None}
-        assert controller.start_update_weights.await_args_list[1].kwargs == {"model_id": None, "members": ["e1"]}
+        assert controller.start_update_weights.await_args_list[1].kwargs == {
+            "model_id": None,
+            "members": ["e1"],
+            "expected_epoch": 3,
+        }
+
+    async def test_a_member_publish_leaves_the_executor_weight_version_alone(self, monkeypatch):
+        """Non-members may still serve the old weights, so the run-wide version must not move yet."""
+        from argparse import Namespace
+
+        from miles.ray import placement_group as placement_group_module
+        from miles.ray.placement_group import update_weights
+
+        monkeypatch.setattr(
+            placement_group_module,
+            "FTTestActionOrchestrationExecutor",
+            MagicMock(from_args=MagicMock(return_value=MagicMock(run_after_step=AsyncMock()))),
+        )
+        args = Namespace(debug_train_only=True, debug_rollout_only=False)
+        actor = MagicMock(update_weights=AsyncMock(return_value=9))
+        controller = MagicMock(start_update_weights=AsyncMock(), end_update_weights=AsyncMock())
+        executor = MagicMock(set_weight_version=AsyncMock())
+
+        assert await update_weights(args, actor, executor, controller, members=["e1"], expected_epoch=0) == 9
+        executor.set_weight_version.assert_not_awaited()
+
+        assert await update_weights(args, actor, executor, controller) == 9
+        executor.set_weight_version.assert_awaited_once_with(9, trainer_model_id=None)

@@ -443,14 +443,21 @@ async def update_weights(
     rollout_id: int | None = None,
     trainer_model_id: str | None = None,
     members: list[str] | None = None,
-) -> None:
-    """Publish the actor weights; ``members`` (cell ids) restricts the publish to those engines only."""
+    expected_epoch: int | None = None,
+) -> int | None:
+    """Publish the actor weights and return the weight version the trainer reported.
+
+    ``members`` (cell ids, with the membership ``expected_epoch``) restricts the publish to those engines only. A
+    member publish does not set the executor's weight version: non-members may still serve an older version, so the
+    caller sets it once every serving engine carries the returned version.
+    """
     orchestration_executor = FTTestActionOrchestrationExecutor.from_args(args, trainer_model_id=trainer_model_id)
     if rollout_id is not None:
         await orchestration_executor.run_after_step(rollout_id=rollout_id)
 
     info: UpdatableEngines = await inference_controller.start_update_weights(
-        model_id=trainer_model_id, **({} if members is None else dict(members=members))
+        model_id=trainer_model_id,
+        **({} if members is None else dict(members=members, expected_epoch=expected_epoch)),
     )
     try:
         weight_version = await actor_model.update_weights(info=info, rollout_id=rollout_id)
@@ -463,8 +470,9 @@ async def update_weights(
         args, inference_controller=inference_controller, rollout_id=rollout_id, trainer_model_id=trainer_model_id
     )
 
-    if weight_version is not None:
+    if weight_version is not None and members is None:
         await rollout_executor.set_weight_version(weight_version, trainer_model_id=trainer_model_id)
+    return weight_version
 
 
 async def _maybe_log_inference_engine_weight_checksums(
