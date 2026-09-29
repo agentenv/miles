@@ -16,6 +16,7 @@ DRIVEN_METHODS = (
     "update_weights",
     "get_deployment_identity",
     "get_train_parallel_config",
+    "run_plugin",
     "get_cell_statuses",
     "onload",
     "offload",

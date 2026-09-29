@@ -25,6 +25,7 @@ from miles.utils.audit_utils.witness.allocator import WitnessInfo
 from miles.utils.distributed_utils import init_gloo_group, one_rank_at_a_time
 from miles.utils.dp_schedule import TrainParallelConfig
 from miles.utils.flops_utils import ModelFlops, model_flops_from_hf_config
+from miles.utils.function_registry import load_function
 from miles.utils.ft_utils.heartbeat_utils import HeartbeatStatus, SimpleHeartbeat
 from miles.utils.ft_utils.indep_dp import IndepDPInfo
 from miles.utils.hf_utils.config import load_hf_config
@@ -331,3 +332,13 @@ class TrainRayActor(NodeProbeMixin):
 
     def get_train_parallel_config(self) -> TrainParallelConfig | None:
         return self.train_parallel_config
+
+    def run_plugin(self, fn_path: str, kwargs: dict[str, Any] | None = None) -> Any:
+        """Run ``fn(actor, **kwargs)`` inside this worker, ``fn`` loaded by dotted path.
+
+        Lets out-of-tree code (e.g. state export/import) execute per rank without
+        subclassing the actor. Under ``--worker-comm-backend rpc`` kwargs and the
+        result must be wire (JSON) serializable.
+        """
+        fn = load_function(fn_path, sync_required=True)
+        return fn(self, **(kwargs or {}))
