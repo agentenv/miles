@@ -363,7 +363,9 @@ async def rebuild_training_models(
     (controllers and engines) is stopped, its specs are rebuilt from ``args`` (e.g. a new
     ``actor_num_gpus_per_node``), ``trainer_pg_view`` (bundles of the startup placement group) becomes the "actor"
     view when given, and ``create_training_models`` starts over; state comes back through the normal load path.
-    It does not use the fault-tolerance cell refresh or indep-DP healing. ``worker_manager`` is the
+    A failure at any stage raises ``TrainerRebuildError`` (stage + cleanup outcome) after stopping the trainer
+    pools again; there is no automatic rollback. It does not use the fault-tolerance cell refresh or indep-DP
+    healing. ``worker_manager`` is the
     RayWorkerManager actor handle (or an object with the same async methods).
     """
     assert not args.use_fault_tolerance, "rebuild_training_models is not a fault-tolerance path"
@@ -380,15 +382,45 @@ async def rebuild_training_models(
 
     specs = [*specs_trainer_controller(args), *specs_trainer(args)]
     pool_ids = [spec.name for spec in specs]
-    await _call_manager(worker_manager.stop_pools, pool_ids)
-    if trainer_pg_view is not None:
-        # every trainer spec (actor and critic) schedules on the "actor" view
-        await _call_manager(worker_manager.set_pg_view, "actor", trainer_pg_view)
-    for spec in specs:
-        await _call_manager(worker_manager.replace_pool_spec, spec)
-    await _call_manager(worker_manager.start_pools, pool_ids)
+    stage = "stop_pools"
+    try:
+        await _call_manager(worker_manager.stop_pools, pool_ids)
+        if trainer_pg_view is not None:
+            stage = "set_pg_view"
+            # every trainer spec (actor and critic) schedules on the "actor" view; their pools are replaced next
+            await _call_manager(worker_manager.set_pg_view, "actor", trainer_pg_view, replacing_pools=pool_ids)
+        stage = "replace_pool_spec"
+        for spec in specs:
+            await _call_manager(worker_manager.replace_pool_spec, spec)
+        stage = "start_pools"
+        await _call_manager(worker_manager.start_pools, pool_ids)
+        stage = "create_training_models"
+        return await create_training_models(args, rollout_executor)
+    except Exception as error:
+        # No rollback to the old trainer: its controllers are already disposed. Stop whatever was started so no
+        # half-built trainer keeps bundles, and report the stage; the caller rebuilds again (e.g. with the previous
+        # args and view) and restores state from its cut.
+        try:
+            await _call_manager(worker_manager.stop_pools, pool_ids)
+            cleanup_error = None
+        except Exception as stop_error:  # noqa: BLE001
+            cleanup_error = stop_error
+        raise TrainerRebuildError(stage=stage, pool_ids=pool_ids, cleanup_error=cleanup_error) from error
 
-    return await create_training_models(args, rollout_executor)
+
+class TrainerRebuildError(RuntimeError):
+    """``rebuild_training_models`` failed at ``stage``; the old trainer is gone and no trainer is running.
+
+    ``cleanup_error`` is set when stopping the trainer pools after the failure failed too; then workers of
+    ``pool_ids`` may still hold bundles and must be stopped before the next rebuild.
+    """
+
+    def __init__(self, *, stage: str, pool_ids: list[str], cleanup_error: BaseException | None) -> None:
+        self.stage, self.pool_ids, self.cleanup_error = stage, pool_ids, cleanup_error
+        state = (
+            "trainer pools stopped" if cleanup_error is None else f"stopping trainer pools failed: {cleanup_error!r}"
+        )
+        super().__init__(f"trainer rebuild failed at {stage}; the old trainer is disposed; {state}")
 
 
 async def _call_manager(method, *args, **kwargs):

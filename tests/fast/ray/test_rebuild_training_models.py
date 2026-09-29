@@ -7,7 +7,7 @@ import pytest
 from tests.fast.fixtures.args_fixtures import parser_defaults
 
 from miles.ray import placement_group as placement_group_module
-from miles.ray.placement_group import PlacementGroupInfo, rebuild_training_models
+from miles.ray.placement_group import PlacementGroupInfo, TrainerRebuildError, rebuild_training_models
 
 
 class _Manager:
@@ -17,8 +17,9 @@ class _Manager:
     async def stop_pools(self, pool_ids):
         self.events.append(("stop_pools", tuple(pool_ids)))
 
-    async def set_pg_view(self, name, info):
+    async def set_pg_view(self, name, info, *, replacing_pools=()):
         self.events.append(("set_pg_view", name, tuple(info.pg_reordered_bundle_indices)))
+        self.replacing_pools = tuple(replacing_pools)
 
     async def replace_pool_spec(self, spec):
         self.events.append(("replace_pool_spec", spec.name, spec.scheduling.num_workers_per_cell))
@@ -106,3 +107,58 @@ class TestRebuildTrainingModels:
                 _args(**overrides), "executor", old_handles={}, worker_manager=_Manager(events)
             )
         assert events == []
+
+
+class TestRebuildFailure:
+    _VIEW = PlacementGroupInfo(pg="pg", pg_reordered_bundle_indices=[0, 1], pg_reordered_gpu_ids=[0, 1])
+
+    async def test_the_view_exempts_exactly_the_pools_being_replaced(self, events):
+        manager = _Manager(events)
+        await rebuild_training_models(
+            _args(), "executor", old_handles={}, worker_manager=manager, trainer_pg_view=self._VIEW
+        )
+        replaced = tuple(e[1] for e in events if e[0] == "replace_pool_spec")
+        assert manager.replacing_pools == replaced
+
+    @pytest.mark.parametrize("stage", ["replace_pool_spec", "start_pools", "create_training_models"])
+    async def test_a_failed_stage_stops_the_trainer_pools_and_names_the_stage(self, events, monkeypatch, stage):
+        manager = _Manager(events)
+        if stage == "create_training_models":
+
+            async def _fail_create(args, rollout_executor):
+                raise RuntimeError("boom")
+
+            monkeypatch.setattr(placement_group_module, "create_training_models", _fail_create)
+        else:
+
+            async def _fail(*_args, **_kwargs):
+                raise RuntimeError("boom")
+
+            setattr(manager, stage, _fail)
+
+        with pytest.raises(TrainerRebuildError, match=f"failed at {stage}") as info:
+            await rebuild_training_models(
+                _args(), "executor", old_handles={}, worker_manager=manager, trainer_pg_view=self._VIEW
+            )
+
+        assert info.value.stage == stage and info.value.cleanup_error is None
+        assert "boom" in repr(info.value.__cause__)
+        assert events[-1][0] == "stop_pools"  # cleanup ran after the failure
+
+    async def test_a_failed_cleanup_is_reported(self, events):
+        manager = _Manager(events)
+        calls = 0
+
+        async def _stop(pool_ids):
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                raise RuntimeError("stop failed")
+
+        async def _fail(*_args, **_kwargs):
+            raise RuntimeError("boom")
+
+        manager.stop_pools, manager.start_pools = _stop, _fail
+        with pytest.raises(TrainerRebuildError, match="stopping trainer pools failed") as info:
+            await rebuild_training_models(_args(), "executor", old_handles={}, worker_manager=manager)
+        assert info.value.stage == "start_pools"

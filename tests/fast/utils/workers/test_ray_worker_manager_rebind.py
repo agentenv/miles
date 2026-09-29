@@ -161,3 +161,74 @@ class TestPgViewOccupancy:
         await manager.replace_pool_spec(spec)
 
         assert manager.get_cell_infos(pool_ids=["trainer"])[cell_id].workers_hash == "pseudo-hash-2"
+
+
+class TestPgViewStoppedCellsFit:
+    def _trainer_spec(self, num_workers: int):
+        return _make_spec(
+            "trainer",
+            num_cells=1,
+            num_workers_per_cell=num_workers,
+            num_gpus_per_worker=0.4,
+            num_gpu_slots_per_worker=1,
+            pg_name="actor",
+        )
+
+    async def test_a_view_too_small_for_a_stopped_cell_is_refused(self, fake_ray_cluster: FakeRayCluster):
+        """Shrinking the view under a stopped 2-worker trainer would make its next start reach outside the view."""
+        manager = await _launch([self._trainer_spec(2)], _pgs())
+        await manager.stop_pools(["trainer"])
+
+        with pytest.raises(AssertionError, match=r"beyond the 1 bundles of the new 'actor' view"):
+            await manager.set_pg_view("actor", _view([0]))
+        assert manager.pgs["actor"].pg_reordered_gpu_ids == [10, 11]
+
+    async def test_a_pool_being_replaced_is_exempt(self, fake_ray_cluster: FakeRayCluster):
+        """P2 -> P1: the rebuild re-points the view first, then replaces the trainer spec with one worker."""
+        manager = await _launch([self._trainer_spec(2)], _pgs())
+        await manager.stop_pools(["trainer"])
+
+        await manager.set_pg_view("actor", _view([0]), replacing_pools=["trainer"])
+        [cell_id] = await manager.replace_pool_spec(self._trainer_spec(1))
+        await manager.start_pools(["trainer"])
+
+        assert manager.get_cell_bundles(cell_id) == [_BUNDLES[0]]
+
+
+class TestStartRollback:
+    async def test_a_failed_rollback_is_reported_as_such(self, fake_ray_cluster: FakeRayCluster, monkeypatch):
+        from miles.utils.workers import ray_worker_manager as rwm
+
+        manager = await _launch([_engine_spec()], _pgs())
+        cell_id = compute_cell_id(pool_id="engine", cell_index=1)
+        await manager.stop_cells([cell_id])
+
+        async def _fail(self):
+            raise RuntimeError("post_setup failed")
+
+        original_stop = rwm._CellManager.stop
+
+        async def _stop_fails_once(self):
+            await original_stop(self)
+            raise RuntimeError("stop failed")
+
+        monkeypatch.setattr(rwm._CellManager, "post_setup", _fail)
+        monkeypatch.setattr(rwm._CellManager, "stop", _stop_fails_once)
+        with pytest.raises(rwm.StartRollbackFailedError, match="during the rollback failed too") as info:
+            await manager.start_cells([cell_id])
+        assert "post_setup failed" in repr(info.value.__cause__)
+
+    async def test_a_clean_rollback_reraises_the_start_error(self, fake_ray_cluster: FakeRayCluster, monkeypatch):
+        from miles.utils.workers import ray_worker_manager as rwm
+
+        manager = await _launch([_engine_spec()], _pgs())
+        cell_id = compute_cell_id(pool_id="engine", cell_index=1)
+        await manager.stop_cells([cell_id])
+
+        async def _fail(self):
+            raise RuntimeError("post_setup failed")
+
+        monkeypatch.setattr(rwm._CellManager, "post_setup", _fail)
+        with pytest.raises(RuntimeError, match="post_setup failed"):
+            await manager.start_cells([cell_id])
+        assert not manager._find_cell(cell_id).alive

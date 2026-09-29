@@ -93,9 +93,16 @@ class RayWorkerManager:
                 await _gather_or_raise([c.launch_actors() for c in cells])
                 await _gather_or_raise([c.alloc_ports() for c in cells])
                 await _gather_or_raise([c.post_setup() for c in cells])
-            except Exception:
+            except Exception as error:
                 logger.error(f"Starting cells {[c.cell_id for c in cells]} failed, rolling back", exc_info=True)
-                await asyncio.gather(*[c.stop() for c in cells], return_exceptions=True)
+                results = await asyncio.gather(*[c.stop() for c in cells], return_exceptions=True)
+                failed = {c.cell_id: r for c, r in zip(cells, results, strict=True) if isinstance(r, BaseException)}
+                if failed:
+                    raise StartRollbackFailedError(
+                        f"starting cells {[c.cell_id for c in cells]} failed ({error!r}) and stopping "
+                        f"{sorted(failed)} during the rollback failed too ({list(failed.values())!r}); they may "
+                        f"still hold workers, stop them again"
+                    ) from error
                 raise
 
     async def stop_cells(self, cell_ids: list[str]) -> None:
@@ -128,8 +135,14 @@ class RayWorkerManager:
     async def start_pools(self, pool_ids: list[str]) -> None:
         await self.start_cells([cell.cell_id for pool_id in pool_ids for cell in self._pools[pool_id].cells])
 
-    async def set_pg_view(self, pg_name: str, info: PlacementGroupInfo) -> None:
-        """Point ``pg_name`` at another slice of the startup placement group (e.g. a new trainer bundle set)."""
+    async def set_pg_view(
+        self, pg_name: str, info: PlacementGroupInfo, *, replacing_pools: list[str] | tuple[str, ...] = ()
+    ) -> None:
+        """Point ``pg_name`` at another slice of the startup placement group (e.g. a new trainer bundle set).
+
+        Stopped cells bound to ``pg_name`` must still fit the new view (otherwise their next start would reach
+        outside it); cells of ``replacing_pools`` are exempt because the caller replaces their spec next.
+        """
         async with self._membership_lock:
             users = [c.cell_id for c in self._all_cells() if c.alive and c.pg_name == pg_name]
             assert not users, f"cells {users} run on {pg_name!r}; stop them before re-pointing it"
@@ -141,6 +154,21 @@ class RayWorkerManager:
             assert not outside, f"bundles {outside} are outside the placement group created at startup"
             assert len(wanted) == len(info.pg_reordered_bundle_indices), f"{pg_name!r} view repeats bundles"
             self._assert_bundles_free(wanted, ignore=None)
+            num_slots = len(info.pg_reordered_bundle_indices)
+            unknown_pools = sorted(set(replacing_pools) - set(self._pools))
+            assert not unknown_pools, f"unknown pools {unknown_pools}; known: {sorted(self._pools)}"
+            overflowing = {
+                c.cell_id: [slot for slot in c.all_slots() if slot >= num_slots]
+                for pool_id, pool in self._pools.items()
+                if pool_id not in replacing_pools
+                for c in pool.cells
+                if c.pg_name == pg_name and c.spec.scheduling.num_gpu_slots_per_worker > 0
+            }
+            overflowing = {cell_id: slots for cell_id, slots in overflowing.items() if slots}
+            assert not overflowing, (
+                f"stopped cells {overflowing} are bound to slots beyond the {num_slots} bundles of the new "
+                f"{pg_name!r} view; rebind them or replace their pool (replacing_pools) first"
+            )
             self.pgs = {**self.pgs, pg_name: info}
 
     async def replace_pool_spec(self, spec: BaseWorkerSpec) -> list[str]:
@@ -307,6 +335,10 @@ def _actor_manager_cls(spec: BaseWorkerSpec, *, comm_backend: WorkerCommBackend)
 
 class BundleInUseError(RuntimeError):
     pass
+
+
+class StartRollbackFailedError(RuntimeError):
+    """A start failed and the rollback that should have stopped its cells failed as well."""
 
 
 def pg_key(pg: Any) -> Any:
