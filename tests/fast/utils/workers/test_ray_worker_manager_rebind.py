@@ -6,6 +6,7 @@ from tests.fast.utils.workers.test_ray_worker_manager import _launch, _make_spec
 
 from miles.ray.placement_group import PlacementGroupInfo
 from miles.utils.workers.naming import compute_cell_id
+from miles.utils.workers.ray_worker_manager import BundleInUseError
 
 # One startup PG of 6 bundles split like an M1 map: trainer [0, 1], rollout [2, 3], standby [4, 5].
 _BUNDLES = [5, 3, 1, 0, 2, 4]  # reordered bundle index per logical position
@@ -65,7 +66,7 @@ class TestRebindCell:
         cell_1 = compute_cell_id(pool_id="engine", cell_index=1)
         await manager.stop_cells([cell_1])
 
-        with pytest.raises(AssertionError, match="in use by running cell engine"):
+        with pytest.raises(BundleInUseError, match="in use by running cell engine"):
             await manager.rebind_cell(cell_1, pg_name="rollout", pg_slot_offset=0)
 
     async def test_targets_outside_the_startup_views_are_refused(self, fake_ray_cluster: FakeRayCluster):
@@ -110,7 +111,7 @@ class TestReplacePoolAndPgView:
 
         assert manager.get_cell_bundles(cell_id) == sorted(_BUNDLES[p] for p in (0, 1, 3))
         assert [a.gpu_ids for a in manager._find_cell(cell_id).actors] == [[10], [11], [13]]
-        assert manager.get_cell_infos(pool_ids=["trainer"])[cell_id].workers_hash == "pseudo-hash-2"
+        assert manager.get_cell_infos(pool_ids=["trainer"])[cell_id].workers_hash == "pseudo-hash-3"
 
     async def test_a_running_pool_cannot_be_replaced_or_repointed(self, fake_ray_cluster: FakeRayCluster):
         manager = await _launch([self._trainer_spec(2)], _pgs())
@@ -132,3 +133,31 @@ class TestReplacePoolAndPgView:
         await manager.stop_pools(["trainer"])
         with pytest.raises(AssertionError, match="outside 'actor'"):
             await manager.replace_pool_spec(self._trainer_spec(3))
+
+
+class TestPgViewOccupancy:
+    async def test_a_view_over_bundles_of_a_running_cell_is_refused(self, fake_ray_cluster: FakeRayCluster):
+        """Pointing the trainer at a running engine's bundle would double-book that GPU on the next start."""
+        spec = _make_spec(
+            "trainer", num_workers_per_cell=2, num_gpus_per_worker=0.4, num_gpu_slots_per_worker=1, pg_name="actor"
+        )
+        manager = await _launch([spec, _engine_spec()], _pgs())
+        await manager.stop_pools(["trainer"])
+
+        with pytest.raises(BundleInUseError, match="in use by running cell engine"):
+            await manager.set_pg_view("actor", _view([0, 1, 2]))
+
+        await manager.set_pg_view("actor", _view([0, 1, 4]))
+        assert manager.pgs["actor"].pg_reordered_gpu_ids == [10, 11, 14]
+
+    async def test_a_replaced_pool_starts_at_a_new_generation(self, fake_ray_cluster: FakeRayCluster):
+        spec = _make_spec(
+            "trainer", num_workers_per_cell=1, num_gpus_per_worker=0.4, num_gpu_slots_per_worker=1, pg_name="actor"
+        )
+        manager = await _launch([spec], _pgs())
+        cell_id = compute_cell_id(pool_id="trainer", cell_index=0)
+        await manager.stop_pools(["trainer"])
+
+        await manager.replace_pool_spec(spec)
+
+        assert manager.get_cell_infos(pool_ids=["trainer"])[cell_id].workers_hash == "pseudo-hash-2"

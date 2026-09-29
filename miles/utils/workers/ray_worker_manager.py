@@ -140,6 +140,7 @@ class RayWorkerManager:
             outside = sorted(b for _, b in wanted - known)
             assert not outside, f"bundles {outside} are outside the placement group created at startup"
             assert len(wanted) == len(info.pg_reordered_bundle_indices), f"{pg_name!r} view repeats bundles"
+            self._assert_bundles_free(wanted, ignore=None)
             self.pgs = {**self.pgs, pg_name: info}
 
     async def replace_pool_spec(self, spec: BaseWorkerSpec) -> list[str]:
@@ -151,8 +152,9 @@ class RayWorkerManager:
             assert not running, f"cells {running} of {spec.name!r} are running; stop the pool first"
             new = _PoolManager.initial(spec, self)
             self._validate_binding(spec, [None] * len(new.cells), cells=new.cells)
+            # a new spec is a new generation even before launch, so nothing can mistake it for the old workers
             for cell in new.cells:
-                cell.generation = max((c.generation for c in old.cells), default=0)
+                cell.generation = max((c.generation for c in old.cells), default=0) + 1
             self._pools[spec.name] = new
             return [c.cell_id for c in new.cells]
 
@@ -192,12 +194,12 @@ class RayWorkerManager:
             results.append(probe.bundles())
         return results
 
-    def _assert_bundles_free(self, bundles: set[tuple[Any, int]], *, ignore: _CellManager) -> None:
+    def _assert_bundles_free(self, bundles: set[tuple[Any, int]], *, ignore: _CellManager | None) -> None:
         for other in self._all_cells():
             if other is ignore or not other.alive:
                 continue
             if overlap := bundles & other.bundles():
-                raise AssertionError(
+                raise BundleInUseError(
                     f"bundles {sorted(b for _, b in overlap)} are in use by running cell {other.cell_id}"
                 )
 
@@ -301,6 +303,10 @@ def _actor_manager_cls(spec: BaseWorkerSpec, *, comm_backend: WorkerCommBackend)
         case ServeWorkerSpec(), WorkerCommBackend.RAY:
             return _ServeActorRayCommManager
     raise AssertionError(f"{spec.name} is neither served nor launched as a command")
+
+
+class BundleInUseError(RuntimeError):
+    pass
 
 
 def pg_key(pg: Any) -> Any:
