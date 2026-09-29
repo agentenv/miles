@@ -25,10 +25,16 @@ class RayWorkerProvider(BaseWorkerProvider):
         self._pool_ids = pool_ids
         self._poll_interval_seconds = poll_interval_seconds
 
-    # TEMPORARY: this layer is not meant to serve a suspend the inference controller drives, deliberately
-    # violated until the weight-update fault tolerance work removes the need
+    # Only cells declared at startup exist in the worker manager, so both calls act on pre-declared cell ids.
+    async def start_cells(self, *, cell_ids: list[str]) -> None:
+        await self._worker_manager_handle.start_cells.remote(cell_ids)
+
     async def stop_cells(self, *, cell_ids: list[str]) -> None:
         await self._worker_manager_handle.stop_cells.remote(cell_ids)
+
+    async def list_declared_cell_ids(self) -> list[str]:
+        infos = await self._worker_manager_handle.get_cell_infos.remote(pool_ids=self._watched_pool_ids())
+        return sorted(infos)
 
     def get_worker_infos(self, *, cell_ids: list[str]) -> list[list[WorkerInfo]]:
         refs = [self._worker_manager_handle.get_worker_infos.remote(cell_id) for cell_id in cell_ids]

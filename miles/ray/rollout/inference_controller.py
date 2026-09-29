@@ -42,8 +42,16 @@ CELLS_READY_POLL_INTERVAL_SECONDS = 2.0
 CELLS_READY_TIMEOUT_SECONDS = 3600.0
 
 
+class MembershipEpochMismatchError(RuntimeError):
+    pass
+
+
 @enforce_lock_discipline
 class InferenceController:
+    # class-level defaults so a controller built without __init__ (tests) still has a membership epoch
+    _membership_epoch: int = 0
+    _last_membership_op: tuple[str, tuple[str, ...]] | None = None
+
     @lock_exempt
     def __init__(
         self,
@@ -87,6 +95,62 @@ class InferenceController:
         dashboard_hooks.register_router(self.args)
 
         await self.wait_expected_num_cells()
+
+    # -------------------------- explicit membership -----------------------------
+
+    @lock_exempt
+    async def get_membership_epoch(self) -> int:
+        return self._membership_epoch
+
+    @with_lock
+    async def start_cells(self, cell_ids: list[str], *, expected_epoch: int) -> int:
+        """Start pre-declared engine cells and return the new membership epoch.
+
+        The cells join through the provider watch (reconcile -> PendingWeights) and take no traffic until their
+        weights are published. A repeated call with the same cells right after it committed returns the same
+        epoch without acting again; any other epoch mismatch is refused.
+        """
+        return await self._change_membership("start", cell_ids, expected_epoch=expected_epoch)
+
+    @with_lock
+    async def stop_cells(self, cell_ids: list[str], *, expected_epoch: int) -> int:
+        """Remove pre-declared engine cells from their servers (router deregistration) and stop them."""
+        return await self._change_membership("stop", cell_ids, expected_epoch=expected_epoch)
+
+    @requires_lock
+    async def _change_membership(self, op: str, cell_ids: list[str], *, expected_epoch: int) -> int:
+        ids = tuple(sorted(set(cell_ids)))
+        assert ids, f"{op}_cells needs at least one cell id"
+        current = self._membership_epoch
+        if self._last_membership_op == (op, ids) and expected_epoch == current - 1:
+            logger.info(f"{op}_cells {list(ids)} already committed as epoch {current}; not acting again")
+            return current
+        if expected_epoch != current:
+            raise MembershipEpochMismatchError(
+                f"{op}_cells {list(ids)} expected membership epoch {expected_epoch}, but it is {current}"
+            )
+
+        provider = self._engine_provider
+        if not all(hasattr(provider, name) for name in ("start_cells", "stop_cells", "list_declared_cell_ids")):
+            raise NotImplementedError(f"{type(provider).__name__} cannot start or stop cells on demand")
+        declared = set(await provider.list_declared_cell_ids())
+        unknown = sorted(set(ids) - declared)
+        if unknown:
+            raise KeyError(f"cells {unknown} were not declared at startup; declared cells are {sorted(declared)}")
+
+        if op == "stop":
+            for srv in self.servers.values():
+                for cell_id in ids:
+                    if cell_id in srv.server_cells:
+                        await srv.remove_cell(cell_id)
+            await provider.stop_cells(cell_ids=list(ids))
+        else:
+            await provider.start_cells(cell_ids=list(ids))
+
+        self._membership_epoch = current + 1
+        self._last_membership_op = (op, ids)
+        logger.info(f"{op}_cells {list(ids)} committed membership epoch {self._membership_epoch}")
+        return self._membership_epoch
 
     # TEMPORARY: exists only so a suspend can take this lock, reverted with the weight-update fault tolerance work
     @with_lock
