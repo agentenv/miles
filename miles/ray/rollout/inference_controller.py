@@ -337,9 +337,18 @@ class InferenceController:
     # -------------------------- engine management -----------------------------
 
     @acquires_lock
-    async def start_update_weights(self, model_id: str | None = None) -> "UpdatableEngines":
-        """Return engines eligible for weight updates."""
+    async def start_update_weights(
+        self, model_id: str | None = None, members: list[str] | None = None
+    ) -> "UpdatableEngines":
+        """Return engines eligible for weight updates.
+
+        ``members`` restricts the update to exactly these cell ids of the updatable server: only they are waited for,
+        returned, and snapshotted, so ``end_update_weights`` marks only them ready and every other cell keeps its
+        state. ``None`` (the default) means every cell.
+        """
         await self._health_monitoring_pause(model_id)
+        if members is not None:
+            return await self._start_member_update_weights(model_id=model_id, members=members)
         await self._ensure_cells_ready(model_id=model_id)
 
         srv = self._get_updatable_server(model_id=model_id)
@@ -356,6 +365,28 @@ class InferenceController:
             engine_gpu_counts=srv.engine_gpu_counts,
             engine_gpu_offsets=srv.engine_gpu_offsets,
             snapshot_cell_id_to_hashes={cell_id: cell.meta.workers_hash for cell_id, cell in srv.server_cells.items()},
+        )
+
+    @requires_lock
+    async def _start_member_update_weights(self, *, model_id: str | None, members: list[str]) -> "UpdatableEngines":
+        srv = self._get_updatable_server(model_id=model_id)
+        assert srv is not None, f"no updatable server to publish members {members} to"
+        wanted = set(members)
+        unknown = sorted(wanted - set(srv.server_cells))
+        if unknown:
+            raise KeyError(
+                f"members {unknown} are not cells of {srv.model_name}; its cells are {sorted(srv.server_cells)}"
+            )
+        await self._ensure_cells_ready(model_id=model_id, cell_ids=wanted)
+        cells = sorted(
+            (cell for cell_id, cell in srv.server_cells.items() if cell_id in wanted),
+            key=lambda cell: cell.meta.gpu_offset,
+        )
+        return UpdatableEngines(
+            rollout_engines=[cell.api_client for cell in cells],
+            engine_gpu_counts=[cell.meta.num_gpus_per_engine for cell in cells],
+            engine_gpu_offsets=[cell.meta.gpu_offset for cell in cells],
+            snapshot_cell_id_to_hashes={cell.meta.cell_id: cell.meta.workers_hash for cell in cells},
         )
 
     @releases_lock
@@ -376,10 +407,15 @@ class InferenceController:
         )
 
     @requires_lock
-    async def _ensure_cells_ready(self, model_id: str | None = None) -> None:
+    async def _ensure_cells_ready(self, model_id: str | None = None, cell_ids: set[str] | None = None) -> None:
         deadline = time.monotonic() + CELLS_READY_TIMEOUT_SECONDS
         while True:
-            cells = [cell for srv in self._get_servers_of_model_id(model_id) for cell in srv.server_cells.values()]
+            cells = [
+                cell
+                for srv in self._get_servers_of_model_id(model_id)
+                for cell_id, cell in srv.server_cells.items()
+                if cell_ids is None or cell_id in cell_ids
+            ]
             if self.args.colocate:
                 await asyncio.gather(*[cell.init() for cell in cells if cell.is_uninitialized])
             pending = [cell for cell in cells if not cell.is_pending_weights_or_serving]
