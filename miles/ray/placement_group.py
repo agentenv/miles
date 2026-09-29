@@ -481,7 +481,7 @@ async def update_weights(
 
     ``members`` (cell ids, with the membership ``expected_epoch``) restricts the publish to those engines only. A
     member publish does not set the executor's weight version: non-members may still serve an older version, so the
-    caller sets it once every serving engine carries the returned version.
+    caller sets it with ``commit_weight_version`` once every serving engine carries the returned version.
     """
     orchestration_executor = FTTestActionOrchestrationExecutor.from_args(args, trainer_model_id=trainer_model_id)
     if rollout_id is not None:
@@ -505,6 +505,34 @@ async def update_weights(
     if weight_version is not None and members is None:
         await rollout_executor.set_weight_version(weight_version, trainer_model_id=trainer_model_id)
     return weight_version
+
+
+async def commit_weight_version(
+    rollout_executor,
+    inference_controller: BaseWorkerHandle,
+    *,
+    weight_version: int,
+    expected_epoch: int,
+    trainer_model_id: str | None = None,
+) -> None:
+    """Set the executor's weight version after member publishes, once every Serving engine reports it.
+
+    ``update_weights(members=...)`` leaves the executor's version alone because non-members may still serve an
+    older one. The caller brings every Serving engine to ``weight_version`` (publishing to the rest, or, when the
+    member publish carried the policy the others already serve, re-stamping them with
+    ``InferenceController.set_cells_weight_version``) and then calls this. It refuses if the membership epoch moved
+    or any Serving engine reports another version.
+    """
+    epoch = await inference_controller.get_membership_epoch()
+    if epoch != expected_epoch:
+        raise RuntimeError(f"weight version commit expected membership epoch {expected_epoch}, but it is {epoch}")
+    versions = await inference_controller.get_cells_weight_versions(model_id=trainer_model_id)
+    if not versions:
+        raise RuntimeError("no serving engine reports a weight version; nothing to commit")
+    stale = {cell_id: v for cell_id, v in versions.items() if v != str(weight_version)}
+    if stale:
+        raise RuntimeError(f"serving engines {stale} do not report weight version {weight_version} yet")
+    await rollout_executor.set_weight_version(weight_version, trainer_model_id=trainer_model_id)
 
 
 async def _maybe_log_inference_engine_weight_checksums(

@@ -211,17 +211,21 @@ class ServerCell:
         if serve_without_weight_update:
             self._mark_serving()
 
-    async def mark_weights_ready(self) -> None:
+    async def mark_weights_ready(self, *, cordoned: bool = False) -> None:
+        """Register with the router and become Serving; ``cordoned`` registers it unselectable until uncordoned."""
         assert isinstance(self._state, StatePendingWeights), f"{self._state=}"
-        await self._register_with_router(addr_info=self._state.addr_info)
+        if cordoned and not self.args.use_miles_router:
+            raise CordonUnsupportedError("a cordoned admission needs the Miles router (--use-miles-router)")
+        await self._register_with_router(addr_info=self._state.addr_info, cordoned=cordoned)
         self._mark_serving()
 
-    async def _register_with_router(self, addr_info: CellAddrInfo) -> None:
+    async def _register_with_router(self, addr_info: CellAddrInfo, *, cordoned: bool = False) -> None:
         await self.router_api_client.add_worker(
             worker_url=addr_info.server_url,
             worker_type=self.meta.worker_type,
             use_legacy_api=use_legacy_router_api(self.args),
             bootstrap_port=addr_info.bootstrap_port,
+            **({"cordoned": True} if cordoned else {}),
         )
 
     # -------------------------- cordon / drain (Miles router only) -----------------------------

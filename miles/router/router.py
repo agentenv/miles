@@ -196,6 +196,10 @@ class MilesRouter:
             return JSONResponse(
                 status_code=400, content={"error": "worker_url is required (use query ?url=... or JSON body)"}
             )
+        # ?cordoned=1 registers the worker already cordoned (atomically), e.g. a new engine that must pass a weight
+        # read-back before it takes traffic; it is admitted later with /uncordon_worker.
+        if request.query_params.get("cordoned", "").lower() in ("1", "true"):
+            self.cordoned_workers.add(worker_url)
 
         # Add if new, keep a simple request count per worker
         if worker_url not in self.worker_request_counts:
@@ -287,10 +291,15 @@ class MilesRouter:
         return url
 
     def _finish_url(self, url: str, *, generation: int | None = None) -> None:
+        """Mark the request to the given URL as finished.
+
+        ``generation`` is the registration the request was counted on. A request of an earlier registration of the
+        same URL (removed and added again meanwhile) does not decrement the new registration's count: in-flight
+        counts, and hence drains, only cover requests routed to the current registration.
+        """
         if generation is not None and self.worker_generations.get(url, 0) != generation:
             logger.info(f"[miles-router] Request to an earlier registration of {url} finished; ignoring")
             return
-        """Mark the request to the given URL as finished"""
         if (count := self.worker_request_counts.get(url)) is None or count == 0:
             logger.info(f"[miles-router] Request to {url} finished after the worker was deregistered; ignoring")
             return

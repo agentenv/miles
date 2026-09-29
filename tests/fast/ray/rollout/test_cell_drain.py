@@ -168,3 +168,42 @@ class TestDrainSkipsCellsThatAreNotServing:
 
         assert await controller.drain_cells(["a", "b"], timeout_seconds=10, poll_interval_seconds=0) is True
         assert serving.cordoned
+
+
+class TestCordonedAdmissionOnTheCell:
+    def _pending_cell(self, client, *, use_miles_router=True):
+        cell = _make_cell(router_api_client=client, use_miles_router=use_miles_router)
+        cell._state = StatePendingWeights(addr_info=CellAddrInfo(server_url=_URL, bootstrap_port=None, gate_url=None))
+        return cell
+
+    async def test_mark_weights_ready_can_register_cordoned(self):
+        client = _router_client([])
+        client.add_worker = AsyncMock()
+        cell = self._pending_cell(client)
+        try:
+            await cell.mark_weights_ready(cordoned=True)
+            assert cell.is_serving
+        finally:
+            await cell.dispose()
+        assert client.add_worker.await_args.kwargs["cordoned"] is True
+
+    async def test_the_default_registration_passes_no_cordon_flag(self):
+        client = _router_client([])
+        client.add_worker = AsyncMock()
+        cell = self._pending_cell(client)
+        try:
+            await cell.mark_weights_ready()
+        finally:
+            await cell.dispose()
+        assert "cordoned" not in client.add_worker.await_args.kwargs
+
+    async def test_a_cordoned_admission_needs_the_miles_router(self):
+        client = _router_client([])
+        client.add_worker = AsyncMock()
+        cell = self._pending_cell(client, use_miles_router=False)
+        try:
+            with pytest.raises(CordonUnsupportedError):
+                await cell.mark_weights_ready(cordoned=True)
+            client.add_worker.assert_not_awaited()
+        finally:
+            await cell.dispose()

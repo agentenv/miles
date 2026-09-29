@@ -118,3 +118,46 @@ class TestRegistrationGenerations:
 
         router._finish_url(url, generation=router.worker_generations[url])
         assert router.worker_request_counts[url] == 0
+
+
+class TestCordonedRegistration:
+    def test_add_worker_can_register_a_worker_cordoned(self, router_env: RouterEnv):  # noqa: F811
+        router = router_env.router
+        url, other = "http://127.0.0.1:30051", "http://127.0.0.1:30052"
+        requests.post(f"{router_env.url}/add_worker", params={"url": other}, timeout=5.0).raise_for_status()
+        requests.post(
+            f"{router_env.url}/add_worker", params={"url": url, "cordoned": "1"}, timeout=5.0
+        ).raise_for_status()
+
+        assert url in router.worker_request_counts and router.cordoned_workers == {url}
+        assert {router._use_url() for _ in range(3)} == {other}
+
+        requests.post(f"{router_env.url}/uncordon_worker", params={"url": url}, timeout=5.0).raise_for_status()
+        assert router._use_url() == url
+
+    async def test_the_client_passes_cordoned_on_the_legacy_api_only(self, router_env: RouterEnv):  # noqa: F811
+        from miles.backends.sglang_utils.sglang_router_api_client import SGLangRouterApiClient
+
+        client = SGLangRouterApiClient(router_url=router_env.url)
+        url = "http://127.0.0.1:30053"
+        await client.add_worker(worker_url=url, worker_type="regular", use_legacy_api=True, cordoned=True)
+        assert router_env.router.cordoned_workers == {url}
+        with pytest.raises(ValueError, match="Miles router"):
+            await client.add_worker(worker_url=url, worker_type="regular", use_legacy_api=False, cordoned=True)
+
+
+class TestRejoinInFlightSemantics:
+    def test_a_drain_of_a_rejoined_url_does_not_count_the_old_registration(self, router_env: RouterEnv):  # noqa: F811
+        """Documented semantics: in-flight counts (and drains) cover the current registration only."""
+        router = router_env.router
+        url = "http://127.0.0.1:30054"
+        requests.post(f"{router_env.url}/add_worker", params={"url": url}, timeout=5.0).raise_for_status()
+        old_generation = router.worker_generations[url]
+        router._use_url()  # one request in flight on the first registration
+
+        requests.post(f"{router_env.url}/remove_worker", params={"url": url}, timeout=5.0).raise_for_status()
+        requests.post(f"{router_env.url}/add_worker", params={"url": url}, timeout=5.0).raise_for_status()
+
+        assert router.worker_inflight()[url] == 0  # the old request is invisible to a drain of the new registration
+        router._finish_url(url, generation=old_generation)
+        assert router.worker_inflight()[url] == 0

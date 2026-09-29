@@ -27,11 +27,15 @@ class SGLangRouterApiClient:
         worker_type: str,
         use_legacy_api: bool,
         bootstrap_port: int | None = None,
+        cordoned: bool = False,
     ):
+        """Register a worker. ``cordoned`` (Miles router only) registers it without making it selectable."""
+        if cordoned and not use_legacy_api:
+            raise ValueError("registering a worker cordoned needs the Miles router (--use-miles-router)")
         if use_legacy_api:
             assert worker_type == "regular", "pd disaggregation is not supported in old router or miles router."
             response = await GeneralHttpClientProvider.client().post(
-                f"{self.router_url}/add_worker?url={worker_url}",
+                f"{self.router_url}/add_worker?url={worker_url}" + ("&cordoned=1" if cordoned else ""),
                 timeout=ROUTER_REQUEST_TIMEOUT,
             )
         else:
