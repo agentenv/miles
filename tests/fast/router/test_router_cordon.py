@@ -95,3 +95,26 @@ class TestRouterApiClientCordon:
 
         await client.uncordon_worker(worker_url=url)
         assert router_env.router.cordoned_workers == set()
+
+
+class TestRegistrationGenerations:
+    def test_a_request_of_a_previous_registration_does_not_decrement_the_new_one(
+        self, router_env: RouterEnv  # noqa: F811
+    ):
+        """remove + re-add of the same url: the old in-flight request must not take the new registration's slot."""
+        router = router_env.router
+        url = "http://127.0.0.1:30041"
+        requests.post(f"{router_env.url}/add_worker", params={"url": url}, timeout=5.0).raise_for_status()
+        old_generation = router.worker_generations[url]
+        assert router._use_url() == url
+
+        requests.post(f"{router_env.url}/remove_worker", params={"url": url}, timeout=5.0).raise_for_status()
+        requests.post(f"{router_env.url}/add_worker", params={"url": url}, timeout=5.0).raise_for_status()
+        assert router._use_url() == url
+        assert router.worker_request_counts[url] == 1
+
+        router._finish_url(url, generation=old_generation)
+        assert router.worker_request_counts[url] == 1
+
+        router._finish_url(url, generation=router.worker_generations[url])
+        assert router.worker_request_counts[url] == 0

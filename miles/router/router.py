@@ -50,6 +50,9 @@ class MilesRouter:
         self.dead_workers: set[str] = set()
         # Cordoned workers keep their registration and in-flight count but are never selected for new requests
         self.cordoned_workers: set[str] = set()
+        # URL -> registration generation; a request only hands its slot back to the registration it was counted on
+        self.worker_generations: dict[str, int] = {}
+        self._next_generation = 1
 
         self.client = httpx.AsyncClient(
             limits=httpx.Limits(max_connections=config.max_connections),
@@ -142,6 +145,7 @@ class MilesRouter:
     ) -> dict:
         """Core proxy logic. Returns dict with request_body, response_body, status_code, headers."""
         worker_url = self._use_url()
+        generation = self.worker_generations.get(worker_url, 0)
         url = f"{worker_url}/{path}"
 
         if body is None:
@@ -161,7 +165,7 @@ class MilesRouter:
                 "headers": dict(response.headers),
             }
         finally:
-            self._finish_url(worker_url)
+            self._finish_url(worker_url, generation=generation)
 
     def build_proxy_response(self, result: dict) -> Response:
         """Build HTTP response from proxy result."""
@@ -196,6 +200,8 @@ class MilesRouter:
         # Add if new, keep a simple request count per worker
         if worker_url not in self.worker_request_counts:
             self.worker_request_counts[worker_url] = 0
+            self.worker_generations[worker_url] = self._next_generation
+            self._next_generation += 1
             self.worker_failure_counts[worker_url] = 0
             self.dead_workers.discard(worker_url)
             if self.verbose:
@@ -212,6 +218,7 @@ class MilesRouter:
             )
 
         self.worker_request_counts.pop(worker_url, None)
+        self.worker_generations.pop(worker_url, None)
         self.worker_failure_counts.pop(worker_url, None)
         self.dead_workers.discard(worker_url)
         self.cordoned_workers.discard(worker_url)
@@ -279,7 +286,10 @@ class MilesRouter:
         self.worker_request_counts[url] += 1
         return url
 
-    def _finish_url(self, url: str) -> None:
+    def _finish_url(self, url: str, *, generation: int | None = None) -> None:
+        if generation is not None and self.worker_generations.get(url, 0) != generation:
+            logger.info(f"[miles-router] Request to an earlier registration of {url} finished; ignoring")
+            return
         """Mark the request to the given URL as finished"""
         if (count := self.worker_request_counts.get(url)) is None or count == 0:
             logger.info(f"[miles-router] Request to {url} finished after the worker was deregistered; ignoring")

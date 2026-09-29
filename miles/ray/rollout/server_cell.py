@@ -40,6 +40,14 @@ INITIALIZING_TIMEOUT_SECONDS = 1800.0
 ABORT_REQUEST_TIMEOUT_SECONDS = 30.0
 
 
+class CordonUnsupportedError(RuntimeError):
+    pass
+
+
+class CellNotServingError(RuntimeError):
+    pass
+
+
 class ServerCellMetadata(FrozenStrictBaseModel):
     model_id: str
     worker_type: Literal["regular", "prefill", "decode"]
@@ -244,10 +252,12 @@ class ServerCell:
             await asyncio.sleep(poll_interval_seconds)
 
     def _assert_cordonable(self) -> None:
-        assert self.args.use_miles_router, "cordon and in-flight counts need the Miles router (--use-miles-router)"
-        assert isinstance(
-            self._state, StateServing
-        ), f"only a serving cell is registered with the router ({self._state=})"
+        if not self.args.use_miles_router:
+            raise CordonUnsupportedError("cordon and in-flight counts need the Miles router (--use-miles-router)")
+        if not isinstance(self._state, StateServing):
+            raise CellNotServingError(
+                f"cell {self.meta.cell_id} is not serving, so it is not registered with the router ({self._state=})"
+            )
 
     async def dispose(self) -> None:
         self._health_checker.stop()

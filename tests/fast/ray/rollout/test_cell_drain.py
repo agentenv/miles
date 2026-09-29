@@ -8,6 +8,7 @@ from tests.fast.ray.rollout.test_inference_controller import _make_controller
 from tests.fast.ray.rollout.test_server_cell_dispose import _make_cell
 
 from miles.ray.rollout.cell_state import CellAddrInfo, StatePendingWeights, StateServing
+from miles.ray.rollout.server_cell import CellNotServingError, CordonUnsupportedError
 
 _URL = "http://10.0.0.2:30000"
 
@@ -54,13 +55,13 @@ class TestServerCellCordon:
         cell = _make_cell(router_api_client=client, use_miles_router=True)
         cell._state = StatePendingWeights(addr_info=CellAddrInfo(server_url=_URL, bootstrap_port=None, gate_url=None))
 
-        with pytest.raises(AssertionError, match="only a serving cell"):
+        with pytest.raises(CellNotServingError, match="is not serving"):
             await cell.cordon()
         await cell.dispose()
 
     async def test_cordon_needs_the_miles_router(self):
         cell = _serving_cell(_router_client([]), use_miles_router=False)
-        with pytest.raises(AssertionError, match="--use-miles-router"):
+        with pytest.raises(CordonUnsupportedError, match="--use-miles-router"):
             await cell.cordon()
         await cell.dispose()
 
@@ -152,3 +153,18 @@ class TestInferenceControllerDrain:
         with pytest.raises(KeyError):
             await controller.cordon_cells(["zz"])
         assert not a.cordoned
+
+
+class TestDrainSkipsCellsThatAreNotServing:
+    async def test_a_pending_cell_is_neither_cordoned_nor_waited_for(self):
+        serving, pending = _FakeDrainCell("a", [1, 0]), _FakeDrainCell("b", [7])
+        pending.is_serving = False
+
+        async def _refuse() -> None:
+            raise CellNotServingError("b is not serving")
+
+        pending.cordon = _refuse
+        controller, _ = _controller_with(serving, pending)
+
+        assert await controller.drain_cells(["a", "b"], timeout_seconds=10, poll_interval_seconds=0) is True
+        assert serving.cordoned

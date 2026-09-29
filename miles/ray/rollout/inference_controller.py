@@ -178,7 +178,8 @@ class InferenceController:
         router (or was replaced by a cell that is not serving yet), so it holds no in-flight request any more.
         """
         cells = self._find_cells(cell_ids)
-        await asyncio.gather(*[cell.cordon() for cell in cells])
+        # a cell that is not serving is not registered with the router, so it has nothing to cordon or drain
+        await asyncio.gather(*[cell.cordon() for cell in cells if cell.is_serving])
         deadline = time.monotonic() + timeout_seconds
         while True:
             remaining = [
