@@ -24,6 +24,16 @@ import numpy as np
 import torch
 
 NAMED_STATE_FORMAT = "lora_named_optimizer_v1"
+
+# What a load does with RNG. "exact": restore this rank's saved RNG and refuse a DP change or a missing coordinate.
+# "keep_on_dp_change": restore when the DP size is unchanged, otherwise keep the fresh RNG of this process.
+RNG_POLICIES = ("exact", "keep_on_dp_change")
+
+
+class DpInvariantStateError(RuntimeError):
+    """A configuration or checkpoint the DP-invariant LoRA state cannot handle."""
+
+
 _NAMED_FILE_RE = re.compile(r"^training_state_named_tp(\d+)_pp(\d+)_dp(\d+)\.pt$")
 
 

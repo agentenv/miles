@@ -84,6 +84,16 @@ def add_lora_arguments(parser):
         ),
     )
     parser.add_argument(
+        "--lora-dp-invariant-rng",
+        choices=("exact", "keep_on_dp_change"),
+        default="exact",
+        help=(
+            "RNG handling when loading DP-invariant LoRA state. exact: restore each rank's saved RNG and refuse a "
+            "checkpoint written at another DP size. keep_on_dp_change: restore when the DP size is unchanged, "
+            "otherwise keep the fresh RNG of the new process."
+        ),
+    )
+    parser.add_argument(
         "--lora-base-cpu-backup",
         action="store_true",
         default=False,
@@ -144,8 +154,46 @@ def add_lora_arguments(parser):
     return parser
 
 
+def check_lora_dp_invariant_config(
+    *, use_distributed_optimizer: bool, bf16: bool, fp16: bool, cp_size: int, ep_size: int
+):
+    """Fail fast on configurations whose optimizer state or RNG cannot be keyed by name per (tp, pp, dp)."""
+    problems = []
+    if use_distributed_optimizer:
+        problems.append(
+            "--use-distributed-optimizer shards optimizer state over DP; the DP gather it needs is not implemented"
+        )
+    if bf16 or fp16:
+        problems.append(
+            "--bf16/--fp16 give the optimizer fp32 main copies that are not the model parameters, so its state "
+            "cannot be keyed by parameter name"
+        )
+    if cp_size > 1:
+        problems.append("context parallelism (CP>1) is not supported: the saved coordinate is the pure DP rank")
+    if ep_size > 1:
+        problems.append("expert parallelism (EP>1) is not supported: expert adapters are sharded inside DP")
+    if problems:
+        raise ValueError("--lora-dp-invariant-state cannot be used: " + "; ".join(problems))
+
+
+def validate_lora_dp_invariant_args(args) -> None:
+    """Fail fast at argument parsing on configurations --lora-dp-invariant-state cannot save or load."""
+    if not getattr(args, "lora_dp_invariant_state", False):
+        return
+    if not is_lora_enabled(args):
+        raise ValueError("--lora-dp-invariant-state needs LoRA training")
+    check_lora_dp_invariant_config(
+        use_distributed_optimizer=bool(getattr(args, "use_distributed_optimizer", False)),
+        bf16=bool(getattr(args, "bf16", False)),
+        fp16=bool(getattr(args, "fp16", False)),
+        cp_size=getattr(args, "context_parallel_size", 1) or 1,
+        ep_size=getattr(args, "expert_model_parallel_size", 1) or 1,
+    )
+
+
 def validate_lora_args(args):
     validate_multi_lora_args(args)
+    validate_lora_dp_invariant_args(args)
     if not is_lora_enabled(args):
         return
     assert args.train_backend == "megatron", "LoRA injection is not implemented for FSDP; use --train-backend megatron"

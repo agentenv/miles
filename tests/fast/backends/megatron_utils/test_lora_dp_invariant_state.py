@@ -147,12 +147,14 @@ class TestRngState:
         torch.testing.assert_close(torch.rand(3), expected, rtol=0, atol=0)
 
 
-def _patch_parallel_state(monkeypatch, *, dp_rank: int):
-    rank = lambda r: SimpleNamespace(rank=r, size=1)  # noqa: E731
+def _patch_parallel_state(monkeypatch, *, dp_rank: int, dp_size: int = 1, cp_size: int = 1, ep_size: int = 1):
+    group = lambda r, n=1: SimpleNamespace(rank=r, size=n)  # noqa: E731
     monkeypatch.setattr(
         lora_utils,
         "get_parallel_state",
-        lambda: SimpleNamespace(tp=rank(0), pp=rank(0), intra_dp_cp=rank(dp_rank), ep=rank(0)),
+        lambda: SimpleNamespace(
+            tp=group(0), pp=group(0), intra_dp=group(dp_rank, dp_size), cp=group(0, cp_size), ep=group(0, ep_size)
+        ),
     )
 
 
@@ -186,8 +188,8 @@ class TestSaveLoadDpInvariant:
             "training_state_rank0.pt",
         ]
 
-    def test_a_dp2_checkpoint_restores_at_dp1_with_optimizer_and_rng(self, tmp_path, monkeypatch):
-        """Two DP ranks save; a single rank (another global layout) loads by name and gets its RNG back."""
+    def _save_dp2(self, tmp_path, monkeypatch):
+        """Two DP ranks save into one directory; returns (model, optimizer, dir, RNG draw expected on dp rank 0)."""
         model = _AdapterModel(1.0)
         optimizer = torch.optim.Adam(model.parameters(), lr=0.1)
         model.lora_A.grad = torch.ones(2, 2)
@@ -195,46 +197,79 @@ class TestSaveLoadDpInvariant:
         optimizer.step()
 
         merged_dir = tmp_path / "merged"
-        rng_expected = None
+        merged_dir.mkdir()
+        expected = None
         for dp_rank in (1, 0):
-            _patch_parallel_state(monkeypatch, dp_rank=dp_rank)
+            _patch_parallel_state(monkeypatch, dp_rank=dp_rank, dp_size=2)
             torch.manual_seed(100 + dp_rank)
             if dp_rank == 0:
-                rng_expected = torch.rand(1)
+                expected = torch.rand(1)
                 torch.manual_seed(100)
             self._save(model, optimizer, tmp_path / f"dp{dp_rank}", flag=True)
-            merged_dir.mkdir(exist_ok=True)
             for f in (tmp_path / f"dp{dp_rank}").iterdir():
                 if "dp_invariant" in f.name or "named" in f.name:
                     shutil.copy(f, merged_dir / f.name)
-        assert sorted(p.name for p in merged_dir.iterdir()) == [
-            "adapter_dp_invariant_tp0_pp0.pt",
-            "training_state_named_tp0_pp0_dp0.pt",
-            "training_state_named_tp0_pp0_dp1.pt",
-        ]
+        return model, optimizer, merged_dir, expected
 
-        _patch_parallel_state(monkeypatch, dp_rank=0)
+    def _load(self, merged_dir, *, rng_policy="exact"):
         target = _AdapterModel(0.0)
         target_opt = torch.optim.Adam(target.parameters(), lr=0.1)
         scheduler_loads = []
-        torch.manual_seed(7)
-
-        loaded, iteration, restored = lora_utils.load_lora_adapter(
+        result = lora_utils.load_lora_adapter(
             [target],
             str(merged_dir),
             optimizer=target_opt,
             opt_param_scheduler=SimpleNamespace(load_state_dict=scheduler_loads.append),
             dp_invariant=True,
+            rng_policy=rng_policy,
         )
+        return result, target, target_opt, scheduler_loads
 
-        assert (loaded, iteration, restored) == (True, 4, True)
+    def test_same_dp_size_restores_optimizer_and_exact_rng(self, tmp_path, monkeypatch):
+        model, optimizer, merged_dir, expected = self._save_dp2(tmp_path, monkeypatch)
+        assert sorted(p.name for p in merged_dir.iterdir()) == [
+            "adapter_dp_invariant_tp0_pp0.pt",
+            "training_state_named_tp0_pp0_dp0.pt",
+            "training_state_named_tp0_pp0_dp1.pt",
+        ]
+        _patch_parallel_state(monkeypatch, dp_rank=0, dp_size=2)
+        torch.manual_seed(7)
+
+        result, target, target_opt, scheduler_loads = self._load(merged_dir)
+
+        assert result == (True, 4, True)
         torch.testing.assert_close(target.lora_A.data, model.lora_A.data)
         assert scheduler_loads == [{"lr": 0.5}]
-        torch.testing.assert_close(torch.rand(1), rng_expected, rtol=0, atol=0)
+        torch.testing.assert_close(torch.rand(1), expected, rtol=0, atol=0)
+
+    def test_a_dp_change_loads_optimizer_by_name_under_keep_on_dp_change(self, tmp_path, monkeypatch):
+        """DP=2 -> DP=1: optimizer state comes back by name; RNG stays the fresh one of the new process."""
+        model, optimizer, merged_dir, _ = self._save_dp2(tmp_path, monkeypatch)
+        _patch_parallel_state(monkeypatch, dp_rank=0, dp_size=1)
+        torch.manual_seed(7)
+        fresh = torch.rand(1)
+        torch.manual_seed(7)
+
+        result, _, target_opt, _ = self._load(merged_dir, rng_policy="keep_on_dp_change")
+
+        assert result == (True, 4, True)
+        torch.testing.assert_close(torch.rand(1), fresh, rtol=0, atol=0)
         saved_state = optimizer.state_dict()["state"]
         loaded_state = target_opt.state_dict()["state"]
         for index in saved_state:
             torch.testing.assert_close(loaded_state[index]["exp_avg"], saved_state[index]["exp_avg"])
+
+    def test_a_dp_change_is_refused_under_the_exact_rng_policy(self, tmp_path, monkeypatch):
+        _, _, merged_dir, _ = self._save_dp2(tmp_path, monkeypatch)
+        _patch_parallel_state(monkeypatch, dp_rank=0, dp_size=1)
+
+        with pytest.raises(dps.DpInvariantStateError, match="explicit policy"):
+            self._load(merged_dir, rng_policy="exact")
+
+    def test_an_unknown_rng_policy_is_refused(self, tmp_path, monkeypatch):
+        _, _, merged_dir, _ = self._save_dp2(tmp_path, monkeypatch)
+        with pytest.raises(ValueError, match="unknown RNG policy"):
+            self._load(merged_dir, rng_policy="whatever")
 
     def test_dp_invariant_load_falls_back_to_rank_shards(self, tmp_path, monkeypatch):
         _patch_parallel_state(monkeypatch, dp_rank=0)
@@ -247,17 +282,47 @@ class TestSaveLoadDpInvariant:
         assert (loaded, iteration) == (True, None)
         torch.testing.assert_close(target.lora_A.data, model.lora_A.data)
 
-    def test_expert_parallelism_is_refused(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(
-            lora_utils,
-            "get_parallel_state",
-            lambda: SimpleNamespace(
-                tp=SimpleNamespace(rank=0),
-                pp=SimpleNamespace(rank=0),
-                intra_dp_cp=SimpleNamespace(rank=0),
-                ep=SimpleNamespace(rank=0, size=2),
-            ),
-        )
+    @pytest.mark.parametrize("sizes", [dict(ep_size=2), dict(cp_size=2)])
+    def test_expert_and_context_parallelism_are_refused_at_runtime(self, tmp_path, monkeypatch, sizes):
+        _patch_parallel_state(monkeypatch, dp_rank=0, **sizes)
         model = _AdapterModel(1.0)
-        with pytest.raises(AssertionError, match="EP>1"):
+        with pytest.raises(dps.DpInvariantStateError, match="EP=1 and CP=1"):
             self._save(model, torch.optim.Adam(model.parameters()), tmp_path / "ckpt", flag=True)
+
+
+class TestArgumentFailFast:
+    @staticmethod
+    def _args(**overrides):
+        base = dict(
+            lora_dp_invariant_state=True,
+            lora_rank=8,
+            use_distributed_optimizer=False,
+            bf16=False,
+            fp16=False,
+            context_parallel_size=1,
+            expert_model_parallel_size=1,
+        )
+        return Namespace(**{**base, **overrides})
+
+    def test_a_supported_config_passes_and_the_default_is_untouched(self):
+        from miles.utils.lora.arguments import validate_lora_dp_invariant_args
+
+        validate_lora_dp_invariant_args(self._args())
+        validate_lora_dp_invariant_args(self._args(lora_dp_invariant_state=False, use_distributed_optimizer=True))
+
+    @pytest.mark.parametrize(
+        "overrides, match",
+        [
+            (dict(use_distributed_optimizer=True), "DP gather it needs is not implemented"),
+            (dict(bf16=True), "fp32 main copies"),
+            (dict(fp16=True), "fp32 main copies"),
+            (dict(context_parallel_size=2), "CP>1"),
+            (dict(expert_model_parallel_size=4), "EP>1"),
+            (dict(lora_rank=0), "needs LoRA"),
+        ],
+    )
+    def test_unsupported_configs_fail_at_parse_time(self, overrides, match):
+        from miles.utils.lora.arguments import validate_lora_dp_invariant_args
+
+        with pytest.raises(ValueError, match=match):
+            validate_lora_dp_invariant_args(self._args(**overrides))

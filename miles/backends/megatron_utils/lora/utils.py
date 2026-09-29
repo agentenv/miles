@@ -228,12 +228,14 @@ def save_lora_checkpoint(
     return str(save_dir)
 
 
-def _dp_coordinates() -> tuple[int, int, int]:
+def _dp_coordinates() -> tuple[int, int, int, int]:
+    """(tp rank, pp rank, dp rank, dp size); the runtime twin of the argument check."""
     ps = get_parallel_state()
-    assert (
-        ps.ep.size == 1
-    ), "DP-invariant LoRA state keys adapters by (tp, pp); expert parallelism (EP>1) is unsupported"
-    return ps.tp.rank, ps.pp.rank, ps.intra_dp_cp.rank
+    if ps.ep.size > 1 or ps.cp.size > 1:
+        raise dp_invariant_state.DpInvariantStateError(
+            f"DP-invariant LoRA state needs EP=1 and CP=1, got EP={ps.ep.size} CP={ps.cp.size}"
+        )
+    return ps.tp.rank, ps.pp.rank, ps.intra_dp.rank, ps.intra_dp.size
 
 
 def _write_dp_invariant_state(
@@ -245,7 +247,7 @@ def _write_dp_invariant_state(
     training_state: dict | None,
 ) -> None:
     """Write the DP-invariant copy: one adapter per (tp, pp) and a name-keyed optimizer + RNG per (tp, pp, dp)."""
-    tp_rank, pp_rank, dp_rank = _dp_coordinates()
+    tp_rank, pp_rank, dp_rank, dp_size = _dp_coordinates()
     if dp_rank == 0:
         torch.save(
             adapter_state,
@@ -264,6 +266,7 @@ def _write_dp_invariant_state(
             "optimizer_named": named_optimizer,
             "opt_param_scheduler": training_state["opt_param_scheduler"] if training_state else None,
             "rng": dp_invariant_state.capture_rng_state(),
+            "dp_size": dp_size,
         },
         checkpoint_dir
         / dp_invariant_state.named_training_state_filename(tp_rank=tp_rank, pp_rank=pp_rank, dp_rank=dp_rank),
@@ -277,8 +280,11 @@ def _load_dp_invariant_state(
     optimizer: Any | None,
     opt_param_scheduler: Any | None,
     load_optimizer: bool,
+    rng_policy: str,
 ) -> tuple[bool, int | None, bool]:
-    tp_rank, pp_rank, dp_rank = _dp_coordinates()
+    if rng_policy not in dp_invariant_state.RNG_POLICIES:
+        raise ValueError(f"unknown RNG policy {rng_policy!r}; known: {dp_invariant_state.RNG_POLICIES}")
+    tp_rank, pp_rank, dp_rank, dp_size = _dp_coordinates()
     adapter_file = adapter_dir / dp_invariant_state.dp_invariant_adapter_filename(tp_rank=tp_rank, pp_rank=pp_rank)
     if not adapter_file.exists():
         return False, None, False
@@ -303,12 +309,20 @@ def _load_dp_invariant_state(
         optimizer_restored = True
     if opt_param_scheduler is not None and reference.get("opt_param_scheduler") is not None:
         opt_param_scheduler.load_state_dict(reference["opt_param_scheduler"])
-    if own is not None and own.get("rng") is not None:
+    saved_dp_sizes = {s.get("dp_size") for s in shards.values()}
+    same_layout = saved_dp_sizes == {dp_size} and sorted(shards) == list(range(dp_size))
+    if same_layout and own is not None and own.get("rng") is not None:
         dp_invariant_state.restore_rng_state(own["rng"])
+    elif rng_policy == "exact":
+        raise dp_invariant_state.DpInvariantStateError(
+            f"--lora-dp-invariant-rng exact: the checkpoint holds RNG for DP size(s) {sorted(map(str, saved_dp_sizes))} "
+            f"and ranks {sorted(shards)}, this run has DP size {dp_size} (rank {dp_rank}); restoring RNG across a DP "
+            f"change needs an explicit policy (keep_on_dp_change)"
+        )
     else:
         logger.warning(
-            f"no RNG state was saved for (tp={tp_rank}, pp={pp_rank}, dp={dp_rank}) (saved dp ranks: "
-            f"{sorted(shards)}); keeping this rank's current RNG"
+            f"DP layout changed (saved DP sizes {sorted(map(str, saved_dp_sizes))}, now {dp_size}); keeping this "
+            f"rank's current RNG (policy keep_on_dp_change)"
         )
     return True, reference.get("iteration"), optimizer_restored
 
@@ -339,6 +353,7 @@ def load_lora_adapter(
     opt_param_scheduler: Any | None = None,
     load_optimizer: bool = True,
     dp_invariant: bool = False,
+    rng_policy: str = "exact",
 ) -> tuple[bool, int | None, bool]:
     """Restore native adapter shards and optional optimizer/scheduler state.
 
@@ -358,6 +373,7 @@ def load_lora_adapter(
             optimizer=optimizer,
             opt_param_scheduler=opt_param_scheduler,
             load_optimizer=load_optimizer,
+            rng_policy=rng_policy,
         )
         if result[0]:
             logger.info(f"Loaded DP-invariant LoRA state from {adapter_dir}")
