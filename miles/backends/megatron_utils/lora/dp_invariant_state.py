@@ -3,12 +3,12 @@
 The default LoRA checkpoint stores ``optimizer.state_dict()`` per global rank, whose ``state`` is keyed by the
 optimizer's positional parameter index. That index depends on how the optimizer was built on that rank, so a
 checkpoint written at one DP size cannot be loaded at another. Here the state is re-keyed by parameter name and
-written once per (tp, pp, dp) coordinate; a loader merges every DP shard of its own (tp, pp) coordinate and picks
-the names its optimizer holds, so the DP size may change while TP/PP stay fixed.
+written once per (tp, pp, dp) coordinate together with the range of the parameter that rank owns; a loader
+gathers every DP shard of its own (tp, pp) coordinate into full tensors and slices out the ranges it owns now, so
+the DP size may change while TP/PP stay fixed. The fp32 main copies of bf16 training (Float16Optimizer) and the
+DP-sharded main params/state of Megatron's DistributedOptimizer are covered (see ``optimizer_slots``).
 
-Everything in this module is pure torch/CPU and does not touch Megatron. A Megatron distributed optimizer keeps its
-state in flattened, DP-sharded fp32 buffers that do not map 1:1 onto model parameters; re-keying it requires a DP
-gather of the parameter state first, which is not implemented here (see ``unwrap_name_mappable_optimizer``).
+Everything in this module is pure torch/CPU; Megatron optimizers are accessed by duck typing.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from typing import Any
 import numpy as np
 import torch
 
-NAMED_STATE_FORMAT = "lora_named_optimizer_v1"
+NAMED_STATE_FORMAT = "lora_named_optimizer_v2"
 
 # What a load does with RNG. "exact": restore this rank's saved RNG and refuse a DP change or a missing coordinate.
 # "keep_on_dp_change": restore when the DP size is unchanged, otherwise keep the fresh RNG of this process.
@@ -55,112 +55,254 @@ def list_named_training_state_files(checkpoint_dir: Path, *, tp_rank: int, pp_ra
 
 
 # ---------------------------------------------------------------------------
-# optimizer state <-> parameter names
+# optimizer state <-> parameter names (with DP-shard ranges)
 # ---------------------------------------------------------------------------
+#
+# Every optimizer is reduced to "slots": one per model parameter this rank updates, holding the range
+# [start, end) of the flattened model parameter that this rank's optimizer owns, plus accessors for the fp32 main
+# copy ("param") and the per-element optimizer state (exp_avg, ...). Three optimizer layouts are supported:
+#
+# * a plain torch optimizer (or Megatron FP32Optimizer): main param == model param, full range;
+# * Megatron Float16OptimizerWithFloat16Params (bf16/fp16 without DistOpt): the torch optimizer holds fp32 main
+#   copies; they are matched to model params through ``float16_groups``/``fp32_from_float16_groups``; full range;
+# * Megatron DistributedOptimizer: each DP rank owns a contiguous slice of every bucket, i.e. a sub-range of some
+#   parameters (``gbuf_ranges[..]["param_map"][model_param]["param"]``); main shard + state come from
+#   ``_get_main_param_and_optimizer_states``.
+# ChainedOptimizer is unwrapped into its members. Saving writes each rank's slots keyed by parameter name with their
+# ranges; loading merges every DP shard of one (tp, pp) coordinate into full flat tensors (gather) and slices out
+# the ranges the new rank owns (reshard). No collective is needed: the checkpoint directory is the gather point.
 
 
-def param_names_per_group(optimizer: torch.optim.Optimizer, named_params: Iterable[tuple[str, torch.nn.Parameter]]):
-    """For each param group, the names of its parameters in optimizer order (matched by tensor identity)."""
+class _Slot:
+    __slots__ = ("name", "model_param", "start", "end", "get", "set", "group")
+
+    def __init__(self, name, model_param, start, end, get, set_, group):
+        self.name, self.model_param, self.start, self.end = name, model_param, start, end
+        self.get, self.set, self.group = get, set_, group
+
+
+def _optimizer_leaves(optimizer: Any) -> list[Any]:
+    chained = getattr(optimizer, "chained_optimizers", None)
+    if chained is not None:
+        return [leaf for member in chained for leaf in _optimizer_leaves(member)]
+    return [optimizer]
+
+
+def _is_distributed(leaf: Any) -> bool:
+    return hasattr(leaf, "gbuf_ranges") and hasattr(leaf, "model_param_group_index_map")
+
+
+def _torch_slots(torch_optimizer: torch.optim.Optimizer, main_to_model: Mapping[int, torch.nn.Parameter], name_of):
+    slots = []
+    for group in torch_optimizer.param_groups:
+        for main in group["params"]:
+            model_param = main_to_model.get(id(main), main)
+            if id(model_param) not in name_of:
+                raise NotImplementedError(
+                    f"optimizer holds a tensor of shape {tuple(main.shape)} that maps to no model parameter"
+                )
+
+            def get(main=main):
+                tensors = {"param": main}
+                tensors.update(
+                    {k: v for k, v in torch_optimizer.state.get(main, {}).items() if isinstance(v, torch.Tensor)}
+                )
+                return tensors
+
+            def set_(tensors, main=main):
+                state = torch_optimizer.state[main]
+                for key, value in tensors.items():
+                    if key == "param":
+                        main.data.copy_(value.reshape(main.shape))
+                    elif value.dim() == 0:
+                        state[key] = value.clone()
+                    else:
+                        state[key] = value.reshape(main.shape).to(device=main.device).clone()
+
+            slots.append(_Slot(name_of[id(model_param)], model_param, 0, model_param.numel(), get, set_, group))
+    return slots
+
+
+def _distributed_slots(leaf: Any, name_of) -> list[_Slot]:
+    if getattr(getattr(leaf, "config", None), "use_precision_aware_optimizer_no_fp8_or_ds_fp8", False):
+        raise NotImplementedError("DP-invariant LoRA state does not support the precision-aware optimizer")
+    slots = []
+    for gbuf_range_maps in leaf.gbuf_ranges:
+        for per_bucket in gbuf_range_maps.values():
+            for bucket_range_map in per_bucket:
+                for model_param, range_map in bucket_range_map["param_map"].items():
+                    if id(model_param) not in name_of:
+                        raise NotImplementedError(
+                            f"distributed optimizer holds a parameter of shape {tuple(model_param.shape)} that is not "
+                            f"a named model parameter"
+                        )
+                    group_index, _ = leaf.model_param_group_index_map[model_param]
+
+                    def get(model_param=model_param):
+                        return leaf._get_main_param_and_optimizer_states(model_param)
+
+                    def set_(tensors, model_param=model_param):
+                        current = leaf._get_main_param_and_optimizer_states(model_param)
+                        missing = current.keys() - tensors.keys()
+                        if missing:
+                            raise DpInvariantStateError(
+                                f"saved state of {name_of[id(model_param)]!r} lacks {sorted(missing)}"
+                            )
+                        leaf._set_main_param_and_optimizer_states(model_param, tensors)
+
+                    param_range = range_map["param"]
+                    slots.append(
+                        _Slot(
+                            name_of[id(model_param)],
+                            model_param,
+                            param_range.start,
+                            param_range.end,
+                            get,
+                            set_,
+                            leaf.optimizer.param_groups[group_index],
+                        )
+                    )
+    return slots
+
+
+def optimizer_slots(optimizer: Any, named_params: Iterable[tuple[str, torch.nn.Parameter]]) -> list[_Slot]:
+    """The parameter slots this rank's optimizer updates (see the section comment)."""
     name_of = {}
     for name, param in named_params:
         assert id(param) not in name_of, f"parameter {name!r} is registered twice"
         name_of[id(param)] = name
-    groups = []
-    for group_index, group in enumerate(optimizer.param_groups):
-        names = []
-        for param in group["params"]:
-            if id(param) not in name_of:
-                raise NotImplementedError(
-                    f"optimizer param group {group_index} holds a tensor that is not a model parameter (shape "
-                    f"{tuple(param.shape)}); a distributed/mixed-precision optimizer keeps sharded main copies and "
-                    f"needs a DP gather before its state can be keyed by name"
+    slots = []
+    for leaf in _optimizer_leaves(optimizer):
+        if isinstance(leaf, torch.optim.Optimizer):
+            slots += _torch_slots(leaf, {}, name_of)
+        elif _is_distributed(leaf):
+            slots += _distributed_slots(leaf, name_of)
+        elif hasattr(leaf, "float16_groups") and hasattr(leaf, "fp32_from_float16_groups"):
+            main_to_model = {
+                id(main): model
+                for model_group, main_group in zip(leaf.float16_groups, leaf.fp32_from_float16_groups, strict=True)
+                for model, main in zip(model_group, main_group, strict=True)
+            }
+            slots += _torch_slots(leaf.optimizer, main_to_model, name_of)
+        elif isinstance(getattr(leaf, "optimizer", None), torch.optim.Optimizer):
+            slots += _torch_slots(leaf.optimizer, {}, name_of)
+        else:
+            raise NotImplementedError(f"DP-invariant LoRA state does not support {type(leaf).__name__}")
+    names = [slot.name for slot in slots]
+    duplicated = sorted({n for n in names if names.count(n) > 1})
+    assert not duplicated, f"parameters {duplicated} appear in more than one optimizer slot"
+    return slots
+
+
+def _hyper(group: Mapping[str, Any]) -> dict[str, Any]:
+    return {k: copy.deepcopy(v) for k, v in group.items() if k != "params"}
+
+
+def export_named_optimizer_state(optimizer: Any, named_params) -> dict[str, Any]:
+    """This rank's optimizer state keyed by parameter name, each entry tagged with its range in the parameter."""
+    entries = {}
+    for slot in optimizer_slots(optimizer, named_params):
+        tensors, scalars = {}, {}
+        for key, value in slot.get().items():
+            value = value.detach().cpu()
+            if value.dim() == 0:
+                scalars[key] = value.clone()
+                continue
+            flat = value.reshape(-1).clone()
+            if flat.numel() != slot.end - slot.start:
+                raise DpInvariantStateError(
+                    f"{slot.name!r}: state {key!r} has {flat.numel()} elements but the owned range is "
+                    f"[{slot.start}, {slot.end})"
                 )
-            names.append(name_of[id(param)])
-        groups.append(names)
-    return groups
+            tensors[key] = flat
+        entries[slot.name] = {
+            "numel": slot.model_param.numel(),
+            "shape": tuple(slot.model_param.shape),
+            "start": slot.start,
+            "end": slot.end,
+            "tensors": tensors,
+            "scalars": scalars,
+            "hyper": _hyper(slot.group),
+        }
+    return {"format": NAMED_STATE_FORMAT, "entries": entries}
 
 
-def optimizer_state_to_named(state_dict: Mapping[str, Any], group_names: Sequence[Sequence[str]]) -> dict[str, Any]:
-    """Re-key a torch ``optimizer.state_dict()`` by parameter name."""
-    groups = state_dict["param_groups"]
-    assert len(groups) == len(group_names), f"{len(groups)} param groups but names for {len(group_names)}"
-    index_to_name: dict[int, str] = {}
-    named_groups = []
-    for group, names in zip(groups, group_names, strict=True):
-        assert len(group["params"]) == len(names), f"group has {len(group['params'])} params, {len(names)} names"
-        index_to_name.update(zip(group["params"], names, strict=True))
-        named_groups.append({**{k: v for k, v in group.items() if k != "params"}, "param_names": list(names)})
-    state = {index_to_name[index]: copy.deepcopy(value) for index, value in state_dict["state"].items()}
-    return {"format": NAMED_STATE_FORMAT, "param_groups": named_groups, "state": state}
+def merge_named_optimizer_states(shards: Sequence[Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Gather the DP shards of one (tp, pp) coordinate into full flat tensors per parameter name.
 
-
-def named_to_optimizer_state(named: Mapping[str, Any], group_names: Sequence[Sequence[str]]) -> dict[str, Any]:
-    """Build a torch ``state_dict`` for an optimizer whose groups hold ``group_names``.
-
-    Hyperparameters of each target group come from the saved group holding its first name; a target whose names are
-    split across saved groups with different hyperparameters is rejected.
-    """
-    assert named.get("format") == NAMED_STATE_FORMAT, f"not a named optimizer state: {named.get('format')!r}"
-    group_of_name = {}
-    for saved_group in named["param_groups"]:
-        for name in saved_group["param_names"]:
-            group_of_name[name] = saved_group
-    wanted = [name for names in group_names for name in names]
-    missing = sorted(set(wanted) - set(group_of_name))
-    if missing:
-        raise KeyError(f"named optimizer state lacks parameters {missing}")
-
-    param_groups, state, index = [], {}, 0
-    for names in group_names:
-        hyper = [{k: v for k, v in group_of_name[n].items() if k != "param_names"} for n in names]
-        assert all(
-            h == hyper[0] for h in hyper
-        ), f"parameters {list(names)} come from groups with different hyperparameters"
-        params = []
-        for name in names:
-            if name in named["state"]:
-                state[index] = copy.deepcopy(named["state"][name])
-            params.append(index)
-            index += 1
-        param_groups.append({**(hyper[0] if hyper else {}), "params": params})
-    return {"state": state, "param_groups": param_groups}
-
-
-def merge_named_optimizer_states(shards: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    """Merge the named states of several DP shards of the same (tp, pp) coordinate.
-
-    Replicated (non-distributed) optimizers write identical entries on every DP rank; they must agree exactly.
+    Ranges written by more than one rank (replicated optimizers) must agree exactly; every parameter must be
+    covered completely, otherwise a shard file is missing.
     """
     assert shards, "no shards to merge"
-    merged_state: dict[str, Any] = {}
-    merged_groups: dict[str, dict] = {}
+    merged: dict[str, dict[str, Any]] = {}
+    covered: dict[str, torch.Tensor] = {}
     for shard in shards:
-        assert shard.get("format") == NAMED_STATE_FORMAT, f"not a named optimizer state: {shard.get('format')!r}"
-        for name, value in shard["state"].items():
-            if name in merged_state:
-                if not _equal(merged_state[name], value):
-                    raise ValueError(f"DP shards disagree on the optimizer state of {name!r}")
-            else:
-                merged_state[name] = value
-        for group in shard["param_groups"]:
-            hyper = {k: v for k, v in group.items() if k != "param_names"}
-            for name in group["param_names"]:
-                if name in merged_groups and merged_groups[name] != hyper:
-                    raise ValueError(f"DP shards disagree on the hyperparameters of {name!r}")
-                merged_groups[name] = hyper
-    groups_by_hyper: list[tuple[dict, list[str]]] = []
-    for name, hyper in merged_groups.items():
-        for existing, names in groups_by_hyper:
-            if existing == hyper:
-                names.append(name)
-                break
-        else:
-            groups_by_hyper.append((hyper, [name]))
-    return {
-        "format": NAMED_STATE_FORMAT,
-        "param_groups": [{**hyper, "param_names": names} for hyper, names in groups_by_hyper],
-        "state": merged_state,
-    }
+        if shard.get("format") != NAMED_STATE_FORMAT:
+            raise DpInvariantStateError(f"not a {NAMED_STATE_FORMAT} optimizer state: {shard.get('format')!r}")
+        for name, entry in shard["entries"].items():
+            start, end = entry["start"], entry["end"]
+            if name not in merged:
+                merged[name] = {
+                    "numel": entry["numel"],
+                    "shape": tuple(entry["shape"]),
+                    "tensors": {
+                        k: torch.zeros(entry["numel"], dtype=v.dtype) for k, v in entry["tensors"].items()
+                    },
+                    "scalars": dict(entry["scalars"]),
+                    "hyper": entry["hyper"],
+                }
+                covered[name] = torch.zeros(entry["numel"], dtype=torch.bool)
+            target = merged[name]
+            if (target["numel"], target["shape"]) != (entry["numel"], tuple(entry["shape"])):
+                raise DpInvariantStateError(f"DP shards disagree on the shape of {name!r}")
+            if target["tensors"].keys() != entry["tensors"].keys():
+                raise DpInvariantStateError(f"DP shards disagree on the state keys of {name!r}")
+            if not _equal(target["scalars"], entry["scalars"]):
+                raise DpInvariantStateError(f"DP shards disagree on the scalar state (e.g. step) of {name!r}")
+            if target["hyper"] != entry["hyper"]:
+                raise DpInvariantStateError(f"DP shards disagree on the hyperparameters of {name!r}")
+            overlap = covered[name][start:end]
+            for key, piece in entry["tensors"].items():
+                existing = target["tensors"][key][start:end]
+                if overlap.any() and not torch.equal(existing[overlap], piece[overlap]):
+                    raise DpInvariantStateError(f"DP shards disagree on the optimizer state {key!r} of {name!r}")
+                existing.copy_(piece)
+            covered[name][start:end] = True
+    incomplete = sorted(name for name, mask in covered.items() if not bool(mask.all()))
+    if incomplete:
+        raise DpInvariantStateError(
+            f"optimizer state of {incomplete} is not fully covered; a DP shard file is missing"
+        )
+    return merged
+
+
+def load_named_optimizer_state(optimizer: Any, named_params, merged: Mapping[str, Mapping[str, Any]]) -> None:
+    """Scatter the merged (gathered) state onto the ranges this rank's optimizer owns."""
+    for leaf in _optimizer_leaves(optimizer):
+        if _is_distributed(leaf) and not leaf.optimizer.state:
+            # A freshly built DistOpt has no state tensors yet; Megatron's own loaders initialize them first.
+            leaf._init_optimizer_states_with_dummy_values()
+    slots = optimizer_slots(optimizer, named_params)
+    missing = sorted(slot.name for slot in slots if slot.name not in merged)
+    if missing:
+        raise KeyError(f"named optimizer state lacks parameters {missing}")
+    for slot in slots:
+        full = merged[slot.name]
+        if full["numel"] != slot.model_param.numel():
+            raise DpInvariantStateError(
+                f"{slot.name!r} has {slot.model_param.numel()} elements, the checkpoint {full['numel']}"
+            )
+        tensors = {k: v[slot.start : slot.end] for k, v in full["tensors"].items()}
+        tensors.update({k: v.clone() for k, v in full["scalars"].items()})
+        slot.set(tensors)
+    groups: dict[int, tuple[dict, list[str]]] = {}
+    for slot in slots:
+        groups.setdefault(id(slot.group), (slot.group, []))[1].append(slot.name)
+    for group, names in groups.values():
+        hypers = [merged[n]["hyper"] for n in names]
+        if any(h != hypers[0] for h in hypers):
+            raise DpInvariantStateError(f"parameters {names} come from groups with different hyperparameters")
+        group.update(copy.deepcopy(hypers[0]))
 
 
 def _equal(a: Any, b: Any) -> bool:
@@ -169,27 +311,6 @@ def _equal(a: Any, b: Any) -> bool:
     if isinstance(a, Mapping) and isinstance(b, Mapping):
         return a.keys() == b.keys() and all(_equal(a[k], b[k]) for k in a)
     return a == b
-
-
-def unwrap_name_mappable_optimizer(optimizer: Any) -> torch.optim.Optimizer:
-    """The plain torch optimizer behind ``optimizer`` whose params are model parameters, or NotImplementedError."""
-    seen = 0
-    current = optimizer
-    while not isinstance(current, torch.optim.Optimizer):
-        seen += 1
-        inner = getattr(current, "optimizer", None)
-        if inner is None or seen > 4:
-            raise NotImplementedError(
-                f"{type(optimizer).__name__} exposes no plain torch optimizer; DP-invariant LoRA state is "
-                f"implemented only for non-distributed optimizers"
-            )
-        if type(current).__name__ in ("DistributedOptimizer", "ChainedOptimizer"):
-            raise NotImplementedError(
-                f"{type(current).__name__} shards its state over DP; keying it by name needs a DP gather that is "
-                f"not implemented (disable --use-distributed-optimizer for DP-invariant LoRA state)"
-            )
-        current = inner
-    return current
 
 
 # ---------------------------------------------------------------------------

@@ -255,11 +255,7 @@ def _write_dp_invariant_state(
         )
     named_optimizer = None
     if optimizer is not None:
-        torch_optimizer = dp_invariant_state.unwrap_name_mappable_optimizer(optimizer)
-        group_names = dp_invariant_state.param_names_per_group(
-            torch_optimizer, [item for chunk in model for item in chunk.named_parameters()]
-        )
-        named_optimizer = dp_invariant_state.optimizer_state_to_named(torch_optimizer.state_dict(), group_names)
+        named_optimizer = dp_invariant_state.export_named_optimizer_state(optimizer, _named_parameters(model))
     torch.save(
         {
             "iteration": training_state["iteration"] if training_state else None,
@@ -288,43 +284,54 @@ def _load_dp_invariant_state(
     adapter_file = adapter_dir / dp_invariant_state.dp_invariant_adapter_filename(tp_rank=tp_rank, pp_rank=pp_rank)
     if not adapter_file.exists():
         return False, None, False
-    _copy_adapter_state(model, torch.load(adapter_file, map_location="cpu", weights_only=True), source=adapter_file)
 
     files = dp_invariant_state.list_named_training_state_files(adapter_dir, tp_rank=tp_rank, pp_rank=pp_rank)
-    if not files:
-        return True, None, False
     shards = {dp: torch.load(path, map_location="cpu", weights_only=False) for dp, path in files.items()}
     own = shards.get(dp_rank)
-    reference = own if own is not None else shards[min(shards)]
-
-    optimizer_restored = False
+    # Decide the RNG outcome before touching the model, so a refused load leaves adapter and optimizer untouched.
+    restore_rng = None
+    if shards:
+        saved_dp_sizes = {s.get("dp_size") for s in shards.values()}
+        same_layout = saved_dp_sizes == {dp_size} and sorted(shards) == list(range(dp_size))
+        if same_layout and own is not None and own.get("rng") is not None:
+            restore_rng = own["rng"]
+        elif rng_policy == "exact":
+            raise dp_invariant_state.DpInvariantStateError(
+                f"--lora-dp-invariant-rng exact: the checkpoint holds RNG for DP size(s) "
+                f"{sorted(map(str, saved_dp_sizes))} and ranks {sorted(shards)}, this run has DP size {dp_size} "
+                f"(rank {dp_rank}); restoring RNG across a DP change needs an explicit policy (keep_on_dp_change)"
+            )
+        else:
+            logger.warning(
+                f"DP layout changed (saved DP sizes {sorted(map(str, saved_dp_sizes))}, now {dp_size}); keeping "
+                f"this rank's current RNG (policy keep_on_dp_change)"
+            )
     named = [s["optimizer_named"] for s in shards.values() if s.get("optimizer_named") is not None]
+    merged = None
     if optimizer is not None and load_optimizer and named:
-        torch_optimizer = dp_invariant_state.unwrap_name_mappable_optimizer(optimizer)
-        group_names = dp_invariant_state.param_names_per_group(
-            torch_optimizer, [item for chunk in model for item in chunk.named_parameters()]
-        )
+        # Gather (and validate coverage) before any write as well.
         merged = dp_invariant_state.merge_named_optimizer_states(named)
-        torch_optimizer.load_state_dict(dp_invariant_state.named_to_optimizer_state(merged, group_names))
+
+    _copy_adapter_state(model, torch.load(adapter_file, map_location="cpu", weights_only=True), source=adapter_file)
+    if not shards:
+        return True, None, False
+    reference = own if own is not None else shards[min(shards)]
+    optimizer_restored = False
+    if merged is not None:
+        dp_invariant_state.load_named_optimizer_state(optimizer, _named_parameters(model), merged)
         optimizer_restored = True
     if opt_param_scheduler is not None and reference.get("opt_param_scheduler") is not None:
         opt_param_scheduler.load_state_dict(reference["opt_param_scheduler"])
-    saved_dp_sizes = {s.get("dp_size") for s in shards.values()}
-    same_layout = saved_dp_sizes == {dp_size} and sorted(shards) == list(range(dp_size))
-    if same_layout and own is not None and own.get("rng") is not None:
-        dp_invariant_state.restore_rng_state(own["rng"])
-    elif rng_policy == "exact":
-        raise dp_invariant_state.DpInvariantStateError(
-            f"--lora-dp-invariant-rng exact: the checkpoint holds RNG for DP size(s) {sorted(map(str, saved_dp_sizes))} "
-            f"and ranks {sorted(shards)}, this run has DP size {dp_size} (rank {dp_rank}); restoring RNG across a DP "
-            f"change needs an explicit policy (keep_on_dp_change)"
-        )
-    else:
-        logger.warning(
-            f"DP layout changed (saved DP sizes {sorted(map(str, saved_dp_sizes))}, now {dp_size}); keeping this "
-            f"rank's current RNG (policy keep_on_dp_change)"
-        )
+    if restore_rng is not None:
+        dp_invariant_state.restore_rng_state(restore_rng)
     return True, reference.get("iteration"), optimizer_restored
+
+
+def _named_parameters(model: Sequence[torch.nn.Module]) -> list[tuple[str, torch.nn.Parameter]]:
+    """Parameter names for optimizer state; virtual-pipeline chunks reuse local names, so they get a chunk prefix."""
+    if len(model) == 1:
+        return list(model[0].named_parameters())
+    return [(f"chunk{i}.{name}", p) for i, chunk in enumerate(model) for name, p in chunk.named_parameters()]
 
 
 def _copy_adapter_state(model: Sequence[torch.nn.Module], state_dict: dict, *, source: Path) -> None:

@@ -79,8 +79,9 @@ def add_lora_arguments(parser):
         help=(
             "Also save LoRA training state in a DP-invariant form (optimizer state keyed by parameter name per "
             "(tp, pp, dp), one adapter copy per (tp, pp), and Python/NumPy/Torch/CUDA RNG) and prefer it on load, "
-            "so a checkpoint can be restored at another DP size with TP/PP/EP fixed. Requires a non-distributed "
-            "optimizer and EP=1. Off keeps the per-rank format only."
+            "so a checkpoint can be restored at another DP size with TP/PP/EP fixed. Works with bf16 and the "
+            "distributed optimizer (shards are gathered/resharded by parameter range on load); requires no fp16, "
+            "CP=1, EP=1. Off keeps the per-rank format only."
         ),
     )
     parser.add_argument(
@@ -155,19 +156,25 @@ def add_lora_arguments(parser):
 
 
 def check_lora_dp_invariant_config(
-    *, use_distributed_optimizer: bool, bf16: bool, fp16: bool, cp_size: int, ep_size: int
+    *,
+    fp16: bool,
+    cp_size: int,
+    ep_size: int,
+    precision_aware_optimizer: bool = False,
+    distributed_optimizer_instances: int = 1,
 ):
-    """Fail fast on configurations whose optimizer state or RNG cannot be keyed by name per (tp, pp, dp)."""
+    """Fail fast on configurations whose optimizer state or RNG cannot be keyed by name per (tp, pp, dp).
+
+    Supported: fp32 or bf16 training, with or without --use-distributed-optimizer (the DistOpt shards are gathered
+    and resharded through the checkpoint directory, see ``dp_invariant_state``).
+    """
     problems = []
-    if use_distributed_optimizer:
-        problems.append(
-            "--use-distributed-optimizer shards optimizer state over DP; the DP gather it needs is not implemented"
-        )
-    if bf16 or fp16:
-        problems.append(
-            "--bf16/--fp16 give the optimizer fp32 main copies that are not the model parameters, so its state "
-            "cannot be keyed by parameter name"
-        )
+    if fp16:
+        problems.append("--fp16 keeps a dynamic loss-scaler state that the DP-invariant format does not save")
+    if precision_aware_optimizer:
+        problems.append("--use-precision-aware-optimizer stores scaled/low-precision state that is not supported")
+    if distributed_optimizer_instances > 1:
+        problems.append("--num-distributed-optimizer-instances > 1 shards the optimizer over a partial DP group")
     if cp_size > 1:
         problems.append("context parallelism (CP>1) is not supported: the saved coordinate is the pure DP rank")
     if ep_size > 1:
@@ -177,17 +184,21 @@ def check_lora_dp_invariant_config(
 
 
 def validate_lora_dp_invariant_args(args) -> None:
-    """Fail fast at argument parsing on configurations --lora-dp-invariant-state cannot save or load."""
+    """Fail fast at argument parsing on configurations --lora-dp-invariant-state cannot save or load.
+
+    Runs after ``set_default_megatron_args`` (which turns on bf16 and, for Adam, the distributed optimizer), so the
+    checked values are the ones training will use.
+    """
     if not getattr(args, "lora_dp_invariant_state", False):
         return
     if not is_lora_enabled(args):
         raise ValueError("--lora-dp-invariant-state needs LoRA training")
     check_lora_dp_invariant_config(
-        use_distributed_optimizer=bool(getattr(args, "use_distributed_optimizer", False)),
-        bf16=bool(getattr(args, "bf16", False)),
         fp16=bool(getattr(args, "fp16", False)),
         cp_size=getattr(args, "context_parallel_size", 1) or 1,
         ep_size=getattr(args, "expert_model_parallel_size", 1) or 1,
+        precision_aware_optimizer=bool(getattr(args, "use_precision_aware_optimizer", False)),
+        distributed_optimizer_instances=getattr(args, "num_distributed_optimizer_instances", 1) or 1,
     )
 
 

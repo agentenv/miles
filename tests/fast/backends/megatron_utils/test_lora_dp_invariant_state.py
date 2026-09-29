@@ -45,85 +45,237 @@ def _step(model: _Model, optimizer: torch.optim.Optimizer, seed: int) -> None:
     optimizer.step()
 
 
-def _group_names(model, optimizer):
-    return dps.param_names_per_group(optimizer, model.named_parameters())
+def _named(model):
+    return model.named_parameters()
+
+
+def _export(model, optimizer):
+    return dps.export_named_optimizer_state(optimizer, _named(model))
+
+
+def _load(model, optimizer, shards):
+    dps.load_named_optimizer_state(optimizer, _named(model), dps.merge_named_optimizer_states(shards))
 
 
 class TestNamedOptimizerState:
     def test_state_is_keyed_by_name_and_survives_a_different_param_order(self):
-        """Resuming from name-keyed state gives the same next step as never stopping."""
-        reference, source = _Model(), _Model()
-        ref_opt, src_opt = _optimizer(reference, _NAMES), _optimizer(source, _NAMES)
-        for seed in range(3):
-            _step(reference, ref_opt, seed)
-            _step(source, src_opt, seed)
-        named = dps.optimizer_state_to_named(src_opt.state_dict(), _group_names(source, src_opt))
-        assert set(named["state"]) == set(_NAMES)
+        src = _Model(0)
+        src_opt = _optimizer(src, _NAMES)
+        _step(src, src_opt, 1)
+        named = _export(src, src_opt)
 
-        target = _Model(seed=1)
-        with torch.no_grad():
-            for name in _NAMES:
-                target.params[name].copy_(source.params[name])
-        tgt_opt = _optimizer(target, list(reversed(_NAMES)))
-        tgt_opt.load_state_dict(dps.named_to_optimizer_state(named, _group_names(target, tgt_opt)))
-
-        _step(reference, ref_opt, 99)
-        _step(target, tgt_opt, 99)
+        tgt = _Model(0)
+        tgt_opt = _optimizer(tgt, list(reversed(_NAMES)))
+        _load(tgt, tgt_opt, [named])
         for name in _NAMES:
-            torch.testing.assert_close(target.params[name], reference.params[name], rtol=0, atol=0)
-
-    def test_disjoint_dp_shards_merge_and_load_at_a_smaller_dp(self):
-        model = _Model()
-        opt = _optimizer(model, _NAMES)
-        _step(model, opt, 0)
-        full = dps.optimizer_state_to_named(opt.state_dict(), _group_names(model, opt))
-        shard0 = {**full, "state": {n: v for n, v in full["state"].items() if n != _NAMES[2]}}
-        shard1 = {**full, "state": {_NAMES[2]: full["state"][_NAMES[2]]}}
-
-        merged = dps.merge_named_optimizer_states([shard0, shard1])
-
-        assert set(merged["state"]) == set(_NAMES)
-        fresh = _optimizer(_Model(), _NAMES)
-        fresh.load_state_dict(dps.named_to_optimizer_state(merged, _group_names(model, opt)))
-        assert fresh.param_groups[1]["lr"] == 0.01
+            s, t = src_opt.state[src.params[name]], tgt_opt.state[tgt.params[name]]
+            torch.testing.assert_close(t["exp_avg"], s["exp_avg"], rtol=0, atol=0)
+            torch.testing.assert_close(t["step"], s["step"], rtol=0, atol=0)
+            torch.testing.assert_close(tgt.params[name].data, src.params[name].data, rtol=0, atol=0)
+        assert tgt_opt.param_groups[1]["lr"] == 0.01
 
     def test_replicated_shards_must_agree(self):
-        model = _Model()
+        model = _Model(0)
         opt = _optimizer(model, _NAMES)
-        _step(model, opt, 0)
-        a = dps.optimizer_state_to_named(opt.state_dict(), _group_names(model, opt))
-        b = dps.optimizer_state_to_named(opt.state_dict(), _group_names(model, opt))
-        b["state"][_NAMES[0]]["exp_avg"] = b["state"][_NAMES[0]]["exp_avg"] + 1
-
-        assert set(dps.merge_named_optimizer_states([a, a])["state"]) == set(_NAMES)
-        with pytest.raises(ValueError, match="disagree on the optimizer state"):
+        _step(model, opt, 1)
+        a = _export(model, opt)
+        _step(model, opt, 2)
+        b = _export(model, opt)
+        assert set(dps.merge_named_optimizer_states([a, a])) == set(_NAMES)
+        with pytest.raises(dps.DpInvariantStateError, match="disagree"):
             dps.merge_named_optimizer_states([a, b])
 
     def test_missing_names_and_mixed_hyperparameters_are_refused(self):
-        model = _Model()
+        model = _Model(0)
         opt = _optimizer(model, _NAMES)
-        named = dps.optimizer_state_to_named(opt.state_dict(), _group_names(model, opt))
+        _step(model, opt, 1)
+        merged = dps.merge_named_optimizer_states([_export(model, opt)])
+        merged.pop(_NAMES[0])
+        with pytest.raises(KeyError, match="lacks parameters"):
+            dps.load_named_optimizer_state(opt, _named(model), merged)
 
-        with pytest.raises(KeyError, match="layers.9"):
-            dps.named_to_optimizer_state(named, [["layers.9.lora_A.weight"]])
-        with pytest.raises(AssertionError, match="different hyperparameters"):
-            dps.named_to_optimizer_state(named, [[_NAMES[0], _NAMES[2]]])
+        merged = dps.merge_named_optimizer_states([_export(model, opt)])
+        mixed = torch.optim.AdamW([{"params": [model.params[_NAMES[0]], model.params[_NAMES[2]]]}])
+        with pytest.raises(dps.DpInvariantStateError, match="different hyperparameters"):
+            dps.load_named_optimizer_state(mixed, [(n, model.params[n]) for n in (_NAMES[0], _NAMES[2])], merged)
 
-    def test_an_optimizer_over_non_model_tensors_is_not_name_mappable(self):
-        model = _Model()
-        opt = torch.optim.SGD([torch.nn.Parameter(torch.zeros(2))], lr=0.1)
-        with pytest.raises(NotImplementedError, match="DP gather"):
-            dps.param_names_per_group(opt, model.named_parameters())
+    def test_an_optimizer_over_non_model_tensors_is_refused(self):
+        model = _Model(0)
+        opt = torch.optim.Adam([torch.nn.Parameter(torch.zeros(2))])
+        with pytest.raises(NotImplementedError, match="maps to no model parameter"):
+            _export(model, opt)
 
-    def test_a_distributed_optimizer_wrapper_is_refused(self):
-        class DistributedOptimizer:
-            def __init__(self, inner):
-                self.optimizer = inner
+    def test_an_unknown_optimizer_wrapper_is_refused(self):
+        with pytest.raises(NotImplementedError, match="does not support"):
+            _export(_Model(0), SimpleNamespace())
 
-        inner = _optimizer(_Model(), _NAMES)
-        assert dps.unwrap_name_mappable_optimizer(SimpleNamespace(optimizer=inner)) is inner
-        with pytest.raises(NotImplementedError, match="DistributedOptimizer shards its state"):
-            dps.unwrap_name_mappable_optimizer(DistributedOptimizer(inner))
+
+class _Float16Optimizer:
+    """The attribute layout of Megatron Float16OptimizerWithFloat16Params (whose ctor needs CUDA tensors)."""
+
+    def __init__(self, model, lr=0.1):
+        self.float16_groups = [[p for p in model.parameters()]]
+        self.fp32_from_float16_groups = [[p.detach().clone().float() for p in self.float16_groups[0]]]
+        self.fp32_from_fp32_groups = [[]]
+        self.optimizer = torch.optim.Adam(self.fp32_from_float16_groups[0], lr=lr, foreach=False)
+
+    def step(self, grads):
+        for main, g in zip(self.fp32_from_float16_groups[0], grads, strict=True):
+            main.grad = g.clone()
+        self.optimizer.step()
+        for model_p, main in zip(self.float16_groups[0], self.fp32_from_float16_groups[0], strict=True):
+            model_p.data.copy_(main)
+
+
+class _Bf16Model(torch.nn.Module):
+    def __init__(self, seed):
+        super().__init__()
+        g = torch.Generator().manual_seed(seed)
+        self.lora_A = torch.nn.Parameter(torch.randn(3, 5, generator=g).bfloat16())
+        self.lora_B = torch.nn.Parameter(torch.randn(7, generator=g).bfloat16())
+
+
+class TestFloat16Optimizer:
+    def test_fp32_main_params_and_state_roundtrip_by_name(self):
+        src = _Bf16Model(0)
+        opt = _Float16Optimizer(src)
+        opt.step([torch.randn(3, 5), torch.randn(7)])
+        named = _export(src, opt)
+        assert named["entries"]["lora_A"]["tensors"]["param"].dtype == torch.float32
+
+        tgt = _Bf16Model(1)
+        tgt_opt = _Float16Optimizer(tgt)
+        _load(tgt, tgt_opt, [named])
+        for s_main, t_main in zip(opt.fp32_from_float16_groups[0], tgt_opt.fp32_from_float16_groups[0], strict=True):
+            torch.testing.assert_close(t_main, s_main, rtol=0, atol=0)  # full fp32 precision, not the bf16 copy
+            for key in ("exp_avg", "exp_avg_sq", "step"):
+                torch.testing.assert_close(tgt_opt.optimizer.state[t_main][key], opt.optimizer.state[s_main][key])
+        grads = [torch.randn(3, 5), torch.randn(7)]
+        opt.step(grads)
+        tgt_opt.step(grads)
+        for s_main, t_main in zip(opt.fp32_from_float16_groups[0], tgt_opt.fp32_from_float16_groups[0], strict=True):
+            torch.testing.assert_close(t_main, s_main, rtol=0, atol=0)
+
+
+# --- DistributedOptimizer: the real Megatron range/state accessors on a CPU-constructible object -------------------
+
+_dist = pytest.importorskip("megatron.core.optimizer.distrib_optimizer")
+
+
+class _DistOpt:
+    """One DP rank of a Megatron DistributedOptimizer over one flat bf16 buffer holding ``params`` in order.
+
+    The ranges come from ``DistributedOptimizer._build_model_gbuf_param_range_map`` and the state accessors are the
+    real DistributedOptimizer methods; only the CUDA grad buffer is replaced by the index arithmetic it performs.
+    """
+
+    _get_main_param_and_optimizer_states = _dist.DistributedOptimizer._get_main_param_and_optimizer_states
+    _set_main_param_and_optimizer_states = _dist.DistributedOptimizer._set_main_param_and_optimizer_states
+    _init_optimizer_states_with_dummy_values = _dist.DistributedOptimizer._init_optimizer_states_with_dummy_values
+
+    def __init__(self, params, full_main, *, dp_rank, dp_size, lr=0.1):
+        index_map, offset = {}, 0
+        for p in params:
+            index_map[p] = (offset, offset + p.numel(), 0)
+            offset += p.numel()
+        shard = -(-offset // dp_size)
+        world = _dist.Range(dp_rank * shard, min((dp_rank + 1) * shard, offset))
+        param_map = _dist.DistributedOptimizer._build_model_gbuf_param_range_map(index_map, world, 0)
+        self.gbuf_ranges = [{(torch.bfloat16, torch.float32): [{"param_map": param_map}]}]
+        self.model_param_group_index_map, mains = {}, []
+        for p, ranges in param_map.items():
+            r = ranges["param"]
+            self.model_param_group_index_map[p] = (0, len(mains))
+            mains.append(full_main[p].reshape(-1)[r.start : r.end].clone())
+        self.param_map = param_map
+        self.config = SimpleNamespace(use_precision_aware_optimizer_no_fp8_or_ds_fp8=False)
+        self.optimizer = torch.optim.AdamW(
+            [{"params": mains, "lr": lr, "weight_decay": 0.01}] if mains else [{"params": [torch.zeros(0)]}],
+            foreach=False,
+        )
+
+    def step(self, full_grads):
+        for p, ranges in self.param_map.items():
+            gi, go = self.model_param_group_index_map[p]
+            r = ranges["param"]
+            self.optimizer.param_groups[gi]["params"][go].grad = full_grads[p].reshape(-1)[r.start : r.end].clone()
+        self.optimizer.step()
+
+    def gather_into(self, full):
+        for p, ranges in self.param_map.items():
+            gi, go = self.model_param_group_index_map[p]
+            r = ranges["param"]
+            full[p].reshape(-1)[r.start : r.end] = self.optimizer.param_groups[gi]["params"][go].detach()
+
+    def state_dict(self):
+        return {}
+
+
+def _params_of(model):
+    return [p for _, p in model.named_parameters()]
+
+
+def _grads(model, seed):
+    g = torch.Generator().manual_seed(seed)
+    return {p: torch.randn(p.shape, generator=g) for p in _params_of(model)}
+
+
+class TestDistributedOptimizerGatherReshard:
+    """Save at one DP size, gather through the files, reshard at another; the next step must match exactly."""
+
+    def _reference(self, model, init):
+        mains = [init[p].clone().reshape(-1) for p in _params_of(model)]
+        opt = torch.optim.AdamW([{"params": mains, "lr": 0.1, "weight_decay": 0.01}], foreach=False)
+
+        def step(grads):
+            for m, p in zip(mains, _params_of(model), strict=True):
+                m.grad = grads[p].reshape(-1).clone()
+            opt.step()
+
+        return mains, step
+
+    @pytest.mark.parametrize("save_dp, load_dp", [(2, 1), (2, 3), (1, 4), (4, 2)])
+    def test_the_next_step_after_a_dp_change_matches_an_unsharded_run(self, save_dp, load_dp):
+        model = _Bf16Model(0)
+        init = {p: p.detach().float() for p in _params_of(model)}
+        ref_mains, ref_step = self._reference(model, init)
+
+        savers = [_DistOpt(_params_of(model), init, dp_rank=r, dp_size=save_dp) for r in range(save_dp)]
+        for seed in (1, 2):
+            for opt in savers:
+                opt.step(_grads(model, seed))
+            ref_step(_grads(model, seed))
+        shards = [_export(model, opt) for opt in savers]
+
+        zeros = {p: torch.zeros(p.shape) for p in _params_of(model)}
+        loaders = [_DistOpt(_params_of(model), zeros, dp_rank=r, dp_size=load_dp) for r in range(load_dp)]
+        for opt in loaders:
+            _load(model, opt, shards)
+            opt.step(_grads(model, 3))
+        ref_step(_grads(model, 3))
+
+        gathered = {p: torch.full(p.shape, float("nan")) for p in _params_of(model)}
+        for opt in loaders:
+            opt.gather_into(gathered)
+        for p, ref in zip(_params_of(model), ref_mains, strict=True):
+            torch.testing.assert_close(gathered[p].reshape(-1), ref.detach(), rtol=0, atol=0)
+
+    def test_a_missing_dp_shard_is_detected(self):
+        model = _Bf16Model(0)
+        init = {p: p.detach().float() for p in _params_of(model)}
+        savers = [_DistOpt(_params_of(model), init, dp_rank=r, dp_size=2) for r in range(2)]
+        for opt in savers:
+            opt.step(_grads(model, 1))
+        with pytest.raises(dps.DpInvariantStateError, match="not fully covered"):
+            dps.merge_named_optimizer_states([_export(model, savers[0])])
+
+    def test_chained_optimizers_are_unwrapped(self):
+        model = _Bf16Model(0)
+        init = {p: p.detach().float() for p in _params_of(model)}
+        dist = _DistOpt(_params_of(model), init, dp_rank=0, dp_size=1)
+        dist.step(_grads(model, 1))
+        chained = SimpleNamespace(chained_optimizers=[dist])
+        assert set(_export(model, chained)["entries"]) == {"lora_A", "lora_B"}
 
 
 class TestRngState:
@@ -290,32 +442,115 @@ class TestSaveLoadDpInvariant:
             self._save(model, torch.optim.Adam(model.parameters()), tmp_path / "ckpt", flag=True)
 
 
+class TestDistributedOptimizerEndToEnd:
+    """save_lora_checkpoint at DP=2 with a bf16 model under a DistributedOptimizer, load_lora_adapter at DP=1."""
+
+    def test_dp2_to_dp1_through_the_checkpoint_directory(self, tmp_path, monkeypatch):
+        model = _Bf16Model(0)
+        init = {p: p.detach().float() for p in _params_of(model)}
+        savers = [_DistOpt(_params_of(model), init, dp_rank=r, dp_size=2) for r in range(2)]
+        for opt in savers:
+            opt.step(_grads(model, 1))
+        full = {p: torch.zeros(p.shape) for p in _params_of(model)}
+        for opt in savers:
+            opt.gather_into(full)
+        for p in _params_of(model):
+            p.data.copy_(full[p])
+
+        merged_dir = tmp_path / "merged"
+        merged_dir.mkdir()
+        for dp_rank, opt in enumerate(savers):
+            _patch_parallel_state(monkeypatch, dp_rank=dp_rank, dp_size=2)
+            args = Namespace(megatron_to_hf_mode="bridge", no_save_optim=False, lora_dp_invariant_state=True)
+            out = tmp_path / f"dp{dp_rank}"
+            lora_utils.save_lora_checkpoint(
+                [model], args, str(out), publisher=SimpleNamespace(write_adapter=lambda *_: None),
+                optimizer=opt, opt_param_scheduler=None, iteration=9,
+            )
+            for f in out.iterdir():
+                if "dp_invariant" in f.name or "named" in f.name:
+                    shutil.copy(f, merged_dir / f.name)
+
+        _patch_parallel_state(monkeypatch, dp_rank=0, dp_size=1)
+        target = _Bf16Model(5)
+        zeros = {p: torch.zeros(p.shape) for p in _params_of(target)}
+        loader = _DistOpt(_params_of(target), zeros, dp_rank=0, dp_size=1)
+        result = lora_utils.load_lora_adapter(
+            [target], str(merged_dir), optimizer=loader, dp_invariant=True, rng_policy="keep_on_dp_change"
+        )
+
+        assert result == (True, 9, True)
+        gathered = {p: torch.zeros(p.shape) for p in _params_of(target)}
+        loader.gather_into(gathered)
+        for src_p, tgt_p in zip(_params_of(model), _params_of(target), strict=True):
+            torch.testing.assert_close(gathered[tgt_p], full[src_p], rtol=0, atol=0)
+            torch.testing.assert_close(tgt_p.data, src_p.data, rtol=0, atol=0)
+
+    def test_the_exact_policy_refuses_a_dp_change_before_touching_the_model(self, tmp_path, monkeypatch):
+        model = _AdapterModel(1.0)
+        opt = torch.optim.Adam(model.parameters())
+        for dp_rank in (0, 1):
+            _patch_parallel_state(monkeypatch, dp_rank=dp_rank, dp_size=2)
+            args = Namespace(megatron_to_hf_mode="bridge", no_save_optim=False, lora_dp_invariant_state=True)
+            lora_utils.save_lora_checkpoint(
+                [model],
+                args,
+                str(tmp_path / f"dp{dp_rank}"),
+                publisher=SimpleNamespace(write_adapter=lambda *_: None),
+                optimizer=opt, opt_param_scheduler=None, iteration=1,
+            )
+        merged = tmp_path / "dp0"
+        shutil.copy(tmp_path / "dp1" / "training_state_named_tp0_pp0_dp1.pt", merged)
+        _patch_parallel_state(monkeypatch, dp_rank=0, dp_size=1)
+        target = _AdapterModel(0.0)
+        with pytest.raises(dps.DpInvariantStateError, match="explicit policy"):
+            lora_utils.load_lora_adapter([target], str(merged), dp_invariant=True, rng_policy="exact")
+        assert torch.equal(target.lora_A.data, torch.zeros(2, 2))
+
+
 class TestArgumentFailFast:
+    """Validation runs on the args as ``parse_args`` leaves them, i.e. after ``set_default_megatron_args``."""
+
     @staticmethod
     def _args(**overrides):
+        pytest.importorskip("megatron.training.arguments")
+        from miles.backends.megatron_utils.arguments import set_default_megatron_args
+
         base = dict(
             lora_dp_invariant_state=True,
             lora_rank=8,
-            use_distributed_optimizer=False,
-            bf16=False,
+            optimizer="adam",
             fp16=False,
+            seq_length=None,
+            vocab_size=None,
+            padded_vocab_size=None,
+            tokenizer_model="tok",
+            tokenizer_type="HuggingFaceTokenizer",
+            multi_latent_attention=False,
+            rope_type="rope",
+            spec=None,
             context_parallel_size=1,
             expert_model_parallel_size=1,
+            use_precision_aware_optimizer=False,
+            num_distributed_optimizer_instances=1,
         )
-        return Namespace(**{**base, **overrides})
+        return set_default_megatron_args(Namespace(**{**base, **overrides}))
 
-    def test_a_supported_config_passes_and_the_default_is_untouched(self):
+    def test_the_default_megatron_config_is_accepted(self):
         from miles.utils.lora.arguments import validate_lora_dp_invariant_args
 
-        validate_lora_dp_invariant_args(self._args())
-        validate_lora_dp_invariant_args(self._args(lora_dp_invariant_state=False, use_distributed_optimizer=True))
+        args = self._args()
+        assert args.bf16 and args.use_distributed_optimizer  # what a real launch gets
+        validate_lora_dp_invariant_args(args)
+        validate_lora_dp_invariant_args(self._args(optimizer="sgd"))  # bf16 without DistOpt
+        validate_lora_dp_invariant_args(self._args(lora_dp_invariant_state=False, fp16=True))
 
     @pytest.mark.parametrize(
         "overrides, match",
         [
-            (dict(use_distributed_optimizer=True), "DP gather it needs is not implemented"),
-            (dict(bf16=True), "fp32 main copies"),
-            (dict(fp16=True), "fp32 main copies"),
+            (dict(fp16=True), "loss-scaler"),
+            (dict(use_precision_aware_optimizer=True), "precision-aware"),
+            (dict(num_distributed_optimizer_instances=2), "partial DP group"),
             (dict(context_parallel_size=2), "CP>1"),
             (dict(expert_model_parallel_size=4), "EP>1"),
             (dict(lora_rank=0), "needs LoRA"),
