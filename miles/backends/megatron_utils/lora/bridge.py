@@ -166,6 +166,10 @@ def _setup_lora_model_via_bridge(args: Namespace) -> list:
     provider.moe_router_dtype = args.moe_router_dtype
     provider.moe_router_use_torch_mm = args.moe_router_use_torch_mm
     provider.variable_seq_lengths = True
+    # Same as the non-LoRA bridge path (model_provider._apply_bridge_runtime_config). Megatron's schedule and DDP
+    # read this from the model config: without it a per-token loss (loss.py returns (sum, num_tokens)) is divided
+    # by each microbatch's own token count and by num_microbatches instead of by the global token count.
+    provider.calculate_per_token_loss = args.calculate_per_token_loss
     provider.moe_token_dispatcher_type = "alltoall"
     provider.moe_router_load_balancing_type = "none"
     if is_multi_lora_enabled(args):
