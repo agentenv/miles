@@ -79,6 +79,7 @@ class RayWorkerManager:
         )
         self.comm_backend = comm_backend
         self.pgs = pgs
+        self._startup_pgs = dict(pgs)
         self._pools = {spec.name: _PoolManager.initial(spec, self) for spec in specs}
         assert len(self._pools) == len(specs)
         self._membership_lock = asyncio.Lock()
@@ -104,6 +105,101 @@ class RayWorkerManager:
     async def shutdown(self) -> None:
         async with self._membership_lock:
             await asyncio.gather(*[cell.stop() for cell in self._all_cells()])
+
+    # -------------------------- rebinding (elastic placement) -----------------------------
+    # A stopped cell or pool may be moved onto other bundles of the placement group created at startup; nothing
+    # here creates bundles, so every target stays inside the startup placement (map) range.
+
+    async def rebind_cell(self, cell_id: str, *, pg_name: str, pg_slot_offset: int) -> None:
+        """Bind a stopped cell's workers to slots ``pg_slot_offset..`` of ``pgs[pg_name]`` for its next start."""
+        async with self._membership_lock:
+            cell = self._find_cell(cell_id)
+            assert not cell.alive, f"cell {cell_id} is running; stop it before rebinding it"
+            binding = _CellBinding(pg_name=pg_name, pg_slot_offset=pg_slot_offset)
+            bundles = self._validate_binding(cell.spec, [binding])[0]
+            self._assert_bundles_free(bundles, ignore=cell)
+            cell.binding = binding
+            logger.info(f"Cell {cell_id} rebound to {pg_name}[{pg_slot_offset}:] (bundles {sorted(bundles)})")
+
+    async def stop_pools(self, pool_ids: list[str]) -> None:
+        async with self._membership_lock:
+            await asyncio.gather(*[cell.stop() for pool_id in pool_ids for cell in self._pools[pool_id].cells])
+
+    async def start_pools(self, pool_ids: list[str]) -> None:
+        await self.start_cells([cell.cell_id for pool_id in pool_ids for cell in self._pools[pool_id].cells])
+
+    async def set_pg_view(self, pg_name: str, info: PlacementGroupInfo) -> None:
+        """Point ``pg_name`` at another slice of the startup placement group (e.g. a new trainer bundle set)."""
+        async with self._membership_lock:
+            users = [c.cell_id for c in self._all_cells() if c.alive and c.pg_name == pg_name]
+            assert not users, f"cells {users} run on {pg_name!r}; stop them before re-pointing it"
+            known = {
+                (pg_key(pgi.pg), b) for pgi in self._startup_pgs.values() for b in pgi.pg_reordered_bundle_indices
+            }
+            wanted = {(pg_key(info.pg), b) for b in info.pg_reordered_bundle_indices}
+            outside = sorted(b for _, b in wanted - known)
+            assert not outside, f"bundles {outside} are outside the placement group created at startup"
+            assert len(wanted) == len(info.pg_reordered_bundle_indices), f"{pg_name!r} view repeats bundles"
+            self.pgs = {**self.pgs, pg_name: info}
+
+    async def replace_pool_spec(self, spec: BaseWorkerSpec) -> list[str]:
+        """Swap the spec of a fully stopped pool (e.g. a trainer with a new GPU count); returns its new cell ids."""
+        async with self._membership_lock:
+            old = self._pools.get(spec.name)
+            assert old is not None, f"unknown pool {spec.name!r}; known: {sorted(self._pools)}"
+            running = [c.cell_id for c in old.cells if c.alive]
+            assert not running, f"cells {running} of {spec.name!r} are running; stop the pool first"
+            new = _PoolManager.initial(spec, self)
+            self._validate_binding(spec, [None] * len(new.cells), cells=new.cells)
+            for cell in new.cells:
+                cell.generation = max((c.generation for c in old.cells), default=0)
+            self._pools[spec.name] = new
+            return [c.cell_id for c in new.cells]
+
+    def get_cell_bundles(self, cell_id: str) -> list[int]:
+        return sorted(b for _, b in self._find_cell(cell_id).bundles())
+
+    def _validate_binding(
+        self,
+        spec: BaseWorkerSpec,
+        bindings: list[_CellBinding | None],
+        *,
+        cells: list[_CellManager] | None = None,
+    ) -> list[set[tuple[Any, int]]]:
+        scheduling = spec.scheduling
+        results = []
+        for index, binding in enumerate(bindings):
+            probe = (
+                cells[index]
+                if cells is not None
+                else _CellManager(manager=self, cell_index=0, spec=spec, actors=None, binding=binding)
+            )
+            if probe.pg_name is None:
+                assert binding is None, f"{spec.name!r} owns no GPU slots and cannot be bound to a placement group"
+                results.append(set())
+                continue
+            if scheduling.num_gpu_slots_per_worker == 0:
+                assert binding is None, f"{spec.name!r} owns no GPU slots to rebind"
+                results.append(set())
+                continue
+            assert (
+                probe.pg_name in self.pgs
+            ), f"unknown placement group view {probe.pg_name!r}; known: {sorted(self.pgs)}"
+            num_slots = len(self.pgs[probe.pg_name].pg_reordered_bundle_indices)
+            slots = probe.all_slots()
+            bad = [slot for slot in slots if not 0 <= slot < num_slots]
+            assert not bad, f"slots {bad} are outside {probe.pg_name!r}, which has {num_slots} bundles"
+            results.append(probe.bundles())
+        return results
+
+    def _assert_bundles_free(self, bundles: set[tuple[Any, int]], *, ignore: _CellManager) -> None:
+        for other in self._all_cells():
+            if other is ignore or not other.alive:
+                continue
+            if overlap := bundles & other.bundles():
+                raise AssertionError(
+                    f"bundles {sorted(b for _, b in overlap)} are in use by running cell {other.cell_id}"
+                )
 
     def inject_fault(self, cell_id: str, *, mode: str, worker_in_cell_index: int) -> None:
         cell = self._find_cell(cell_id)
@@ -207,6 +303,16 @@ def _actor_manager_cls(spec: BaseWorkerSpec, *, comm_backend: WorkerCommBackend)
     raise AssertionError(f"{spec.name} is neither served nor launched as a command")
 
 
+def pg_key(pg: Any) -> Any:
+    return getattr(pg, "id", pg)
+
+
+@dataclass(frozen=True)
+class _CellBinding:
+    pg_name: str
+    pg_slot_offset: int
+
+
 @dataclass(kw_only=True)
 class _CellManager(Generic[SpecT]):
     manager: RayWorkerManager
@@ -215,6 +321,38 @@ class _CellManager(Generic[SpecT]):
     actors: list[_BaseActorManager] | None
     generation: int = 0
     liveness_scan_task: asyncio.Task | None = None
+    # set by RayWorkerManager.rebind_cell; None keeps the spec's own slot layout
+    binding: _CellBinding | None = None
+
+    @property
+    def pg_name(self) -> str | None:
+        return self.binding.pg_name if self.binding is not None else self.spec.scheduling.pg_name
+
+    def slot_of(self, worker_in_cell_index: int) -> int | None:
+        scheduling = self.spec.scheduling
+        if self.pg_name is None:
+            return None
+        if (binding := self.binding) is not None:
+            return binding.pg_slot_offset + worker_in_cell_index * scheduling.num_gpu_slots_per_worker
+        return (
+            scheduling.pg_slot_offset
+            + (self.cell_index * scheduling.num_workers_per_cell + worker_in_cell_index)
+            * scheduling.num_gpu_slots_per_worker
+        )
+
+    def all_slots(self) -> list[int]:
+        scheduling = self.spec.scheduling
+        return [
+            self.slot_of(w) + k
+            for w in range(scheduling.num_workers_per_cell)
+            for k in range(max(1, scheduling.num_gpu_slots_per_worker))
+        ]
+
+    def bundles(self) -> set[tuple[Any, int]]:
+        if self.pg_name is None or self.spec.scheduling.num_gpu_slots_per_worker == 0:
+            return set()
+        pg = self.manager.pgs[self.pg_name]
+        return {(pg_key(pg.pg), pg.pg_reordered_bundle_indices[slot]) for slot in self.all_slots()}
 
     async def launch_actors(self):
         assert self.actors is None
@@ -228,13 +366,7 @@ class _CellManager(Generic[SpecT]):
                 worker_in_cell_index=worker_in_cell_index,
                 spec=self.spec,
                 actor_handle=None,
-                gpu_slot_index=(
-                    scheduling.pg_slot_offset
-                    + (self.cell_index * scheduling.num_workers_per_cell + worker_in_cell_index)
-                    * scheduling.num_gpu_slots_per_worker
-                    if scheduling.pg_name is not None
-                    else None
-                ),
+                gpu_slot_index=self.slot_of(worker_in_cell_index),
             )
             for worker_in_cell_index in range(scheduling.num_workers_per_cell)
         ]
@@ -374,7 +506,7 @@ class _BaseActorManager(Generic[SpecT]):
 
     def _create_actor(self, actor_class: type, **ctor_kwargs) -> ray.actor.ActorHandle:
         scheduling_strategy = None
-        if (pg_name := self.spec.scheduling.pg_name) is not None:
+        if (pg_name := self.parent.pg_name) is not None:
             pg = self.manager.pgs[pg_name]
             scheduling_strategy = PlacementGroupSchedulingStrategy(
                 placement_group=pg.pg,
@@ -427,7 +559,7 @@ class _BaseActorManager(Generic[SpecT]):
 
     @property
     def gpu_ids(self) -> list[int]:
-        if (pg_name := self.spec.scheduling.pg_name) is None:
+        if (pg_name := self.parent.pg_name) is None:
             return []
         pg = self.manager.pgs[pg_name]
         base_gpu_id = int(pg.pg_reordered_gpu_ids[self.gpu_slot_index])

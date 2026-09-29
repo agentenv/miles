@@ -25,6 +25,8 @@ from miles.ray.specs.train import (
     compute_trainer_configs,
     create_trainer_controller_handle,
     external_trainer_controller_addrs,
+    specs_trainer,
+    specs_trainer_controller,
 )
 from miles.ray.wiring import get_backend_capability
 from miles.utils.audit_utils.checksum_utils import flatten_inference_engine_checksums
@@ -345,6 +347,54 @@ async def create_training_models(
     await rollout_executor.load(args.start_rollout_id - 1)
 
     return actor_info.handle, critic_info.handle if critic_info is not None else None
+
+
+async def rebuild_training_models(
+    args,
+    rollout_executor: BaseWorkerHandle,
+    *,
+    old_handles: dict[str, BaseWorkerHandle],
+    worker_manager,
+    trainer_pg_view: PlacementGroupInfo | None = None,
+) -> tuple[BaseWorkerHandle, BaseWorkerHandle | None]:
+    """Re-create the trainer on a (possibly different) bundle set with the sizes in ``args``, disposing the old one.
+
+    This is a process rebuild for elastic placement: the old trainer controllers are disposed, every trainer pool
+    (controllers and engines) is stopped, its specs are rebuilt from ``args`` (e.g. a new
+    ``actor_num_gpus_per_node``), ``trainer_pg_view`` (bundles of the startup placement group) becomes the "actor"
+    view when given, and ``create_training_models`` starts over; state comes back through the normal load path.
+    It does not use the fault-tolerance cell refresh or indep-DP healing. ``worker_manager`` is the
+    RayWorkerManager actor handle (or an object with the same async methods).
+    """
+    assert not args.use_fault_tolerance, "rebuild_training_models is not a fault-tolerance path"
+    assert not args.indep_dp, "rebuild_training_models re-creates the trainer; indep-DP cells are not supported"
+    assert args.trainer_controller_addrs is None, "an independently deployed trainer is not rebuilt from here"
+
+    for trainer_id, handle in old_handles.items():
+        try:
+            await handle.dispose()
+        except Exception:
+            logger.warning(
+                f"Disposing the old trainer controller {trainer_id!r} failed; stopping it anyway", exc_info=True
+            )
+
+    specs = [*specs_trainer_controller(args), *specs_trainer(args)]
+    pool_ids = [spec.name for spec in specs]
+    await _call_manager(worker_manager.stop_pools, pool_ids)
+    if trainer_pg_view is not None:
+        # every trainer spec (actor and critic) schedules on the "actor" view
+        await _call_manager(worker_manager.set_pg_view, "actor", trainer_pg_view)
+    for spec in specs:
+        await _call_manager(worker_manager.replace_pool_spec, spec)
+    await _call_manager(worker_manager.start_pools, pool_ids)
+
+    return await create_training_models(args, rollout_executor)
+
+
+async def _call_manager(method, *args, **kwargs):
+    if hasattr(method, "remote"):
+        return await method.remote(*args, **kwargs)
+    return await method(*args, **kwargs)
 
 
 # TODO: move (when reorganizing files)
