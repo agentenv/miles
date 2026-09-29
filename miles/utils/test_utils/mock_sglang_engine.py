@@ -87,9 +87,14 @@ class MockSGLangEngine:
         if self._http_server is not None:
             self._http_server.close()
 
-    def _get_free_port_block(self, *, start_port: int | None, count: int) -> int:
-        self._record("_get_free_port_block", (), {"start_port": start_port, "count": count})
-        return NodeProbeMixin._get_free_port_block(start_port=start_port, count=count)
+    def _get_free_port_block(
+        self, *, start_port: int | None, count: int, range_start: int | None = None, hold: bool = False
+    ) -> int:
+        range_kwargs = {} if range_start is None else {"range_start": range_start}
+        if hold:
+            range_kwargs["hold"] = True
+        self._record("_get_free_port_block", (), {"start_port": start_port, "count": count, **range_kwargs})
+        return NodeProbeMixin._get_free_port_block(start_port=start_port, count=count, **range_kwargs)
 
     def _get_node_ip(self):
         self._record("_get_node_ip", (), {})

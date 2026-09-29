@@ -440,8 +440,11 @@ def fake_engine(host: str = "10.0.0.1", port_seed: int = 30000) -> MagicMock:
     e._spec_class = ray.actor.ActorHandle
     e._port_cursor = port_seed
 
-    async def _alloc(start_port: int | None = None, count: int = 1):
-        port = max(e._port_cursor, FAKE_SERVICE_PORT_START if start_port is None else start_port)
+    async def _alloc(
+        start_port: int | None = None, count: int = 1, range_start: int | None = None, hold: bool = False
+    ):
+        floor = FAKE_SERVICE_PORT_START if range_start is None else range_start
+        port = max(e._port_cursor, floor if start_port is None else start_port)
         e._port_cursor = port + count
         return port
 

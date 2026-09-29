@@ -11,7 +11,7 @@ from miles.utils.workers.addr_allocator import PortAllocator
 
 
 def _make_probe_fail(engine: MagicMock) -> None:
-    async def _fail(start_port: int | None = None, count: int = 1):
+    async def _fail(start_port: int | None = None, count: int = 1, range_start: int | None = None, hold: bool = False):
         raise RuntimeError("free port probe failed")
 
     engine._get_free_port_block.remote.side_effect = _fail
@@ -141,3 +141,37 @@ class TestPortAllocator:
         await asyncio.gather(cursors.alloc(engine, node_ip="10.0.0.1"), _tick())
 
         assert ticks == [0, 1, 2]
+
+
+class TestPortAllocatorRangeStart:
+    async def test_a_configured_start_reaches_the_node_probe(self):
+        """Two runs sharing a host only stay apart if each node probe scans the run's own range."""
+        cursors = PortAllocator(range_start=31000)
+        engine = fake_engine(host="10.0.0.1", port_seed=0)
+
+        await cursors.alloc(engine, node_ip="10.0.0.1")
+
+        engine._get_free_port_block.remote.assert_called_once_with(start_port=None, count=1, range_start=31000)
+
+    async def test_an_unset_start_keeps_the_upstream_probe_call(self):
+        """Without the option the node keeps the service port range it derives from its own kernel."""
+        cursors = PortAllocator()
+        engine = fake_engine(host="10.0.0.1", port_seed=0)
+
+        await cursors.alloc(engine, node_ip="10.0.0.1")
+
+        assert "range_start" not in engine._get_free_port_block.remote.call_args.kwargs
+
+
+class TestPortAllocatorHold:
+    async def test_only_a_hold_request_asks_the_actor_to_hold(self):
+        """The master port is held by its worker; other probes keep the old call so every actor still accepts it."""
+        cursors = PortAllocator()
+        engine = fake_engine(host="10.0.0.1", port_seed=0)
+
+        await cursors.alloc(engine, node_ip="10.0.0.1")
+        await cursors.alloc(engine, node_ip="10.0.0.1", hold=True)
+
+        calls = [c.kwargs for c in engine._get_free_port_block.remote.call_args_list]
+        assert "hold" not in calls[0]
+        assert calls[1]["hold"] is True
