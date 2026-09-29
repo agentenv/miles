@@ -166,6 +166,15 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--worker-dynamic-port-start",
+                type=int,
+                default=20000,
+                help=(
+                    "First host port the ray worker manager hands out to dynamically allocated worker ports "
+                    "(engines, routers, trainer master). Give co-resident runs on one host disjoint ranges."
+                ),
+            )
+            parser.add_argument(
                 "--worker-comm-backend",
                 type=str,
                 default=None,

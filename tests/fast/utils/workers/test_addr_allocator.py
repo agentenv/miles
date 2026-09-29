@@ -144,3 +144,24 @@ class TestPortAllocator:
         await asyncio.gather(cursors.alloc(engine, node_ip="10.0.0.1"), _tick())
 
         assert ticks == [0, 1, 2]
+
+
+class TestPortAllocatorDynamicStart:
+    async def test_a_configured_start_is_where_the_first_probe_begins(self):
+        """Two runs sharing a host only stay apart if each one probes from its own range."""
+        cursors = PortAllocator(dynamic_port_start=31000)
+        engine = fake_engine(host="10.0.0.1", port_seed=0)
+
+        await cursors.alloc(engine, node_ip="10.0.0.1")
+
+        assert engine._get_free_port_block.remote.call_args.kwargs["start_port"] == 31000
+
+    async def test_wrapping_past_the_top_returns_to_the_configured_start(self):
+        """Wrapping to the global default would walk straight into the other run's range."""
+        cursors = PortAllocator(dynamic_port_start=31000)
+        cursors._next_port_of_ip["10.0.0.1"] = 65535
+        engine = fake_engine(host="10.0.0.1", port_seed=0)
+
+        await cursors.alloc(engine, node_ip="10.0.0.1", consecutive=2)
+
+        assert engine._get_free_port_block.remote.call_args.kwargs["start_port"] == 31000

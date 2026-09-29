@@ -10,6 +10,8 @@ _MAX_PORT = 65535
 
 @dataclass
 class PortAllocator:
+    # Co-resident drivers on one host must use disjoint ranges, or two of them can probe the same free port.
+    dynamic_port_start: int = _DYNAMIC_PORT_START
     _next_port_of_ip: dict[str, int] = field(default_factory=dict)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
@@ -17,9 +19,9 @@ class PortAllocator:
         async with self._lock:
             # use small ports to prevent ephemeral port between 32768 and 65536.
             # also, ray uses port 10002-19999, thus we avoid near-10002 to avoid racing condition
-            start_port = self._next_port_of_ip.get(node_ip, _DYNAMIC_PORT_START)
+            start_port = self._next_port_of_ip.get(node_ip, self.dynamic_port_start)
             if start_port + consecutive - 1 > _MAX_PORT:
-                start_port = _DYNAMIC_PORT_START
+                start_port = self.dynamic_port_start
             port: int = await actor._get_free_port_block.remote(
                 start_port=start_port,
                 count=consecutive,

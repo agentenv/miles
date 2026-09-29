@@ -74,6 +74,9 @@ class RayWorkerManager:
     ):
         configure_logger(args, source=SimpleProcessIdentity(component="worker_manager"))
 
+        self.port_allocator = PortAllocator(
+            dynamic_port_start=getattr(args, "worker_dynamic_port_start", None) or PortAllocator.dynamic_port_start
+        )
         self.comm_backend = comm_backend
         self.pgs = pgs
         self._pools = {spec.name: _PoolManager.initial(spec, self) for spec in specs}
