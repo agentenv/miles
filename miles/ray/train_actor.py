@@ -6,7 +6,7 @@ import random
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Literal
+from typing import Any, Literal
 
 import ray
 import torch
@@ -32,7 +32,7 @@ from miles.utils.hf_utils.config import load_hf_config
 from miles.utils.init_once import InitOnce, init_once
 from miles.utils.logging_utils import configure_logger, rebind_env_reporting
 from miles.utils.memory_utils import clear_memory, print_memory
-from miles.utils.misc import NodeProbeMixin, get_current_node_ip, get_free_port
+from miles.utils.misc import NodeProbeMixin, get_current_node_ip, get_free_port, release_held_port
 from miles.utils.object_store import StoreObjectRef
 from miles.utils.output_store.config import output_store_reader
 from miles.utils.port_range import service_port_range
@@ -175,11 +175,14 @@ class TrainRayActor(NodeProbeMixin):
                 self.processor = load_processor(self.args.hf_checkpoint, trust_remote_code=True)
 
     def propose_master_addr_and_port(self) -> tuple[str, int]:
-        low, high = service_port_range()
+        range_start = self.args.worker_dynamic_port_start
+        low, high = service_port_range() if range_start is None else service_port_range(start=range_start)
         start_port = random.randint(low, min(low + 1000, high))
         return get_current_node_ip(), get_free_port(start_port=start_port, port_range=(low, high))
 
     def configure_master_addr_and_port(self, *, master_addr: str, master_port: int) -> None:
+        # rank 0 held this port since allocation; free it for init_process_group
+        release_held_port(master_port)
         os.environ["MASTER_ADDR"] = master_addr
         os.environ["MASTER_PORT"] = str(master_port)
 

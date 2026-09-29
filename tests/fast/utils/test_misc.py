@@ -208,6 +208,16 @@ class TestNodeProbeMixin:
 
         assert NodeProbeMixin._get_free_port_block(start_port=8996, count=4) == 8996
 
+    def test_a_block_probe_with_a_configured_start_scans_from_it(self, monkeypatch):
+        """--worker-dynamic-port-start reaches the node, so a new cursor starts at the run's own start."""
+        monkeypatch.setattr(
+            misc, "service_port_range", lambda start=None: (2000, 8999) if start is None else (start, 8999)
+        )
+        monkeypatch.setattr(misc, "is_port_available", lambda port: True)
+
+        assert NodeProbeMixin._get_free_port_block(start_port=None, count=4, range_start=5000) == 5000
+        assert NodeProbeMixin._get_free_port_block(start_port=2500, count=4, range_start=5000) == 5000
+
     def test_is_port_available_separates_a_bound_port_from_a_free_one(self) -> None:
         """The probe answers False exactly for a port another process is already listening on."""
         free_port: int = get_free_port(start_port=15000, consecutive=2)
@@ -586,3 +596,42 @@ class TestSplitEvenly:
         parts = [items[s] for s in split_evenly(len(items), 4)]
 
         assert [x for part in parts for x in part] == items
+
+
+class TestHoldPort:
+    """A probed-free port was taken by another process before its user bound it (EADDRINUSE)."""
+
+    def test_a_held_block_refuses_other_binders_until_released(self) -> None:
+        """Between the probe and the trainer's bind no other socket may take the master port."""
+        first_port = NodeProbeMixin._get_free_port_block(start_port=None, count=2, hold=True)
+        try:
+            for port in (first_port, first_port + 1):
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as intruder:
+                    with pytest.raises(OSError):
+                        intruder.bind(("", port))
+        finally:
+            assert misc.release_held_port(first_port) and misc.release_held_port(first_port + 1)
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as user:
+            user.bind(("", first_port))
+
+    @pytest.mark.skipif(sys.platform != "linux", reason="BSD refuses a second SO_REUSEADDR bind of a bound port")
+    def test_a_reuseaddr_listener_still_binds_a_held_port(self) -> None:
+        """torch's TCPStore listens with SO_REUSEADDR, so it binds even before the hold is released."""
+        port = NodeProbeMixin._get_free_port_block(start_port=None, count=1, hold=True)
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                listener.bind(("", port))
+                listener.listen(1)
+        finally:
+            misc.release_held_port(port)
+
+    def test_releasing_a_port_that_is_not_held_is_a_no_op(self) -> None:
+        """Every rank releases the master port; only rank 0 holds it."""
+        assert misc.release_held_port(1) is False
+
+    def test_without_hold_the_probe_keeps_nothing_bound(self) -> None:
+        """Every other dynamic port keeps the plain probe."""
+        port = NodeProbeMixin._get_free_port_block(start_port=None, count=1)
+        assert port not in misc._HELD_PORTS

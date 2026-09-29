@@ -28,15 +28,21 @@ def ephemeral_port_range() -> tuple[int, int] | None:
     return low, high
 
 
-def service_port_range() -> tuple[int, int]:
+def service_port_range(start: int | None = None) -> tuple[int, int]:
     """The inclusive range Miles allocates its service ports from on this host.
 
     It starts at 20000, above Ray's default worker ports, and ends just below the ephemeral
     range when that lies above 20000. When 20000 itself lies inside the ephemeral range, the
     range moves to the wider of the stretches outside it: below both the ephemeral range and
     Ray's default worker ports, or above them.
+
+    ``start`` (``--worker-dynamic-port-start``) replaces 20000 as the low end, so runs that
+    share a host can be given disjoint ranges. The range still ends below the ephemeral
+    range when ``start`` lies below it; a ``start`` inside it is honored with a warning.
     """
     ephemeral = ephemeral_port_range()
+    if start is not None:
+        return _configured_range(start=start, ephemeral=ephemeral)
     if ephemeral is None or ephemeral[1] < _SERVICE_PORT_START:
         return _SERVICE_PORT_START, _MAX_PORT
     if _SERVICE_PORT_START < ephemeral[0]:
@@ -57,6 +63,20 @@ def ray_worker_port_args() -> str:
     if ephemeral is None or not _overlaps(ephemeral, _RAY_DEFAULT_WORKER_PORTS):
         return ""
     return " --min-worker-port 0 --max-worker-port 0"
+
+
+def _configured_range(*, start: int, ephemeral: tuple[int, int] | None) -> tuple[int, int]:
+    if not _MIN_UNPRIVILEGED_PORT <= start <= _MAX_PORT:
+        raise ValueError(f"--worker-dynamic-port-start {start} is outside [{_MIN_UNPRIVILEGED_PORT}, {_MAX_PORT}]")
+    if ephemeral is None or ephemeral[1] < start:
+        return start, _MAX_PORT
+    if start < ephemeral[0]:
+        return start, ephemeral[0] - 1
+    logger.warning(
+        f"--worker-dynamic-port-start {start} lies inside the ephemeral port range {ephemeral[0]}-{ephemeral[1]} "
+        "(net.ipv4.ip_local_port_range), where an outgoing connection can take a probed port before it is bound"
+    )
+    return start, _MAX_PORT
 
 
 def _widest_range_outside(ephemeral: tuple[int, int]) -> tuple[int, int]:

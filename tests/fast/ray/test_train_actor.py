@@ -16,6 +16,7 @@ from miles.utils import distributed_utils, logging_utils
 from miles.utils.args.trainer_utils import compute_trainer_config
 from miles.utils.dp_schedule import TrainParallelConfig
 from miles.utils.init_once import InitOnce
+from miles.utils.misc import NodeProbeMixin
 from miles.utils.workers.env_vars import CELL_INDEX_ENV_VAR, SUBPROCESS_INDEX_ENV_VAR
 
 
@@ -59,7 +60,9 @@ class TestProposeMasterAddrAndPort:
             taken_port = occupied.getsockname()[1]
             monkeypatch.setattr(train_actor.random, "randint", lambda _low, _high: taken_port)
 
-            addr, port = TrainRayActor.__new__(TrainRayActor).propose_master_addr_and_port()
+            actor = TrainRayActor.__new__(TrainRayActor)
+            actor.args = SimpleNamespace(worker_dynamic_port_start=None)
+            addr, port = actor.propose_master_addr_and_port()
 
         assert addr == "10.0.0.3"
         assert port > taken_port
@@ -103,6 +106,17 @@ class TestConfigureMasterAddrAndPort:
 
         assert os.environ["MASTER_ADDR"] == "10.0.0.1"
         assert os.environ["MASTER_PORT"] == "20001"
+
+    def test_configuring_the_master_port_releases_its_hold(self, monkeypatch: pytest.MonkeyPatch):
+        """Rank 0 held the port since allocation; init_process_group must find it free."""
+        monkeypatch.delenv("MASTER_PORT", raising=False)
+        start_port = train_actor.get_free_port(start_port=24500)
+        port = NodeProbeMixin._get_free_port_block(start_port=start_port, count=1, hold=True)
+
+        self._make_actor().configure_master_addr_and_port(master_addr="127.0.0.1", master_port=port)
+
+        with socket.socket() as plain:
+            plain.bind(("", port))
 
     def test_a_stale_master_addr_and_port_are_overwritten(self, monkeypatch: pytest.MonkeyPatch):
         """A worker inheriting another run's env must end up on the addr/port the driver assigned."""

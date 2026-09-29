@@ -161,3 +161,28 @@ class TestProbedPortsAndOutgoingConnections:
         with _outgoing_connection_asking_for(port) as source_port:
             assert source_port != port
             _serve_on(port)
+
+
+class TestConfiguredServicePortRange:
+    def test_a_start_below_the_ephemeral_range_ends_just_below_it(self, ephemeral_range_file):
+        """--worker-dynamic-port-start moves the low end; the high end still avoids the ephemeral range."""
+        ephemeral_range_file(32768, 60999)
+
+        assert service_port_range(start=30100) == (30100, 32767)
+
+    def test_a_start_above_the_ephemeral_range_runs_to_the_top(self, ephemeral_range_file):
+        """Nothing above the ephemeral range is handed out as a source port."""
+        ephemeral_range_file(32768, 60999)
+
+        assert service_port_range(start=61100) == (61100, 65535)
+
+    def test_a_start_inside_the_ephemeral_range_is_honored(self, ephemeral_range_file):
+        """An explicit start is the operator's choice; the run warns instead of moving it."""
+        ephemeral_range_file(32768, 60999)
+
+        assert service_port_range(start=40000) == (40000, 65535)
+
+    def test_a_start_out_of_bounds_is_refused(self, ephemeral_range_file):
+        """A privileged or impossible port cannot be scanned from."""
+        with pytest.raises(ValueError, match="worker-dynamic-port-start"):
+            service_port_range(start=80)

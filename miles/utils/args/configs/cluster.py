@@ -31,6 +31,16 @@ class ClusterConfig(BaseConfig):
             ),
         ),
     ] = None
+    worker_dynamic_port_start: A[
+        int | None,
+        Arg(
+            help=(
+                "First host port of the range dynamically allocated worker ports (engines, routers, trainer "
+                "master) come from. Unset keeps the service port range, which starts at 20000 and stays below "
+                "the host's ephemeral range. Give runs that share a host disjoint starts."
+            )
+        ),
+    ] = None
     deploy_component: A[
         str,
         Arg(
