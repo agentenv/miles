@@ -464,6 +464,15 @@ class TrainerController:
     async def get_train_parallel_config(self) -> dict[str, Any]:
         return (await self._execute_first_alive("get_train_parallel_config"))[0]
 
+    async def run_plugin(self, fn_path: str, kwargs: dict[str, Any] | None = None) -> list[Any]:
+        """Run a plugin on every worker of every cell; results are flattened in cell then rank order."""
+        not_alive = [cell.cell_id for cell in self._cells if not cell.is_alive]
+        assert not not_alive, f"run_plugin requires all cells alive: {not_alive}"
+        cell_results = await gather_and_raise_first(
+            [cell.execute("run_plugin", fn_path=fn_path, kwargs=kwargs) for cell in self._cells]
+        )
+        return [item for sublist in cell_results for item in sublist]
+
     async def get_cell_statuses(self) -> dict[str, CellStatus]:
         return {cell_id: cell.cell_status() for cell_id, cell in list(self._cells_by_id.items())}
 
