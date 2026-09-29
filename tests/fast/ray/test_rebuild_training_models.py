@@ -28,6 +28,9 @@ class _Manager:
     async def start_pools(self, pool_ids):
         self.events.append(("start_pools", tuple(pool_ids)))
 
+    async def get_pg_view(self, name):
+        return PlacementGroupInfo(pg="pg", pg_reordered_bundle_indices=[7, 8], pg_reordered_gpu_ids=[7, 8])
+
 
 def _args(**overrides) -> Namespace:
     defaults = dict(actor_num_nodes=1, actor_num_gpus_per_node=3, use_critic=False, megatron_config=None)
@@ -143,7 +146,8 @@ class TestRebuildFailure:
 
         assert info.value.stage == stage and info.value.cleanup_error is None
         assert "boom" in repr(info.value.__cause__)
-        assert events[-1][0] == "stop_pools"  # cleanup ran after the failure
+        # cleanup ran after the failure: pools stopped, then the previous actor view restored
+        assert [e[0] for e in events][-2:] == ["stop_pools", "set_pg_view"]
 
     async def test_a_failed_cleanup_is_reported(self, events):
         manager = _Manager(events)
@@ -162,3 +166,36 @@ class TestRebuildFailure:
         with pytest.raises(TrainerRebuildError, match="stopping trainer pools failed") as info:
             await rebuild_training_models(_args(), "executor", old_handles={}, worker_manager=manager)
         assert info.value.stage == "start_pools"
+
+
+class TestRebuildFailureRestoresTheView:
+    _VIEW = PlacementGroupInfo(pg="pg", pg_reordered_bundle_indices=[0, 1], pg_reordered_gpu_ids=[0, 1])
+
+    async def test_the_previous_actor_view_is_put_back_and_reported(self, events):
+        manager = _Manager(events)
+
+        async def _fail(*_args, **_kwargs):
+            raise RuntimeError("boom")
+
+        manager.start_pools = _fail
+        with pytest.raises(TrainerRebuildError) as info:
+            await rebuild_training_models(
+                _args(), "executor", old_handles={}, worker_manager=manager, trainer_pg_view=self._VIEW
+            )
+        assert info.value.view_restored and info.value.previous_view.pg_reordered_bundle_indices == [7, 8]
+        assert events[-1] == ("set_pg_view", "actor", (7, 8))
+
+    async def test_a_cancellation_is_cleaned_up_and_reraised_unchanged(self, events):
+        import asyncio
+
+        manager = _Manager(events)
+
+        async def _cancel(*_args, **_kwargs):
+            raise asyncio.CancelledError()
+
+        manager.replace_pool_spec = _cancel
+        with pytest.raises(asyncio.CancelledError):
+            await rebuild_training_models(
+                _args(), "executor", old_handles={}, worker_manager=manager, trainer_pg_view=self._VIEW
+            )
+        assert [e[0] for e in events][-2:] == ["stop_pools", "set_pg_view"]

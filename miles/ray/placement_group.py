@@ -383,10 +383,13 @@ async def rebuild_training_models(
     specs = [*specs_trainer_controller(args), *specs_trainer(args)]
     pool_ids = [spec.name for spec in specs]
     stage = "stop_pools"
+    previous_view = None
     try:
         await _call_manager(worker_manager.stop_pools, pool_ids)
         if trainer_pg_view is not None:
             stage = "set_pg_view"
+            if hasattr(worker_manager, "get_pg_view"):
+                previous_view = await _call_manager(worker_manager.get_pg_view, "actor")
             # every trainer spec (actor and critic) schedules on the "actor" view; their pools are replaced next
             await _call_manager(worker_manager.set_pg_view, "actor", trainer_pg_view, replacing_pools=pool_ids)
         stage = "replace_pool_spec"
@@ -396,27 +399,54 @@ async def rebuild_training_models(
         await _call_manager(worker_manager.start_pools, pool_ids)
         stage = "create_training_models"
         return await create_training_models(args, rollout_executor)
-    except Exception as error:
+    except BaseException as error:
         # No rollback to the old trainer: its controllers are already disposed. Stop whatever was started so no
-        # half-built trainer keeps bundles, and report the stage; the caller rebuilds again (e.g. with the previous
-        # args and view) and restores state from its cut.
+        # half-built trainer keeps bundles, point the "actor" view back at the old bundles, and report the stage;
+        # the caller rebuilds again (e.g. with the previous args and view) and restores state from its cut.
+        # A cancellation is cleaned up the same way and then re-raised unchanged.
+        cleanup_error = None
         try:
             await _call_manager(worker_manager.stop_pools, pool_ids)
-            cleanup_error = None
         except Exception as stop_error:  # noqa: BLE001
             cleanup_error = stop_error
-        raise TrainerRebuildError(stage=stage, pool_ids=pool_ids, cleanup_error=cleanup_error) from error
+        view_restored = False
+        if previous_view is not None and cleanup_error is None:
+            try:
+                await _call_manager(worker_manager.set_pg_view, "actor", previous_view, replacing_pools=pool_ids)
+                view_restored = True
+            except Exception:  # noqa: BLE001
+                logger.warning("Restoring the previous actor view after a failed rebuild failed", exc_info=True)
+        if not isinstance(error, Exception):
+            raise
+        raise TrainerRebuildError(
+            stage=stage,
+            pool_ids=pool_ids,
+            cleanup_error=cleanup_error,
+            previous_view=previous_view,
+            view_restored=view_restored,
+        ) from error
 
 
 class TrainerRebuildError(RuntimeError):
     """``rebuild_training_models`` failed at ``stage``; the old trainer is gone and no trainer is running.
 
     ``cleanup_error`` is set when stopping the trainer pools after the failure failed too; then workers of
-    ``pool_ids`` may still hold bundles and must be stopped before the next rebuild.
+    ``pool_ids`` may still hold bundles and must be stopped before the next rebuild. ``previous_view`` is the
+    "actor" view before the rebuild (None when the view was not changed) and ``view_restored`` whether it was put
+    back; if not, the caller passes ``previous_view`` to its next rebuild.
     """
 
-    def __init__(self, *, stage: str, pool_ids: list[str], cleanup_error: BaseException | None) -> None:
+    def __init__(
+        self,
+        *,
+        stage: str,
+        pool_ids: list[str],
+        cleanup_error: BaseException | None,
+        previous_view: PlacementGroupInfo | None = None,
+        view_restored: bool = False,
+    ) -> None:
         self.stage, self.pool_ids, self.cleanup_error = stage, pool_ids, cleanup_error
+        self.previous_view, self.view_restored = previous_view, view_restored
         state = (
             "trainer pools stopped" if cleanup_error is None else f"stopping trainer pools failed: {cleanup_error!r}"
         )
@@ -476,12 +506,15 @@ async def update_weights(
     trainer_model_id: str | None = None,
     members: list[str] | None = None,
     expected_epoch: int | None = None,
+    admit_cordoned: bool = False,
 ) -> int | None:
     """Publish the actor weights and return the weight version the trainer reported.
 
     ``members`` (cell ids, with the membership ``expected_epoch``) restricts the publish to those engines only. A
     member publish does not set the executor's weight version: non-members may still serve an older version, so the
     caller sets it with ``commit_weight_version`` once every serving engine carries the returned version.
+    ``admit_cordoned`` registers the engines this publish readies cordoned; the caller verifies their weights and
+    opens them with ``InferenceController.admit_cells(..., expected_weight_version=<returned version>)``.
     """
     orchestration_executor = FTTestActionOrchestrationExecutor.from_args(args, trainer_model_id=trainer_model_id)
     if rollout_id is not None:
@@ -490,6 +523,7 @@ async def update_weights(
     info: UpdatableEngines = await inference_controller.start_update_weights(
         model_id=trainer_model_id,
         **({} if members is None else dict(members=members, expected_epoch=expected_epoch)),
+        **({"admit_cordoned": True} if admit_cordoned else {}),
     )
     try:
         weight_version = await actor_model.update_weights(info=info, rollout_id=rollout_id)
@@ -521,18 +555,18 @@ async def commit_weight_version(
     older one. The caller brings every Serving engine to ``weight_version`` (publishing to the rest, or, when the
     member publish carried the policy the others already serve, re-stamping them with
     ``InferenceController.set_cells_weight_version``) and then calls this. It refuses if the membership epoch moved
-    or any Serving engine reports another version.
+    or any Serving engine reports another version; the checks and the executor update happen under one hold of
+    the controller lock.
     """
-    epoch = await inference_controller.get_membership_epoch()
-    if epoch != expected_epoch:
-        raise RuntimeError(f"weight version commit expected membership epoch {expected_epoch}, but it is {epoch}")
-    versions = await inference_controller.get_cells_weight_versions(model_id=trainer_model_id)
-    if not versions:
-        raise RuntimeError("no serving engine reports a weight version; nothing to commit")
-    stale = {cell_id: v for cell_id, v in versions.items() if v != str(weight_version)}
-    if stale:
-        raise RuntimeError(f"serving engines {stale} do not report weight version {weight_version} yet")
-    await rollout_executor.set_weight_version(weight_version, trainer_model_id=trainer_model_id)
+    # start_commit_weight_version checks epoch, incompleteness and every serving engine's version and keeps the
+    # controller lock until end_commit_weight_version, so nothing can move them before the executor is set.
+    await inference_controller.start_commit_weight_version(
+        weight_version=weight_version, expected_epoch=expected_epoch, model_id=trainer_model_id
+    )
+    try:
+        await rollout_executor.set_weight_version(weight_version, trainer_model_id=trainer_model_id)
+    finally:
+        await inference_controller.end_commit_weight_version()
 
 
 async def _maybe_log_inference_engine_weight_checksums(

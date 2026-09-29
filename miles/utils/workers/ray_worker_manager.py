@@ -171,6 +171,9 @@ class RayWorkerManager:
             )
             self.pgs = {**self.pgs, pg_name: info}
 
+    def get_pg_view(self, pg_name: str) -> PlacementGroupInfo:
+        return self.pgs[pg_name]
+
     async def replace_pool_spec(self, spec: BaseWorkerSpec) -> list[str]:
         """Swap the spec of a fully stopped pool (e.g. a trainer with a new GPU count); returns its new cell ids."""
         async with self._membership_lock:
