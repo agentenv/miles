@@ -73,6 +73,17 @@ def add_lora_arguments(parser):
         help="Sync LoRA weights via tensor instead of file (more efficient)",
     )
     parser.add_argument(
+        "--lora-dp-invariant-state",
+        action="store_true",
+        default=False,
+        help=(
+            "Also save LoRA training state in a DP-invariant form (optimizer state keyed by parameter name per "
+            "(tp, pp, dp), one adapter copy per (tp, pp), and Python/NumPy/Torch/CUDA RNG) and prefer it on load, "
+            "so a checkpoint can be restored at another DP size with TP/PP/EP fixed. Requires a non-distributed "
+            "optimizer and EP=1. Off keeps the per-rank format only."
+        ),
+    )
+    parser.add_argument(
         "--lora-base-cpu-backup",
         action="store_true",
         default=False,

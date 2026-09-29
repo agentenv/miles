@@ -10,6 +10,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
+from miles.backends.megatron_utils.lora import dp_invariant_state
 from miles.backends.training_utils.checkpoint_io import write_checkpoint_dir
 from miles.backends.training_utils.parallel import get_parallel_state
 from miles.backends.training_utils.weight_update.snapshot_publisher import SnapshotPublisher
@@ -212,9 +213,122 @@ def save_lora_checkpoint(
         torch.save(adapter_state, checkpoint_dir / f"adapter_megatron_rank{global_rank}.pt")
         if training_state is not None:
             torch.save(training_state, checkpoint_dir / f"training_state_rank{global_rank}.pt")
+        if getattr(args, "lora_dp_invariant_state", False):
+            _write_dp_invariant_state(
+                checkpoint_dir,
+                model=model,
+                adapter_state=adapter_state,
+                optimizer=(
+                    optimizer if training_state is not None and training_state["optimizer"] is not None else None
+                ),
+                training_state=training_state,
+            )
 
     write_checkpoint_dir(save_dir, write_shards)
     return str(save_dir)
+
+
+def _dp_coordinates() -> tuple[int, int, int]:
+    ps = get_parallel_state()
+    assert (
+        ps.ep.size == 1
+    ), "DP-invariant LoRA state keys adapters by (tp, pp); expert parallelism (EP>1) is unsupported"
+    return ps.tp.rank, ps.pp.rank, ps.intra_dp_cp.rank
+
+
+def _write_dp_invariant_state(
+    checkpoint_dir: Path,
+    *,
+    model: Sequence[torch.nn.Module],
+    adapter_state: dict[str, torch.Tensor],
+    optimizer: Any | None,
+    training_state: dict | None,
+) -> None:
+    """Write the DP-invariant copy: one adapter per (tp, pp) and a name-keyed optimizer + RNG per (tp, pp, dp)."""
+    tp_rank, pp_rank, dp_rank = _dp_coordinates()
+    if dp_rank == 0:
+        torch.save(
+            adapter_state,
+            checkpoint_dir / dp_invariant_state.dp_invariant_adapter_filename(tp_rank=tp_rank, pp_rank=pp_rank),
+        )
+    named_optimizer = None
+    if optimizer is not None:
+        torch_optimizer = dp_invariant_state.unwrap_name_mappable_optimizer(optimizer)
+        group_names = dp_invariant_state.param_names_per_group(
+            torch_optimizer, [item for chunk in model for item in chunk.named_parameters()]
+        )
+        named_optimizer = dp_invariant_state.optimizer_state_to_named(torch_optimizer.state_dict(), group_names)
+    torch.save(
+        {
+            "iteration": training_state["iteration"] if training_state else None,
+            "optimizer_named": named_optimizer,
+            "opt_param_scheduler": training_state["opt_param_scheduler"] if training_state else None,
+            "rng": dp_invariant_state.capture_rng_state(),
+        },
+        checkpoint_dir
+        / dp_invariant_state.named_training_state_filename(tp_rank=tp_rank, pp_rank=pp_rank, dp_rank=dp_rank),
+    )
+
+
+def _load_dp_invariant_state(
+    adapter_dir: Path,
+    model: Sequence[torch.nn.Module],
+    *,
+    optimizer: Any | None,
+    opt_param_scheduler: Any | None,
+    load_optimizer: bool,
+) -> tuple[bool, int | None, bool]:
+    tp_rank, pp_rank, dp_rank = _dp_coordinates()
+    adapter_file = adapter_dir / dp_invariant_state.dp_invariant_adapter_filename(tp_rank=tp_rank, pp_rank=pp_rank)
+    if not adapter_file.exists():
+        return False, None, False
+    _copy_adapter_state(model, torch.load(adapter_file, map_location="cpu", weights_only=True), source=adapter_file)
+
+    files = dp_invariant_state.list_named_training_state_files(adapter_dir, tp_rank=tp_rank, pp_rank=pp_rank)
+    if not files:
+        return True, None, False
+    shards = {dp: torch.load(path, map_location="cpu", weights_only=False) for dp, path in files.items()}
+    own = shards.get(dp_rank)
+    reference = own if own is not None else shards[min(shards)]
+
+    optimizer_restored = False
+    named = [s["optimizer_named"] for s in shards.values() if s.get("optimizer_named") is not None]
+    if optimizer is not None and load_optimizer and named:
+        torch_optimizer = dp_invariant_state.unwrap_name_mappable_optimizer(optimizer)
+        group_names = dp_invariant_state.param_names_per_group(
+            torch_optimizer, [item for chunk in model for item in chunk.named_parameters()]
+        )
+        merged = dp_invariant_state.merge_named_optimizer_states(named)
+        torch_optimizer.load_state_dict(dp_invariant_state.named_to_optimizer_state(merged, group_names))
+        optimizer_restored = True
+    if opt_param_scheduler is not None and reference.get("opt_param_scheduler") is not None:
+        opt_param_scheduler.load_state_dict(reference["opt_param_scheduler"])
+    if own is not None and own.get("rng") is not None:
+        dp_invariant_state.restore_rng_state(own["rng"])
+    else:
+        logger.warning(
+            f"no RNG state was saved for (tp={tp_rank}, pp={pp_rank}, dp={dp_rank}) (saved dp ranks: "
+            f"{sorted(shards)}); keeping this rank's current RNG"
+        )
+    return True, reference.get("iteration"), optimizer_restored
+
+
+def _copy_adapter_state(model: Sequence[torch.nn.Module], state_dict: dict, *, source: Path) -> None:
+    adapter_params = {
+        name: param
+        for model_chunk in model
+        for name, param in model_chunk.named_parameters()
+        if _is_adapter_param_name(name)
+    }
+    missing = adapter_params.keys() - state_dict.keys()
+    unexpected = state_dict.keys() - adapter_params.keys()
+    if missing or unexpected:
+        raise RuntimeError(
+            f"Adapter checkpoint {source} does not match the model's adapter parameters: "
+            f"missing={sorted(missing)}, unexpected={sorted(unexpected)}"
+        )
+    for name, param in adapter_params.items():
+        param.data.copy_(state_dict[name].to(device=param.device))
 
 
 def load_lora_adapter(
@@ -224,15 +338,31 @@ def load_lora_adapter(
     optimizer: Any | None = None,
     opt_param_scheduler: Any | None = None,
     load_optimizer: bool = True,
+    dp_invariant: bool = False,
 ) -> tuple[bool, int | None, bool]:
     """Restore native adapter shards and optional optimizer/scheduler state.
 
+    With ``dp_invariant`` the DP-invariant copy (see ``dp_invariant_state``) is preferred when present, so the
+    checkpoint may have been written at another DP size; RNG is restored for this rank's (tp, pp, dp) coordinate.
     HF adapters cannot be loaded into Bridge models through this path.
     """
     adapter_dir = Path(adapter_path).resolve()
     if not adapter_dir.exists():
         logger.warning(f"LoRA adapter path does not exist: {adapter_dir}")
         return False, None, False
+
+    if dp_invariant:
+        result = _load_dp_invariant_state(
+            adapter_dir,
+            model,
+            optimizer=optimizer,
+            opt_param_scheduler=opt_param_scheduler,
+            load_optimizer=load_optimizer,
+        )
+        if result[0]:
+            logger.info(f"Loaded DP-invariant LoRA state from {adapter_dir}")
+            return result
+        logger.warning(f"{adapter_dir} holds no DP-invariant LoRA state; falling back to per-rank shards")
 
     tp_rank = get_parallel_state().tp.rank
     pp_rank = get_parallel_state().pp.rank
