@@ -20,7 +20,6 @@ from miles.backends.training_utils.loss_hub.losses import policy_loss_function
 from miles.backends.training_utils.loss_hub.math_utils import (
     compute_cispo_loss,
     compute_gmpo_loss,
-    compute_policy_loss,
     compute_sapo_loss,
 )
 from miles.utils.arguments import get_miles_extra_args_provider, validate_policy_loss_variant_args
@@ -344,7 +343,7 @@ def test_policy_loss_function_variant_matches_reference(variant, use_tis):
 
 def test_default_path_bitwise_unchanged():
     """No policy_loss_variant attribute (old Namespace) and explicit policy_loss give identical results,
-    and they equal compute_policy_loss applied directly."""
+    and the variant functions are never called."""
     base = make_args(entropy_coef=0.0, **{k: v for k, v in VARIANT_ARGS.items() if k.startswith("eps")})
     inputs = _inputs(base)
     loss_a, metrics_a, grad_a = _run(base, inputs)
@@ -354,22 +353,22 @@ def test_default_path_bitwise_unchanged():
     for k in metrics_a:
         assert torch.equal(metrics_a[k], metrics_b[k]), k
 
-    batch = make_batch(inputs, "policy_loss")
-    make_parallel_state()
-    lps = get_log_probs_and_entropy(
-        deep_clone(inputs["policy_logits"]),
-        args=base,
-        unconcat_tokens=batch["unconcat_tokens"],
-        total_lengths=batch["total_lengths"],
-        response_lengths=batch["response_lengths"],
-        with_entropy=False,
-    )["log_probs"]
-    ppo_kl = torch.cat(batch["log_probs"]) - torch.cat(lps)
-    mask = torch.cat(batch["loss_masks"]).bool()
-    ppo_kl = torch.where(mask, ppo_kl, 0.0)
-    adv = torch.where(mask, torch.cat(batch["advantages"]), 0.0)
-    pg, _ = compute_policy_loss(ppo_kl, adv, 0.2, 0.28, None)
-    assert torch.equal(_som(batch)(pg), loss_a)
+    # the variant functions are never reached on the default path (the numerics of that path are pinned
+    # against stored snapshots by test_loss_snapshot.py)
+    from miles.backends.training_utils.loss_hub import losses as losses_mod
+
+    def _boom(*a, **k):
+        raise AssertionError("variant function called on the default path")
+
+    saved = {n: getattr(losses_mod, n) for n in ("compute_cispo_loss", "compute_sapo_loss", "compute_gmpo_loss")}
+    try:
+        for n in saved:
+            setattr(losses_mod, n, _boom)
+        loss_c, _, grad_c = _run(base, inputs)
+    finally:
+        for n, f in saved.items():
+            setattr(losses_mod, n, f)
+    assert torch.equal(loss_c, loss_a) and torch.equal(grad_c, grad_a)
 
 
 # ---------------------------------------------------------------------------
