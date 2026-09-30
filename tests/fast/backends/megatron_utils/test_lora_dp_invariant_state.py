@@ -685,3 +685,65 @@ class TestDistributedOptimizerLazyState:
         loader.step(_grads(model, 5))
         with pytest.raises(dps.DpInvariantStateError, match="lacks \\['exp_avg_sq'\\]"):
             dps.load_named_optimizer_state(loader, _named(model), merged)
+
+
+class _TwoBufferDistOpt(_DistOpt):
+    """A DistOpt whose grad buffers hold ``lora_A`` and ``lora_B`` under two dtype keys, the first in two buckets."""
+
+    def __init__(self, params, full_main, *, lr=0.1):
+        a, b = params
+        buffers = [((torch.bfloat16, torch.float32), [[a], []]), ((torch.float16, torch.float32), [[b]])]
+        self.gbuf_ranges, self.param_map, self.model_param_group_index_map, mains = [{}], {}, {}, []
+        for key, buckets in buffers:
+            maps = []
+            for bucket in buckets:
+                index_map, offset = {}, 0
+                for p in bucket:
+                    index_map[p] = (offset, offset + p.numel(), 0)
+                    offset += p.numel()
+                param_map = _dist.DistributedOptimizer._build_model_gbuf_param_range_map(
+                    index_map, _dist.Range(0, offset), 0
+                )
+                for p, ranges in param_map.items():
+                    r = ranges["param"]
+                    self.model_param_group_index_map[p] = (0, len(mains))
+                    mains.append(full_main[p].reshape(-1)[r.start : r.end].clone())
+                self.param_map.update(param_map)
+                maps.append({"param_map": param_map})
+            self.gbuf_ranges[0][key] = maps
+        self.config = SimpleNamespace(use_precision_aware_optimizer_no_fp8_or_ds_fp8=False)
+        self.optimizer = torch.optim.AdamW([{"params": mains, "lr": lr, "weight_decay": 0.01}], foreach=False)
+
+
+class TestLazyStateAcrossBuffers:
+    def test_partly_empty_entries_over_two_dtypes_and_buckets_restore_bitwise(self):
+        model = _Bf16Model(0)
+        init = {p: p.detach().float() for p in _params_of(model)}
+        saver = _TwoBufferDistOpt(_params_of(model), init)
+        saver.step(_grads(model, 1))
+        saver.step(_grads(model, 2))
+        merged = dps.merge_named_optimizer_states([_export(model, saver)])
+
+        loader = _TwoBufferDistOpt(_params_of(model), {p: torch.zeros(p.shape) for p in _params_of(model)})
+        loader.optimizer.state[loader.optimizer.param_groups[0]["params"][1]]  # only lora_B gets an empty entry
+        dps.load_named_optimizer_state(loader, _named(model), merged)
+
+        reread = _export(model, loader)["entries"]
+        assert set(reread) == {"lora_A", "lora_B"}
+        for name, full in merged.items():
+            for key in ("param", "exp_avg", "exp_avg_sq"):
+                assert torch.equal(reread[name]["tensors"][key], full["tensors"][key]), (name, key)
+
+    def test_a_cross_implementation_resume_names_the_cause(self):
+        model = _Bf16Model(0)
+        init = {p: p.detach().float() for p in _params_of(model)}
+        saver = _TwoBufferDistOpt(_params_of(model), init)
+        saver.step(_grads(model, 1))
+        merged = dps.merge_named_optimizer_states([_export(model, saver)])
+        loader = _TwoBufferDistOpt(_params_of(model), init)
+        loader.step(_grads(model, 1))
+        for main in loader.optimizer.param_groups[0]["params"]:  # an implementation that keeps no per-param step
+            del loader.optimizer.state[main]["step"]
+        loader._init_optimizer_states_with_dummy_values = lambda: None
+        with pytest.raises(dps.DpInvariantStateError, match="different optimizer implementation"):
+            dps.load_named_optimizer_state(loader, _named(model), merged)

@@ -154,7 +154,9 @@ def _distributed_slots(leaf: Any, name_of) -> list[_Slot]:
                         if extra:
                             raise DpInvariantStateError(
                                 f"optimizer state of {name_of[id(model_param)]!r} has no {sorted(extra)} to load the "
-                                f"saved values into"
+                                f"saved values into: the checkpoint was most likely written by a different optimizer "
+                                f"implementation (e.g. torch Adam vs TE FusedAdam, which keep 'step' differently); "
+                                f"resume with the optimizer that saved it"
                             )
                         leaf._set_main_param_and_optimizer_states(model_param, tensors)
 
@@ -341,7 +343,9 @@ def _names_by_group(slots) -> dict[int, tuple[dict, list[str]]]:
 def load_named_optimizer_state(optimizer: Any, named_params, merged: Mapping[str, Mapping[str, Any]]) -> None:
     """Scatter the merged (gathered) state onto the ranges this rank's optimizer owns.
 
-    Everything is validated (``check_named_optimizer_state``) before the optimizer is touched.
+    Everything is validated (``check_named_optimizer_state``) before the optimizer is touched. A failure after
+    that (e.g. ``DpInvariantStateError`` from a key mismatch) leaves the optimizer state invalid: the dummy Adam
+    step may already have run and some slots may already hold loaded values. Rebuild the optimizer before retrying.
     """
     named_params = list(named_params)
     check_named_optimizer_state(optimizer, named_params, merged)
