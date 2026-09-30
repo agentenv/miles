@@ -228,7 +228,7 @@ def policy_loss_function(
                 advantages_list, total_lengths, response_lengths, strict=False
             )
         ]
-        pg_loss, pg_clipfrac = compute_gmpo_loss(
+        pg_loss, pg_clipfrac, gmpo_clip_stats = compute_gmpo_loss(
             full_log_probs,
             full_old_log_probs,
             full_advantages,
@@ -328,6 +328,19 @@ def policy_loss_function(
         calculate_per_token_loss=args.calculate_per_token_loss,
     )
 
+    gmpo_clip_num = gmpo_clip_den = None
+    if variant == "gmpo":
+        # Global ratio over tokens that are valid under the *final* mask (after TIS/RS) and have A != 0;
+        # numerator and denominator share the mask. Computed on full sequences, so under CP every CP rank
+        # adds the same counts: only the ratio num / den of the aggregated metrics is meaningful.
+        final_masks = modified_response_masks if (args.get_mismatch_metrics or args.use_tis) else batch["loss_masks"]
+        gmpo_clip_num = pg_loss.new_zeros(())
+        gmpo_clip_den = pg_loss.new_zeros(())
+        for (is_clipped, nonzero_adv), m in zip(gmpo_clip_stats, final_masks, strict=True):
+            m = m.to(device=is_clipped.device, dtype=is_clipped.dtype)
+            gmpo_clip_num = gmpo_clip_num + (is_clipped * m).sum()
+            gmpo_clip_den = gmpo_clip_den + (nonzero_adv * m).sum()
+
     pg_loss = pg_loss_reducer(pg_loss)
     pg_clipfrac = sum_of_sample_mean(pg_clipfrac)
     ppo_kl = sum_of_sample_mean(ppo_kl)
@@ -403,6 +416,10 @@ def policy_loss_function(
         "ppo_kl": ppo_kl.clone().detach(),
         "ess_ratio": ess_ratio_sum.squeeze(),
     }
+
+    if gmpo_clip_num is not None:
+        reported_loss["gmpo_clip_num"] = gmpo_clip_num.detach()
+        reported_loss["gmpo_clip_den"] = gmpo_clip_den.detach()
 
     if train_rollout_logprob_abs_diff is not None:
         reported_loss["train_rollout_logprob_abs_diff"] = train_rollout_logprob_abs_diff.clone().detach()

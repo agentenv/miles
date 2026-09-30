@@ -334,8 +334,11 @@ def compute_gmpo_loss(
     clipfrac (per sequence, expanded to its local tokens): number of masked tokens with A != 0 whose
     min() picks the clipped value, divided by the number of masked tokens with A != 0 (0 if none).
     Inputs are full (CP-gathered) sequences, like compute_gspo_kl.
+
+    Also returns, per sample and over the full sequence, detached float indicators
+    (clipped, nonzero_adv) so the caller can build a global clip ratio with any final mask.
     """
-    losses, clipfracs = [], []
+    losses, clipfracs, clip_stats = [], [], []
     for log_prob, old_log_prob, full_adv, loss_mask, local_adv in zip(
         full_log_probs, full_old_log_probs, full_advantages, loss_masks, local_advantages, strict=True
     ):
@@ -345,11 +348,14 @@ def compute_gmpo_loss(
         unclipped = sign * log_ratio
         clipped = sign * log_ratio.clamp(-log_clip_low, log_clip_high)
         seq_log_ratio = (sign * torch.minimum(unclipped, clipped) * mask).sum() / torch.clamp_min(mask.sum(), 1)
-        active = mask * (sign != 0).to(mask.dtype)
-        clip_frac = ((clipped < unclipped).to(mask.dtype) * active).sum().detach() / torch.clamp_min(active.sum(), 1)
+        nonzero_adv = (sign != 0).to(mask.dtype).detach()
+        is_clipped = (clipped < unclipped).to(mask.dtype).detach() * nonzero_adv
+        active = mask * nonzero_adv
+        clip_frac = (is_clipped * active).sum() / torch.clamp_min(active.sum(), 1)
         losses.append(-seq_log_ratio.exp() * local_adv)
         clipfracs.append(clip_frac.expand_as(local_adv))
-    return torch.cat(losses, dim=0), torch.cat(clipfracs, dim=0)
+        clip_stats.append((is_clipped, nonzero_adv))
+    return torch.cat(losses, dim=0), torch.cat(clipfracs, dim=0), clip_stats
 
 
 def compute_log_probs(

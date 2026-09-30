@@ -1613,8 +1613,13 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 type=str,
                 choices=["policy_loss", "cispo", "sapo", "gmpo"],
                 default="policy_loss",
-                help="Token-level policy objective used by --loss-type policy_loss. policy_loss = PPO clip (default); "
-                "cispo reuses --eps-clip/--eps-clip-high as the IS-weight clip range.",
+                help="Token-level policy objective used by --loss-type policy_loss. policy_loss = PPO clip (default). "
+                "cispo reuses --eps-clip/--eps-clip-high as the IS-weight clip range [1-eps_clip, 1+eps_clip_high]; "
+                "its lower bound therefore follows --eps-clip (default 0.2), whereas the CISPO paper essentially does "
+                "not clip from below (pass a large --eps-clip, e.g. 1.0, to approximate that). The papers' token-level "
+                "normalization needs --calculate-per-token-loss (default is per-sample mean). "
+                "gmpo cannot be combined with --calculate-per-token-loss. gmpo reports gmpo_clip_num/gmpo_clip_den "
+                "(global clipped fraction = their ratio).",
             )
             parser.add_argument("--sapo-tau-pos", type=float, default=1.0, help="SAPO gate temperature for A > 0")
             parser.add_argument("--sapo-tau-neg", type=float, default=1.05, help="SAPO gate temperature for A <= 0")
@@ -3230,6 +3235,10 @@ def validate_policy_loss_variant_args(args):
     assert (
         getattr(args, "eps_clip_c", None) is None
     ), f"--policy-loss-variant {variant} cannot be combined with --eps-clip-c"
+    if variant == "gmpo":
+        assert not getattr(
+            args, "calculate_per_token_loss", False
+        ), "--policy-loss-variant gmpo cannot be combined with --calculate-per-token-loss"
     names = {"sapo": ("sapo_tau_pos", "sapo_tau_neg"), "gmpo": ("gmpo_log_clip_low", "gmpo_log_clip_high")}
     for name in names.get(variant, ()):
         value = getattr(args, name)

@@ -140,7 +140,7 @@ def test_gmpo_matches_reference_with_mask_and_clip():
     lps = [(o + torch.randn(o.shape, generator=g)).requires_grad_(True) for o in olds]
     advs = [torch.full((5,), 1.5), torch.full((7,), -0.7), torch.zeros(3)]
     masks = [torch.tensor([1.0, 1, 0, 1, 1]), torch.ones(7), torch.ones(3)]
-    loss, clipfrac = compute_gmpo_loss(lps, olds, advs, masks, advs, 0.4, 0.3)
+    loss, clipfrac, _ = compute_gmpo_loss(lps, olds, advs, masks, advs, 0.4, 0.3)
 
     lps2 = [lp.detach().clone().requires_grad_(True) for lp in lps]
     ref = torch.cat(
@@ -160,7 +160,7 @@ def test_gmpo_all_clipped_sequence_has_no_gradient_and_clipfrac_one():
     old = [torch.zeros(4)]
     lp = [torch.full((4,), 2.0, requires_grad=True)]  # log r = 2 > 0.4 with A > 0
     adv = [torch.ones(4)]
-    loss, clipfrac = compute_gmpo_loss(lp, old, adv, [torch.ones(4)], adv, 0.4, 0.4)
+    loss, clipfrac, _ = compute_gmpo_loss(lp, old, adv, [torch.ones(4)], adv, 0.4, 0.4)
     torch.testing.assert_close(loss, torch.full((4,), -math.exp(0.4)))
     torch.testing.assert_close(clipfrac, torch.ones(4))
     loss.sum().backward()
@@ -170,7 +170,7 @@ def test_gmpo_all_clipped_sequence_has_no_gradient_and_clipfrac_one():
 def _gmpo(lr, adv, d_l, d_h):
     lp = [lr.clone().requires_grad_(True)]
     a = [torch.full(lr.shape, adv)]
-    loss, clipfrac = compute_gmpo_loss(lp, [torch.zeros(lr.shape)], a, [torch.ones(lr.shape)], a, d_l, d_h)
+    loss, clipfrac, _ = compute_gmpo_loss(lp, [torch.zeros(lr.shape)], a, [torch.ones(lr.shape)], a, d_l, d_h)
     loss.sum().backward()
     return loss, clipfrac, lp[0].grad
 
@@ -212,10 +212,10 @@ def test_gmpo_negative_advantage_symmetric_matches_algorithm1():
 def test_gmpo_clipfrac_ignores_zero_advantage_tokens():
     lp = [torch.tensor([2.0, 2.0, 0.0, 0.0])]
     adv = [torch.tensor([1.0, 1.0, 0.0, 0.0])]
-    _, clipfrac = compute_gmpo_loss(lp, [torch.zeros(4)], adv, [torch.ones(4)], adv, 0.4, 0.4)
+    _, clipfrac, _ = compute_gmpo_loss(lp, [torch.zeros(4)], adv, [torch.ones(4)], adv, 0.4, 0.4)
     torch.testing.assert_close(clipfrac, torch.ones(4))
     zero = [torch.zeros(3)]
-    _, clipfrac = compute_gmpo_loss([torch.ones(3)], [torch.zeros(3)], zero, [torch.ones(3)], zero, 0.4, 0.4)
+    _, clipfrac, _ = compute_gmpo_loss([torch.ones(3)], [torch.zeros(3)], zero, [torch.ones(3)], zero, 0.4, 0.4)
     torch.testing.assert_close(clipfrac, torch.zeros(3))
 
 
@@ -228,7 +228,7 @@ def test_gmpo_simulated_cp_split_matches_full():
     lp = [old[0] + 0.3 * torch.randn(8, generator=g)]
     adv = [torch.full((8,), -1.2)]
     mask = [torch.ones(8)]
-    full, _ = compute_gmpo_loss(lp, old, adv, mask, adv, 0.4, 0.4)
+    full, _, _ = compute_gmpo_loss(lp, old, adv, mask, adv, 0.4, 0.4)
     parts = [compute_gmpo_loss(lp, old, adv, mask, [adv[0][idx]], 0.4, 0.4)[0] for idx in (slice(0, 3), slice(3, 8))]
     torch.testing.assert_close(torch.cat(parts), full)
 
@@ -296,7 +296,7 @@ def _run(args, inputs):
     return loss.detach(), metrics, logits.grad.clone()
 
 
-def _ref(args, inputs, variant, use_tis=False):
+def _ref(args, inputs, variant, correction=None):
     batch = make_batch(inputs, "policy_loss")
     logits = deep_clone(inputs["policy_logits"]).requires_grad_(True)
     make_parallel_state()
@@ -318,8 +318,11 @@ def _ref(args, inputs, variant, use_tis=False):
             tok = ref_sapo(lp, old, adv, args.sapo_tau_pos, args.sapo_tau_neg)
         else:
             tok = -ref_gmpo_seq(lp, old, adv, m, args.gmpo_log_clip_low, args.gmpo_log_clip_high) * adv
-        if use_tis:
+        if correction == "tis":
             tok = tok * torch.clamp(torch.exp(old - roll), args.tis_clip_low, args.tis_clip)
+        elif correction == "icepop":
+            w = torch.exp(old - roll)
+            tok = tok * torch.where((w >= args.tis_clip_low) & (w <= args.tis_clip), w, torch.zeros_like(w))
         total = total + (tok * m).sum() / torch.clamp_min(m.sum(), 1)
     total.backward()
     return total.detach(), logits.grad.clone()
@@ -329,16 +332,75 @@ VARIANT_ARGS = dict(eps_clip=0.2, eps_clip_high=0.28, sapo_tau_pos=1.0, sapo_tau
 VARIANT_ARGS.update(gmpo_log_clip_low=0.4, gmpo_log_clip_high=0.3)
 
 
-@pytest.mark.parametrize("use_tis", [False, True])
+ICEPOP_PATH = "miles.backends.training_utils.loss_hub.corrections.icepop_function"
+
+
+@pytest.mark.parametrize("correction", [None, "tis", "icepop"])
 @pytest.mark.parametrize("variant", ["cispo", "sapo", "gmpo"])
-def test_policy_loss_function_variant_matches_reference(variant, use_tis):
-    args = make_args(policy_loss_variant=variant, entropy_coef=0.0, use_tis=use_tis, **VARIANT_ARGS)
+def test_policy_loss_function_variant_matches_reference(variant, correction):
+    args = make_args(
+        policy_loss_variant=variant,
+        entropy_coef=0.0,
+        use_tis=correction is not None,
+        custom_tis_function_path=ICEPOP_PATH if correction == "icepop" else None,
+        **VARIANT_ARGS,
+    )
     inputs = _inputs(args)
+    if correction == "icepop":
+        # widen the spread so some tokens fall outside [tis_clip_low, tis_clip] and get popped
+        g = torch.Generator().manual_seed(5)
+        inputs["rollout_log_probs"] = [x + 0.6 * torch.randn(x.shape, generator=g) for x in inputs["log_probs"]]
     loss, metrics, grad = _run(args, inputs)
-    ref_loss, ref_grad = _ref(args, inputs, variant, use_tis=use_tis)
+    ref_loss, ref_grad = _ref(args, inputs, variant, correction=correction)
     torch.testing.assert_close(loss, ref_loss, rtol=1e-5, atol=1e-6)
     torch.testing.assert_close(grad, ref_grad, rtol=1e-5, atol=1e-6)
     assert torch.isfinite(metrics["pg_clipfrac"])
+    assert ("gmpo_clip_num" in metrics) == (variant == "gmpo")
+
+
+def rs_reject_function(args, *, pg_loss, loss_masks, **kwargs):
+    """Test-only rejection sampling: drop the first token of every sample (numerator and mask)."""
+    new_masks = []
+    keep = []
+    for m in loss_masks:
+        m = m.clone()
+        m[0] = 0.0
+        new_masks.append(m)
+        keep.append(m)
+    return pg_loss * torch.cat(keep), new_masks, {}
+
+
+@pytest.mark.parametrize("rs", [False, True])
+def test_gmpo_global_clip_ratio_is_one_when_all_active_tokens_clipped(rs):
+    """Zero-advantage group + (optionally) RS-rejected tokens must not dilute the global ratio."""
+    args = make_args(
+        policy_loss_variant="gmpo",
+        entropy_coef=0.0,
+        use_tis=rs,
+        custom_tis_function_path=(__name__ + ".rs_reject_function") if rs else None,
+        **VARIANT_ARGS,
+    )
+    inputs = _inputs(args)
+    make_parallel_state()
+    cur = get_log_probs_and_entropy(
+        inputs["policy_logits"],
+        args=args,
+        unconcat_tokens=inputs["unconcat_tokens"],
+        total_lengths=inputs["total_lens"],
+        response_lengths=inputs["response_lens"],
+        with_entropy=False,
+    )["log_probs"]
+    # sample 0: A > 0, log r = +1 > d_h; sample 1: A < 0, log r = -1 < -d_l; sample 2: A = 0
+    inputs["advantages"] = [torch.full((n,), v) for n, v in zip(RESPONSE_LENS, [1.0, -1.0, 0.0], strict=True)]
+    inputs["log_probs"] = [cur[0].detach() - 1.0, cur[1].detach() + 1.0, cur[2].detach()]
+    inputs["rollout_log_probs"] = [x.clone() for x in inputs["log_probs"]]
+    _, metrics, _ = _run(args, inputs)
+    num, den = metrics["gmpo_clip_num"], metrics["gmpo_clip_den"]
+    expected_den = 4.0 + 6.0 if rs else 5.0 + 7.0  # sample 1 has one masked token; RS drops token 0 of each
+    assert den.item() == expected_den
+    assert (num / den).item() == 1.0
+    # the legacy per-sample-mean pg_clipfrac is kept unchanged: 1 + 1 + 0 over 3 samples (diluted by A = 0)
+    assert metrics["pg_clipfrac"].item() == 2.0
 
 
 def test_default_path_bitwise_unchanged():
@@ -413,6 +475,8 @@ def _ns(**kw):
 @pytest.mark.parametrize("variant", ["policy_loss", "cispo", "sapo", "gmpo"])
 def test_validation_accepts_defaults(variant):
     validate_policy_loss_variant_args(_ns(policy_loss_variant=variant))
+    if variant != "gmpo":
+        validate_policy_loss_variant_args(_ns(policy_loss_variant=variant, calculate_per_token_loss=True))
 
 
 def test_validation_default_variant_ignores_other_settings():
@@ -427,6 +491,7 @@ def test_validation_default_variant_ignores_other_settings():
         (dict(policy_loss_variant="sapo", loss_type="custom_loss"), "loss-type"),
         (dict(policy_loss_variant="sapo", sapo_tau_pos=0.0), "sapo-tau-pos"),
         (dict(policy_loss_variant="sapo", sapo_tau_neg=float("inf")), "sapo-tau-neg"),
+        (dict(policy_loss_variant="gmpo", calculate_per_token_loss=True), "calculate-per-token-loss"),
         (dict(policy_loss_variant="gmpo", gmpo_log_clip_low=-0.1), "gmpo-log-clip-low"),
         (dict(policy_loss_variant="gmpo", gmpo_log_clip_high=float("nan")), "gmpo-log-clip-high"),
     ],
