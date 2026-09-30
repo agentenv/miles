@@ -74,11 +74,11 @@ def list_named_training_state_files(checkpoint_dir: Path, *, tp_rank: int, pp_ra
 
 
 class _Slot:
-    __slots__ = ("name", "model_param", "start", "end", "get", "set", "group")
+    __slots__ = ("name", "model_param", "start", "end", "get", "set", "group", "leaf")
 
-    def __init__(self, name, model_param, start, end, get, set_, group):
+    def __init__(self, name, model_param, start, end, get, set_, group, leaf=None):
         self.name, self.model_param, self.start, self.end = name, model_param, start, end
-        self.get, self.set, self.group = get, set_, group
+        self.get, self.set, self.group, self.leaf = get, set_, group, leaf
 
 
 def _optimizer_leaves(optimizer: Any) -> list[Any]:
@@ -139,14 +139,22 @@ def _distributed_slots(leaf: Any, name_of) -> list[_Slot]:
                     group_index, _ = leaf.model_param_group_index_map[model_param]
 
                     def get(model_param=model_param):
-                        return leaf._get_main_param_and_optimizer_states(model_param)
+                        return _read_distributed_state(leaf, model_param)
 
                     def set_(tensors, model_param=model_param):
-                        current = leaf._get_main_param_and_optimizer_states(model_param)
+                        current = _read_distributed_state(leaf, model_param)
                         missing = current.keys() - tensors.keys()
                         if missing:
                             raise DpInvariantStateError(
                                 f"saved state of {name_of[id(model_param)]!r} lacks {sorted(missing)}"
+                            )
+                        # Megatron copies only the keys the target already holds, so an extra saved key would be
+                        # dropped without a word (e.g. exp_avg onto a state left empty by an earlier read)
+                        extra = tensors.keys() - current.keys()
+                        if extra:
+                            raise DpInvariantStateError(
+                                f"optimizer state of {name_of[id(model_param)]!r} has no {sorted(extra)} to load the "
+                                f"saved values into"
                             )
                         leaf._set_main_param_and_optimizer_states(model_param, tensors)
 
@@ -160,9 +168,39 @@ def _distributed_slots(leaf: Any, name_of) -> list[_Slot]:
                             get,
                             set_,
                             leaf.optimizer.param_groups[group_index],
+                            leaf,
                         )
                     )
     return slots
+
+
+def _main_param_of(leaf: Any, model_param) -> Any:
+    group_index, group_order = leaf.model_param_group_index_map[model_param]
+    return leaf.optimizer.param_groups[group_index]["params"][group_order]
+
+
+def _read_distributed_state(leaf: Any, model_param) -> dict[str, torch.Tensor]:
+    """``_get_main_param_and_optimizer_states`` without its side effect: the read goes through the optimizer's
+    ``state`` defaultdict, which would leave an empty entry for a parameter that has no state yet."""
+    state = leaf.optimizer.state
+    main = _main_param_of(leaf, model_param)
+    had_entry = main in state
+    try:
+        return leaf._get_main_param_and_optimizer_states(model_param)
+    finally:
+        if not had_entry and main in state and not state[main]:
+            del state[main]
+
+
+def _distributed_needs_state_init(leaf: Any, slots: Sequence[_Slot], merged: Mapping[str, Mapping[str, Any]]) -> bool:
+    """Whether some slot of ``leaf`` lacks a saved optimizer-state key (a fresh or lazily read optimizer)."""
+    for slot in slots:
+        if slot.leaf is not leaf:
+            continue
+        saved = set(merged[slot.name]["tensors"]) | set(merged[slot.name]["scalars"])
+        if not saved <= set(slot.get()):
+            return True
+    return False
 
 
 def optimizer_slots(optimizer: Any, named_params: Iterable[tuple[str, torch.nn.Parameter]]) -> list[_Slot]:
@@ -307,11 +345,12 @@ def load_named_optimizer_state(optimizer: Any, named_params, merged: Mapping[str
     """
     named_params = list(named_params)
     check_named_optimizer_state(optimizer, named_params, merged)
-    for leaf in _optimizer_leaves(optimizer):
-        if _is_distributed(leaf) and not leaf.optimizer.state:
-            # A freshly built DistOpt has no state tensors yet; Megatron's own loaders initialize them first.
-            leaf._init_optimizer_states_with_dummy_values()
     slots = optimizer_slots(optimizer, named_params)
+    for leaf in _optimizer_leaves(optimizer):
+        # A freshly built DistOpt has no state tensors yet (Megatron's own loaders initialize them first). Decide per
+        # parameter, not on the whole ``state``: an earlier read may have left empty entries that hide a missing init.
+        if _is_distributed(leaf) and _distributed_needs_state_init(leaf, slots, merged):
+            leaf._init_optimizer_states_with_dummy_values()
     for slot in slots:
         full = merged[slot.name]
         tensors = {k: v[slot.start : slot.end] for k, v in full["tensors"].items()}

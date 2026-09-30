@@ -619,3 +619,69 @@ class TestArgumentFailFast:
 
         with pytest.raises(ValueError, match=match):
             validate_lora_dp_invariant_args(self._args(**overrides))
+
+
+class TestDistributedOptimizerLazyState:
+    """A read of a fresh DistOpt used to leave empty state entries; the load then skipped the Adam init and Megatron
+    copied only ``param``, dropping exp_avg / exp_avg_sq without a word (E2 GPU C1 diag 2)."""
+
+    def _saved(self, model, dp_size=2):
+        init = {p: p.detach().float() for p in _params_of(model)}
+        savers = [_DistOpt(_params_of(model), init, dp_rank=r, dp_size=dp_size) for r in range(dp_size)]
+        for opt in savers:
+            opt.step(_grads(model, 1))
+            opt.step(_grads(model, 2))
+        return savers, [_export(model, opt) for opt in savers]
+
+    def _fresh(self, model, dp_rank=0, dp_size=1):
+        zeros = {p: torch.zeros(p.shape) for p in _params_of(model)}
+        return _DistOpt(_params_of(model), zeros, dp_rank=dp_rank, dp_size=dp_size)
+
+    def test_reading_a_fresh_optimizer_leaves_no_state_entry(self):
+        model = _Bf16Model(0)
+        fresh = self._fresh(model)
+        _export(model, fresh)
+        [slot.get() for slot in dps.optimizer_slots(fresh, _named(model))]
+        assert len(fresh.optimizer.state) == 0
+
+    def test_moments_survive_empty_entries_left_by_an_earlier_read(self):
+        model = _Bf16Model(0)
+        savers, shards = self._saved(model)
+        merged = dps.merge_named_optimizer_states(shards)
+        loader = self._fresh(model)
+        # what the old read path (defaultdict access in Megatron's getter) left behind
+        for group in loader.optimizer.param_groups:
+            for main in group["params"]:
+                loader.optimizer.state[main]
+        assert loader.optimizer.state and not any(loader.optimizer.state.values())
+        ranges_before = [(s.name, s.start, s.end) for s in dps.optimizer_slots(loader, _named(model))]
+
+        _load(model, loader, shards)
+
+        reread = _export(model, loader)["entries"]
+        for name, full in merged.items():
+            for key in ("param", "exp_avg", "exp_avg_sq"):
+                assert torch.equal(reread[name]["tensors"][key], full["tensors"][key]), (name, key)
+            assert torch.equal(reread[name]["scalars"]["step"], full["scalars"]["step"])
+        assert [(s.name, s.start, s.end) for s in dps.optimizer_slots(loader, _named(model))] == ranges_before
+
+    def test_a_saved_key_the_target_cannot_hold_is_refused(self):
+        model = _Bf16Model(0)
+        _, shards = self._saved(model)
+        merged = dps.merge_named_optimizer_states(shards)
+        for entry in merged.values():
+            entry["tensors"]["momentum_buffer"] = torch.zeros_like(entry["tensors"]["param"])
+        loader = self._fresh(model)
+        with pytest.raises(dps.DpInvariantStateError, match="momentum_buffer"):
+            dps.load_named_optimizer_state(loader, _named(model), merged)
+
+    def test_a_target_key_the_save_lacks_is_still_refused(self):
+        model = _Bf16Model(0)
+        _, shards = self._saved(model)
+        merged = dps.merge_named_optimizer_states(shards)
+        for entry in merged.values():
+            del entry["tensors"]["exp_avg_sq"]
+        loader = self._fresh(model)
+        loader.step(_grads(model, 5))
+        with pytest.raises(dps.DpInvariantStateError, match="lacks \\['exp_avg_sq'\\]"):
+            dps.load_named_optimizer_state(loader, _named(model), merged)
