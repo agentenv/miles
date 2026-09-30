@@ -14,9 +14,12 @@ from miles.backends.training_utils.loss_hub.logit_processors import get_log_prob
 from miles.backends.training_utils.loss_hub.math_utils import (
     compute_approx_kl,
     compute_ess_ratio_contribution,
+    compute_cispo_loss,
+    compute_gmpo_loss,
     compute_gspo_kl,
     compute_opsm_mask,
     compute_policy_loss,
+    compute_sapo_loss,
 )
 from miles.backends.training_utils.parallel import get_parallel_state
 from miles.backends.training_utils.sampling_mask import get_rollout_sampling_masks
@@ -141,7 +144,8 @@ def policy_loss_function(
     old_log_probs_list = old_log_probs
 
     # Pre-gather log probs if needed by OPSM or GSPO to avoid duplicate gathering
-    need_full_log_probs = args.use_opsm or args.advantage_estimator == "gspo"
+    variant = getattr(args, "policy_loss_variant", "policy_loss")
+    need_full_log_probs = args.use_opsm or args.advantage_estimator == "gspo" or variant == "gmpo"
 
     full_log_probs = None
     full_old_log_probs = None
@@ -207,9 +211,34 @@ def policy_loss_function(
         advantages.new_zeros(()),
     )
 
-    pg_loss, pg_clipfrac = compute_policy_loss(
-        ppo_kl, advantages, args.eps_clip, args.eps_clip_high, getattr(args, "eps_clip_c", None)
-    )
+    if variant == "policy_loss":
+        pg_loss, pg_clipfrac = compute_policy_loss(
+            ppo_kl, advantages, args.eps_clip, args.eps_clip_high, getattr(args, "eps_clip_c", None)
+        )
+    elif variant == "cispo":
+        pg_loss, pg_clipfrac = compute_cispo_loss(
+            ppo_kl, torch.where(active_tokens, log_probs, 0.0), advantages, args.eps_clip, args.eps_clip_high
+        )
+    elif variant == "sapo":
+        pg_loss, pg_clipfrac = compute_sapo_loss(ppo_kl, advantages, args.sapo_tau_pos, args.sapo_tau_neg)
+    elif variant == "gmpo":
+        full_advantages = [
+            all_gather_with_cp(adv, total_length, response_length)
+            for adv, total_length, response_length in zip(
+                advantages_list, total_lengths, response_lengths, strict=False
+            )
+        ]
+        pg_loss, pg_clipfrac = compute_gmpo_loss(
+            full_log_probs,
+            full_old_log_probs,
+            full_advantages,
+            batch["loss_masks"],
+            list(torch.split(advantages, [a.numel() for a in advantages_list])),
+            args.gmpo_log_clip_low,
+            args.gmpo_log_clip_high,
+        )
+    else:
+        raise ValueError(f"Unknown --policy-loss-variant: {variant}")
 
     if getattr(args, "dump_details", None) is not None:
         from miles.backends.training_utils.debug_dump import maybe_dump_policy_loss_debug

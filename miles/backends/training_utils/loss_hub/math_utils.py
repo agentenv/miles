@@ -277,6 +277,81 @@ def compute_policy_loss(
     return pg_losses, clipfrac
 
 
+@torch.compile(dynamic=True)
+def compute_cispo_loss(
+    ppo_kl: torch.Tensor,
+    log_probs: torch.Tensor,
+    advantages: torch.Tensor,
+    eps_clip: float,
+    eps_clip_high: float,
+):
+    """CISPO (MiniMax-M1): loss = -sg(clamp(ratio, 1-eps_low, 1+eps_high)) * A * log pi_theta.
+
+    Every token keeps a gradient; clipfrac counts tokens whose ratio lies outside the clip range.
+    """
+    ratio = _safe_exp_neg_ppo_kl(ppo_kl).detach()
+    clipped = ratio.clamp(1 - eps_clip, 1 + eps_clip_high)
+    pg_losses = -clipped * advantages * log_probs
+    clipfrac = torch.ne(clipped, ratio).float()
+    return pg_losses, clipfrac
+
+
+@torch.compile(dynamic=True)
+def compute_sapo_loss(
+    ppo_kl: torch.Tensor,
+    advantages: torch.Tensor,
+    tau_pos: float,
+    tau_neg: float,
+):
+    """SAPO (Qwen): loss = -sigmoid(tau * (ratio - 1)) * 4 / tau * A, tau = tau_pos if A > 0 else tau_neg.
+
+    Soft gate, no hard mask: clipfrac is always zero.
+    """
+    ratio = _safe_exp_neg_ppo_kl(ppo_kl)
+    tau = torch.where(advantages > 0, torch.full_like(ratio, tau_pos), torch.full_like(ratio, tau_neg))
+    gate = torch.sigmoid(tau * (ratio - 1)) * 4 / tau
+    pg_losses = -gate * advantages
+    return pg_losses, torch.zeros_like(pg_losses)
+
+
+def compute_gmpo_loss(
+    full_log_probs: list[torch.Tensor],
+    full_old_log_probs: list[torch.Tensor],
+    full_advantages: list[torch.Tensor],
+    loss_masks: list[torch.Tensor],
+    local_advantages: list[torch.Tensor],
+    log_clip_low: float,
+    log_clip_high: float,
+):
+    """GMPO (arXiv:2507.20673v3 eq. 4 / Algorithm 1): geometric-mean sequence ratio with one-sided,
+    PPO-style token clipping in log space.
+
+    l_t = sign(A) * min(sign(A) * log r_t, sign(A) * clamp(log r_t, -log_clip_low, log_clip_high)),
+    i.e. A > 0 caps log r_t at +log_clip_high, A < 0 floors it at -log_clip_low, the other side is
+    unbounded (and keeps its gradient). seq_ratio = exp(masked_mean_t l_t); loss_t = -seq_ratio * A_t
+    on the local (CP) tokens. With log_clip_low == log_clip_high this is exactly Algorithm 1.
+
+    clipfrac (per sequence, expanded to its local tokens): number of masked tokens with A != 0 whose
+    min() picks the clipped value, divided by the number of masked tokens with A != 0 (0 if none).
+    Inputs are full (CP-gathered) sequences, like compute_gspo_kl.
+    """
+    losses, clipfracs = [], []
+    for log_prob, old_log_prob, full_adv, loss_mask, local_adv in zip(
+        full_log_probs, full_old_log_probs, full_advantages, loss_masks, local_advantages, strict=True
+    ):
+        mask = loss_mask.to(log_prob.dtype)
+        sign = torch.sign(torch.nan_to_num(full_adv, nan=0.0, posinf=0.0, neginf=0.0))
+        log_ratio = torch.nan_to_num(log_prob - old_log_prob, nan=0.0, posinf=0.0, neginf=0.0) * mask
+        unclipped = sign * log_ratio
+        clipped = sign * log_ratio.clamp(-log_clip_low, log_clip_high)
+        seq_log_ratio = (sign * torch.minimum(unclipped, clipped) * mask).sum() / torch.clamp_min(mask.sum(), 1)
+        active = mask * (sign != 0).to(mask.dtype)
+        clip_frac = ((clipped < unclipped).to(mask.dtype) * active).sum().detach() / torch.clamp_min(active.sum(), 1)
+        losses.append(-seq_log_ratio.exp() * local_adv)
+        clipfracs.append(clip_frac.expand_as(local_adv))
+    return torch.cat(losses, dim=0), torch.cat(clipfracs, dim=0)
+
+
 def compute_log_probs(
     logits: torch.Tensor,
     tokens: torch.Tensor,

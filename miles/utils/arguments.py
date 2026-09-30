@@ -1,6 +1,7 @@
 import argparse
 import json
 import logging
+import math
 import os
 import re
 from string import Formatter
@@ -1607,6 +1608,22 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 default=None,
                 help="lower bound of the value for Dual-clip PPO from https://arxiv.org/pdf/1912.09729",
             )
+            parser.add_argument(
+                "--policy-loss-variant",
+                type=str,
+                choices=["policy_loss", "cispo", "sapo", "gmpo"],
+                default="policy_loss",
+                help="Token-level policy objective used by --loss-type policy_loss. policy_loss = PPO clip (default); "
+                "cispo reuses --eps-clip/--eps-clip-high as the IS-weight clip range.",
+            )
+            parser.add_argument("--sapo-tau-pos", type=float, default=1.0, help="SAPO gate temperature for A > 0")
+            parser.add_argument("--sapo-tau-neg", type=float, default=1.05, help="SAPO gate temperature for A <= 0")
+            parser.add_argument(
+                "--gmpo-log-clip-low", type=float, default=0.4, help="GMPO log-space clip: lower bound is -value"
+            )
+            parser.add_argument(
+                "--gmpo-log-clip-high", type=float, default=0.4, help="GMPO log-space clip: upper bound is +value"
+            )
             parser.add_argument("--value-clip", type=float, default=0.2, help="the clip for value loss")
             parser.add_argument(
                 "--kl-coef",
@@ -3202,6 +3219,23 @@ def _resolve_run_uuid(args: argparse.Namespace) -> str:
     return generate_run_uuid()
 
 
+def validate_policy_loss_variant_args(args):
+    variant = getattr(args, "policy_loss_variant", "policy_loss")
+    if variant == "policy_loss":
+        return
+    assert args.loss_type == "policy_loss", f"--policy-loss-variant {variant} requires --loss-type policy_loss"
+    assert (
+        args.advantage_estimator != "gspo"
+    ), f"--policy-loss-variant {variant} cannot be combined with --advantage-estimator gspo"
+    assert (
+        getattr(args, "eps_clip_c", None) is None
+    ), f"--policy-loss-variant {variant} cannot be combined with --eps-clip-c"
+    names = {"sapo": ("sapo_tau_pos", "sapo_tau_neg"), "gmpo": ("gmpo_log_clip_low", "gmpo_log_clip_high")}
+    for name in names.get(variant, ()):
+        value = getattr(args, name)
+        assert math.isfinite(value) and value > 0, f"--{name.replace('_', '-')} must be finite and > 0, got {value}"
+
+
 def miles_validate_args(args):
     if args.custom_config_path:
         data = yaml.safe_load(resolve_file_arg(args.custom_config_path)) or {}
@@ -3498,6 +3532,8 @@ def miles_validate_args(args):
 
     if args.eps_clip_high is None:
         args.eps_clip_high = args.eps_clip
+
+    validate_policy_loss_variant_args(args)
 
     if args.eval_reward_key is None:
         args.eval_reward_key = args.reward_key
