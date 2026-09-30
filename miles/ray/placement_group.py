@@ -189,7 +189,7 @@ def parse_placement_map(raw: "str | dict | PlacementMap | None") -> PlacementMap
     data = json.loads(raw) if isinstance(raw, str) else raw
     assert isinstance(data, dict), f"a placement map is a JSON object keyed by role, got {data!r}"
     unknown = set(data) - set(_PLACEMENT_MAP_ROLES) - {ROLLOUT_CELLS_KEY}
-    assert not unknown, f"placement map names unknown roles {sorted(unknown)}; known: {list(_PLACEMENT_MAP_ROLES)}"
+    assert not unknown, f"placement map names unknown roles {sorted(unknown)}; known: {[*_PLACEMENT_MAP_ROLES, ROLLOUT_CELLS_KEY]}"
     fields = {}
     for role in _PLACEMENT_MAP_ROLES:
         indices = data.get(role, [])

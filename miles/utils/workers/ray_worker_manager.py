@@ -105,9 +105,8 @@ class RayWorkerManager:
             if unbound:
                 raise CellUnboundError(f"deferred cells {unbound} are bound to no bundle; rebind_cell them first")
             for cell in cells:
-                # a deferred cell's bundles were checked free at rebind time; check again, something may run there now
-                if cell.deferred:
-                    self._assert_bundles_free(cell.bundles(), ignore=cell)
+                # bindings were checked free when made; check again, a view may have been re-pointed onto them since
+                self._assert_bundles_free(cell.bundles(), ignore=cell)
             try:
                 await _gather_or_raise([c.launch_actors() for c in cells])
                 await _gather_or_raise([c.alloc_ports() for c in cells])
@@ -177,6 +176,8 @@ class RayWorkerManager:
             await asyncio.gather(*[cell.stop() for pool_id in pool_ids for cell in self._pools[pool_id].cells])
 
     async def start_pools(self, pool_ids: list[str]) -> None:
+        """Start the stopped cells of the pools, except deferred cells (declared stopped): those only start through
+        an explicit ``start_cells``."""
         await self.start_cells(
             [cell.cell_id for pool_id in pool_ids for cell in self._pools[pool_id].cells if not cell.deferred]
         )

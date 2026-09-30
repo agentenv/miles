@@ -226,3 +226,19 @@ class TestDeclaredCells:
         )
         with pytest.raises(AssertionError, match="outside 'standby'"):
             await _launch([spec], _pgs())
+
+
+class TestStartRechecksEveryCell:
+    async def test_a_regular_cell_cannot_start_on_bundles_a_trainer_took(self, fake_ray_cluster: FakeRayCluster):
+        """E3: an engine stops, the trainer grows over its bundle, the engine must not start there again."""
+        manager = await _launch([_trainer_spec(2), _engine_spec()], _pgs())
+        engine_1 = compute_cell_id(pool_id="engine", cell_index=1)
+        await manager.stop_cells([engine_1])
+        await manager.stop_pools(["trainer"])
+        await manager.set_pg_view("actor", _view([0, 1, 3]))
+        await manager.replace_pool_spec(_trainer_spec(3))
+        await manager.start_pools(["trainer"])
+
+        with pytest.raises(BundleInUseError, match="in use by running cell trainer"):
+            await manager.start_cells([engine_1])
+        assert manager.describe_cells()[engine_1]["state"] == "stopped"
