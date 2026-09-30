@@ -48,6 +48,13 @@ class SchedulingSpec(FrozenStrictBaseModel):
     pg_name: str | None = None
     pg_slot_offset: int = 0
     pin_to_head: bool = False
+    # extra cells (indices num_cells..) declared stopped and bound to no bundle: never started at init, and only
+    # startable after ``RayWorkerManager.rebind_cell`` gives them a binding (yeto F-R1)
+    num_deferred_cells: int = 0
+    # optional per cell index (num_cells + num_deferred_cells entries): the caller's name for the cell, and the
+    # ``(pg_name, pg_slot_offset)`` it is bound to at declaration (None: the spec layout, or unbound if deferred)
+    cell_aliases: tuple[str, ...] = ()
+    initial_bindings: tuple[tuple[str, int] | None, ...] = ()
 
     def gpus_per_cell(self) -> int:
         return self.num_workers_per_cell * self.num_gpu_slots_per_worker

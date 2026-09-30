@@ -1464,3 +1464,69 @@ class TestRegistrationWiring:
     def test_a_run_deploying_its_own_engines_names_its_pools_after_the_component(self, tmp_path):
         """Every pool id carries a segment, so the unsplit run falls back to the component it deploys."""
         assert compute_engine_pool_ids(self._args(tmp_path)) == ["inference-engine-all-0-0"]
+
+
+class TestDeclaredRolloutCellsSpec:
+    _MAP = (
+        '{"trainer": [0, 1], "rollout": [2, 3, 4, 5], "standby": [6, 7], "rollout_cells": ['
+        '{"name": "c0", "bundles": [2, 3]}, {"name": "c1", "bundles": [4, 5]}, '
+        '{"name": "s0", "bundles": [6, 7], "start": false}, {"name": "t0", "start": false}]}'
+    )
+
+    def _config(self, tmp_path, server_groups):
+        config_path = tmp_path / "sglang.yaml"
+        config_path.write_text(make_sglang_config_yaml(server_groups=server_groups))
+        return str(config_path)
+
+    def test_the_declared_cells_land_on_the_single_engine_pool(self, tmp_path):
+        config = self._config(tmp_path, [{"worker_type": "regular", "num_gpus": 4, "num_gpus_per_engine": 2}])
+        [base] = specs_inference_engine(make_args(sglang_config=config, rollout_num_gpus=4))
+        assert base.scheduling.num_deferred_cells == 0 and base.scheduling.cell_aliases == ()
+
+        [spec] = specs_inference_engine(
+            make_args(sglang_config=config, rollout_num_gpus=4, yeto_placement_map=self._MAP)
+        )
+        scheduling = spec.scheduling
+        assert (scheduling.num_cells, scheduling.num_deferred_cells) == (2, 2)
+        assert scheduling.cell_aliases == ("c0", "c1", "s0", "t0")
+        assert scheduling.initial_bindings == (("rollout", 0), ("rollout", 2), ("standby", 0), None)
+        unchanged = scheduling.model_copy(update=dict(num_deferred_cells=0, cell_aliases=(), initial_bindings=()))
+        assert unchanged == base.scheduling
+        assert (spec.name, spec.port_infos) == (base.name, base.port_infos)
+
+    def test_a_map_without_cells_changes_nothing(self, tmp_path):
+        config = self._config(tmp_path, [{"worker_type": "regular", "num_gpus": 4, "num_gpus_per_engine": 2}])
+        [base] = specs_inference_engine(make_args(sglang_config=config, rollout_num_gpus=4))
+        [spec] = specs_inference_engine(
+            make_args(
+                sglang_config=config,
+                rollout_num_gpus=4,
+                yeto_placement_map='{"trainer": [0], "rollout": [1, 2, 3, 4]}',
+            )
+        )
+        assert spec.scheduling == base.scheduling
+
+    def test_started_cells_must_be_the_rollout_engines(self, tmp_path):
+        config = self._config(tmp_path, [{"worker_type": "regular", "num_gpus": 4, "num_gpus_per_engine": 2}])
+        raw = self._MAP.replace(
+            '{"name": "c1", "bundles": [4, 5]}', '{"name": "c1", "bundles": [4, 5], "start": false}'
+        )
+        with pytest.raises(AssertionError, match="starts 1 rollout cells but the rollout GPUs make 2"):
+            specs_inference_engine(make_args(sglang_config=config, rollout_num_gpus=4, yeto_placement_map=raw))
+
+    def test_a_cell_must_name_one_engine_worth_of_bundles(self, tmp_path):
+        config = self._config(tmp_path, [{"worker_type": "regular", "num_gpus": 4, "num_gpus_per_engine": 2}])
+        raw = self._MAP.replace('"bundles": [6, 7]', '"bundles": [6]')
+        with pytest.raises(AssertionError, match="do not name the 2 bundles of one engine"):
+            specs_inference_engine(make_args(sglang_config=config, rollout_num_gpus=4, yeto_placement_map=raw))
+
+    def test_more_than_one_engine_pool_is_refused(self, tmp_path):
+        config = self._config(
+            tmp_path,
+            [
+                {"worker_type": "prefill", "num_gpus": 2, "num_gpus_per_engine": 2},
+                {"worker_type": "decode", "num_gpus": 2, "num_gpus_per_engine": 2},
+            ],
+        )
+        with pytest.raises(AssertionError, match="exactly one inference engine pool"):
+            specs_inference_engine(make_args(sglang_config=config, rollout_num_gpus=4, yeto_placement_map=self._MAP))

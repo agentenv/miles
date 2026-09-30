@@ -271,7 +271,7 @@ def specs_inference_engine(args) -> list[CommandWorkerSpec]:
 
     config = resolve_sglang_config(args)  # TODO avoid resolve repeatedly
 
-    return [
+    specs = [
         _compute_spec_inference_engine(
             args,
             model_idx=model_idx,
@@ -283,6 +283,42 @@ def specs_inference_engine(args) -> list[CommandWorkerSpec]:
         for group_index, server_group_config in enumerate(model_cfg.server_groups)
         if server_group_config.worker_type != "placeholder"
     ]
+    return _with_declared_rollout_cells(args, specs)
+
+
+def _with_declared_rollout_cells(args, specs: list[CommandWorkerSpec]) -> list[CommandWorkerSpec]:
+    """Lay the single engine pool's cells out as the placement map's ``rollout_cells`` declare them (yeto F-R1).
+
+    Cell ``i`` of the pool is ``rollout_cells[i]``: it keeps the fork's cell id and carries the caller's name as its
+    alias, is bound to the declared bundles (or unbound), and the cells declared with ``start: false`` are deferred
+    (declared, not started). The started cells must be exactly the engines the rollout GPUs make.
+    """
+    from miles.ray.placement_group import parse_placement_map, rollout_cell_binding
+
+    pm = parse_placement_map(getattr(args, "yeto_placement_map", None))
+    if pm is None or not pm.rollout_cells:
+        return specs
+    assert len(specs) == 1, (
+        f"placement map rollout_cells need exactly one inference engine pool to declare them in, got "
+        f"{[spec.name for spec in specs]}"
+    )
+    (spec,) = specs
+    scheduling = spec.scheduling
+    gpus_per_cell = scheduling.gpus_per_cell()
+    wrong = [(c.name, len(c.bundles)) for c in pm.rollout_cells if c.bundles and len(c.bundles) != gpus_per_cell]
+    assert not wrong, f"rollout cells {wrong} do not name the {gpus_per_cell} bundles of one engine"
+    num_started = sum(c.start for c in pm.rollout_cells)
+    assert (
+        num_started == scheduling.num_cells
+    ), f"placement map starts {num_started} rollout cells but the rollout GPUs make {scheduling.num_cells} engines"
+    scheduling = scheduling.model_copy(
+        update=dict(
+            num_deferred_cells=len(pm.rollout_cells) - num_started,
+            cell_aliases=tuple(c.name for c in pm.rollout_cells),
+            initial_bindings=tuple(rollout_cell_binding(pm, c) for c in pm.rollout_cells),
+        )
+    )
+    return [spec.model_copy(update=dict(scheduling=scheduling))]
 
 
 def compute_engine_pool_ids(args) -> list[str]:

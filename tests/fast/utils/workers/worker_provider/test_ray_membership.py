@@ -28,6 +28,7 @@ class _FakeManagerHandle:
         self.get_cell_infos = _Recorder(
             self.calls, "get_cell_infos", answer={"pool-a-1": object(), "pool-a-0": object()}
         )
+        self.describe_cells = _Recorder(self.calls, "describe_cells", answer={"pool-a-0": {"state": "unbound"}})
 
 
 class TestRayWorkerProviderMembership:
@@ -51,3 +52,10 @@ class TestRayWorkerProviderMembership:
         provider = RayWorkerProvider(worker_manager_handle=_FakeManagerHandle())
         with pytest.raises(AssertionError, match="pool_ids"):
             await provider.list_declared_cell_ids()
+
+    async def test_describe_forwards_the_watched_pools(self):
+        handle = _FakeManagerHandle()
+        provider = RayWorkerProvider(worker_manager_handle=handle, pool_ids=["pool-a"])
+
+        assert await provider.describe_declared_cells() == {"pool-a-0": {"state": "unbound"}}
+        assert handle.calls == [("describe_cells", (), {"pool_ids": ["pool-a"]})]

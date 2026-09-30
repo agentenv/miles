@@ -84,11 +84,30 @@ class RayWorkerManager:
         assert len(self._pools) == len(specs)
         self._membership_lock = asyncio.Lock()
 
-        await self.start_cells([c.cell_id for c in self._all_cells()])
+        self._validate_initial_bindings()
+        # deferred cells are declared stopped: they wait for the caller's start_cells (after rebind_cell if unbound)
+        await self.start_cells([c.cell_id for c in self._all_cells() if not c.deferred])
+
+    def _validate_initial_bindings(self) -> None:
+        owner: dict[tuple[Any, int], str] = {}
+        for cell in self._all_cells():
+            if cell.binding is None:
+                continue
+            (bundles,) = self._validate_binding(cell.spec, [cell.binding])
+            for bundle in bundles:
+                assert bundle not in owner, f"cells {owner[bundle]} and {cell.cell_id} are declared on bundle {bundle}"
+                owner[bundle] = cell.cell_id
 
     async def start_cells(self, cell_ids: list[str]) -> None:
         async with self._membership_lock:
             cells = [cell for cell_id in cell_ids if (cell := self._find_cell(cell_id)).actors is None]
+            unbound = [c.cell_id for c in cells if c.unbound]
+            if unbound:
+                raise CellUnboundError(f"deferred cells {unbound} are bound to no bundle; rebind_cell them first")
+            for cell in cells:
+                # a deferred cell's bundles were checked free at rebind time; check again, something may run there now
+                if cell.deferred:
+                    self._assert_bundles_free(cell.bundles(), ignore=cell)
             try:
                 await _gather_or_raise([c.launch_actors() for c in cells])
                 await _gather_or_raise([c.alloc_ports() for c in cells])
@@ -128,12 +147,39 @@ class RayWorkerManager:
             cell.binding = binding
             logger.info(f"Cell {cell_id} rebound to {pg_name}[{pg_slot_offset}:] (bundles {sorted(bundles)})")
 
+    async def unbind_cell(self, cell_id: str) -> None:
+        """Return a stopped deferred cell to the unbound state, so it holds no bundle (e.g. before a trainer grows).
+
+        Only deferred cells can be unbound: a cell declared with a bundle layout always keeps one. Unbinding an
+        already unbound cell does nothing.
+        """
+        async with self._membership_lock:
+            cell = self._find_cell(cell_id)
+            assert cell.deferred, f"cell {cell_id} was not declared deferred; only deferred cells can be unbound"
+            assert not cell.alive, f"cell {cell_id} is running; stop it before unbinding it"
+            cell.binding = None
+            logger.info(f"Cell {cell_id} unbound")
+
+    def describe_cells(self, *, pool_ids: list[str] | None = None) -> dict[str, dict[str, Any]]:
+        """Every declared cell (of ``pool_ids``, default all) with its state and binding, read-only.
+
+        ``alias`` is the caller's name for the cell (placement map ``rollout_cells``) or None; ``state`` is
+        ``unbound`` (a deferred cell with no binding), ``stopped`` or ``running``. ``pg_name`` /
+        ``pg_slot_offset`` are the current binding (``pg_slot_offset`` is None for a spec layout, see
+        ``bundles``); ``bundles`` are the reordered bundle indices of the startup placement group the cell uses (or
+        would use at its next start) and ``gpu_ids`` the matching GPU ids of that view, parallel to ``bundles``.
+        """
+        pools = self._pools if pool_ids is None else {name: self._pools[name] for name in pool_ids}
+        return {c.cell_id: c.describe() for pool in pools.values() for c in pool.cells}
+
     async def stop_pools(self, pool_ids: list[str]) -> None:
         async with self._membership_lock:
             await asyncio.gather(*[cell.stop() for pool_id in pool_ids for cell in self._pools[pool_id].cells])
 
     async def start_pools(self, pool_ids: list[str]) -> None:
-        await self.start_cells([cell.cell_id for pool_id in pool_ids for cell in self._pools[pool_id].cells])
+        await self.start_cells(
+            [cell.cell_id for pool_id in pool_ids for cell in self._pools[pool_id].cells if not cell.deferred]
+        )
 
     async def set_pg_view(
         self, pg_name: str, info: PlacementGroupInfo, *, replacing_pools: list[str] | tuple[str, ...] = ()
@@ -316,8 +362,15 @@ class _PoolManager:
                     cell_index=cell_index,
                     spec=spec,
                     actors=None,
+                    deferred=cell_index >= spec.scheduling.num_cells,
+                    binding=(
+                        _CellBinding(*b)
+                        if cell_index < len(spec.scheduling.initial_bindings)
+                        and (b := spec.scheduling.initial_bindings[cell_index]) is not None
+                        else None
+                    ),
                 )
-                for cell_index in range(spec.scheduling.num_cells)
+                for cell_index in range(spec.scheduling.num_cells + spec.scheduling.num_deferred_cells)
             ],
         )
 
@@ -338,6 +391,10 @@ def _actor_manager_cls(spec: BaseWorkerSpec, *, comm_backend: WorkerCommBackend)
 
 class BundleInUseError(RuntimeError):
     pass
+
+
+class CellUnboundError(RuntimeError):
+    """A deferred cell was asked to start before ``rebind_cell`` bound it to bundles."""
 
 
 class StartRollbackFailedError(RuntimeError):
@@ -364,9 +421,22 @@ class _CellManager(Generic[SpecT]):
     liveness_scan_task: asyncio.Task | None = None
     # set by RayWorkerManager.rebind_cell; None keeps the spec's own slot layout
     binding: _CellBinding | None = None
+    # declared beyond the spec's num_cells: starts unbound (no bundle) and only a binding makes it startable
+    deferred: bool = False
+
+    @property
+    def alias(self) -> str | None:
+        aliases = self.spec.scheduling.cell_aliases
+        return aliases[self.cell_index] if self.cell_index < len(aliases) else None
+
+    @property
+    def unbound(self) -> bool:
+        return self.deferred and self.binding is None
 
     @property
     def pg_name(self) -> str | None:
+        if self.unbound:
+            return None
         return self.binding.pg_name if self.binding is not None else self.spec.scheduling.pg_name
 
     def slot_of(self, worker_in_cell_index: int) -> int | None:
@@ -383,6 +453,8 @@ class _CellManager(Generic[SpecT]):
 
     def all_slots(self) -> list[int]:
         scheduling = self.spec.scheduling
+        if self.unbound:
+            return []
         return [
             self.slot_of(w) + k
             for w in range(scheduling.num_workers_per_cell)
@@ -457,6 +529,30 @@ class _CellManager(Generic[SpecT]):
 
     async def _for_all_actors(self, fn: Callable[[_BaseActorManager], Any]):
         await asyncio.gather(*[fn(a) for a in self.actors])
+
+    def describe(self) -> dict[str, Any]:
+        bundles: list[int] | None = []
+        gpu_ids: list[int] | None = []
+        if self.pg_name is not None and self.spec.scheduling.num_gpu_slots_per_worker > 0:
+            pg = self.manager.pgs[self.pg_name]
+            slots = self.all_slots()
+            if all(0 <= slot < len(pg.pg_reordered_bundle_indices) for slot in slots):
+                bundles = [pg.pg_reordered_bundle_indices[slot] for slot in slots]
+                gpu_ids = [pg.pg_reordered_gpu_ids[slot] for slot in slots]
+            else:  # a stopped cell left outside a re-pointed view (its pool is being replaced)
+                bundles = gpu_ids = None
+        return dict(
+            cell_id=self.cell_id,
+            alias=self.alias,
+            pool_id=self.spec.name,
+            deferred=self.deferred,
+            state="unbound" if self.unbound else ("running" if self.alive else "stopped"),
+            generation=self.generation,
+            pg_name=self.pg_name,
+            pg_slot_offset=self.binding.pg_slot_offset if self.binding is not None else None,
+            bundles=bundles,
+            gpu_ids=gpu_ids,
+        )
 
     def get_info(self) -> CellInfo:
         return CellInfo(

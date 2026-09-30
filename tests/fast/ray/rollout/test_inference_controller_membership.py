@@ -190,3 +190,55 @@ class TestWaitCellsTracked:
 
         with pytest.raises(TimeoutError, match="engine-7"):
             await controller.wait_cells_tracked(["engine-7"], timeout_seconds=0, poll_interval_seconds=0)
+
+
+class _UnboundError(RuntimeError):
+    pass
+
+
+class TestDeferredCells:
+    async def test_starting_an_unbound_cell_fails_and_leaves_the_epoch(self):
+        controller, provider, _ = _controller()
+        provider.fail_next = _UnboundError("deferred cells ['engine-2'] are bound to no bundle")
+        with pytest.raises(_UnboundError):
+            await controller.start_cells(["engine-2"], expected_epoch=0)
+        status = await controller.get_membership_status()
+        assert status["epoch"] == 0 and status["incomplete"] is None
+        # once bound, the same start goes through at the same epoch
+        assert await controller.start_cells(["engine-2"], expected_epoch=0) == 1
+
+    async def test_a_restored_incomplete_start_of_an_unbound_cell_stays_incomplete(self):
+        controller, provider, _ = _controller()
+        await controller.restore_membership_state(
+            epoch=4, incomplete=["start", ["engine-2"]], expected_current_epoch=0
+        )
+        provider.fail_next = _UnboundError("unbound")
+        with pytest.raises(_UnboundError):
+            await controller.start_cells(["engine-2"], expected_epoch=4)
+        assert (await controller.get_membership_status())["incomplete"] == ["start", ["engine-2"]]
+        assert await controller.start_cells(["engine-2"], expected_epoch=4) == 5
+
+    async def test_describe_adds_the_controller_view_to_the_provider_cells(self):
+        class _DescribingProvider(_MembershipProvider):
+            async def describe_declared_cells(self):
+                return {
+                    "engine-0": dict(state="running", deferred=False),
+                    "engine-2": dict(state="unbound", deferred=True),
+                }
+
+        srv = _RecordingServer(
+            server_cells={"engine-0": SimpleNamespace(is_serving=True, meta=SimpleNamespace(cell_id="engine-0"))}
+        )
+        controller, _, _ = _controller(provider=_DescribingProvider(), servers={"default": srv})
+        described = await controller.describe_cells()
+        assert described["engine-0"] == dict(
+            state="running", deferred=False, tracked=True, serving=True, awaiting_admission=False
+        )
+        assert described["engine-2"] == dict(
+            state="unbound", deferred=True, tracked=False, serving=False, awaiting_admission=False
+        )
+
+    async def test_describe_needs_a_describing_provider(self):
+        controller, _, _ = _controller()
+        with pytest.raises(NotImplementedError, match="cannot describe"):
+            await controller.describe_cells()

@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import socket
+from collections.abc import Sequence
 from typing import NamedTuple
 
 import ray
@@ -148,6 +149,24 @@ def _compute_trainer_num_gpus(args) -> int:
 
 STANDBY_PG_NAME = "standby"
 _PLACEMENT_MAP_ROLES = ("trainer", "rollout", "standby")
+# Not a role: an optional explicit list of the rollout engine cells, see ``RolloutCellDecl``.
+ROLLOUT_CELLS_KEY = "rollout_cells"
+_ROLE_VIEW_NAMES = {"rollout": "rollout", STANDBY_PG_NAME: STANDBY_PG_NAME}
+
+
+class RolloutCellDecl(NamedTuple):
+    """One rollout engine cell declared by the caller (yeto) in the placement map.
+
+    ``name`` is the caller's id for the cell; the fork keeps its own cell id (``compute_cell_id(pool, index)`` with
+    ``index`` the position in ``rollout_cells``) and reports both (``RayWorkerManager.describe_cells``).
+    ``bundles`` are logical bundle positions, a consecutive run of the ``rollout`` or ``standby`` role, or empty for
+    an unbound cell. ``start`` False declares the cell stopped: it is not started at startup, takes no GPU, no
+    traffic and no weights until the caller starts it (after ``rebind_cell`` if it is unbound).
+    """
+
+    name: str
+    bundles: tuple[int, ...]
+    start: bool = True
 
 
 class PlacementMap(NamedTuple):
@@ -156,6 +175,8 @@ class PlacementMap(NamedTuple):
     trainer: tuple[int, ...]
     rollout: tuple[int, ...]
     standby: tuple[int, ...] = ()
+    # explicit rollout engine cells (empty: the engine pool lays its cells out over the rollout role as before)
+    rollout_cells: tuple[RolloutCellDecl, ...] = ()
 
     @property
     def num_bundles(self) -> int:
@@ -167,7 +188,7 @@ def parse_placement_map(raw: "str | dict | PlacementMap | None") -> PlacementMap
         return raw
     data = json.loads(raw) if isinstance(raw, str) else raw
     assert isinstance(data, dict), f"a placement map is a JSON object keyed by role, got {data!r}"
-    unknown = set(data) - set(_PLACEMENT_MAP_ROLES)
+    unknown = set(data) - set(_PLACEMENT_MAP_ROLES) - {ROLLOUT_CELLS_KEY}
     assert not unknown, f"placement map names unknown roles {sorted(unknown)}; known: {list(_PLACEMENT_MAP_ROLES)}"
     fields = {}
     for role in _PLACEMENT_MAP_ROLES:
@@ -176,7 +197,61 @@ def parse_placement_map(raw: "str | dict | PlacementMap | None") -> PlacementMap
             isinstance(i, int) and not isinstance(i, bool) for i in indices
         ), f"placement map role {role!r} must be a list of ints, got {indices!r}"
         fields[role] = tuple(indices)
-    return PlacementMap(**fields)
+    return PlacementMap(**fields, rollout_cells=_parse_rollout_cells(data.get(ROLLOUT_CELLS_KEY, [])))
+
+
+def _parse_rollout_cells(raw) -> tuple[RolloutCellDecl, ...]:
+    assert isinstance(raw, list), f"placement map {ROLLOUT_CELLS_KEY!r} must be a list, got {raw!r}"
+    cells = []
+    for entry in raw:
+        assert isinstance(entry, dict) and not (
+            unknown := set(entry) - {"name", "bundles", "start"}
+        ), f"a rollout cell is {{'name', 'bundles', 'start'}}, got {entry!r}"
+        name, bundles, start = entry.get("name"), entry.get("bundles", []), entry.get("start", True)
+        assert isinstance(name, str) and name, f"rollout cell name must be a non-empty string, got {entry!r}"
+        assert isinstance(bundles, list) and all(
+            isinstance(i, int) and not isinstance(i, bool) for i in bundles
+        ), f"rollout cell {name!r} bundles must be a list of ints, got {bundles!r}"
+        assert isinstance(start, bool), f"rollout cell {name!r} start must be a bool, got {start!r}"
+        cells.append(RolloutCellDecl(name=name, bundles=tuple(bundles), start=start))
+    return tuple(cells)
+
+
+def rollout_cell_binding(pm: PlacementMap, cell: RolloutCellDecl) -> tuple[str, int] | None:
+    """``(view name, slot offset)`` of a declared cell's bundles, or None for an unbound cell."""
+    if not cell.bundles:
+        return None
+    for role, view in _ROLE_VIEW_NAMES.items():
+        positions = getattr(pm, role)
+        if cell.bundles[0] in positions:
+            offset = positions.index(cell.bundles[0])
+            assert tuple(positions[offset : offset + len(cell.bundles)]) == cell.bundles, (
+                f"rollout cell {cell.name!r} bundles {list(cell.bundles)} are not a consecutive run of the {role!r} "
+                f"role {list(positions)}"
+            )
+            return view, offset
+    raise AssertionError(
+        f"rollout cell {cell.name!r} bundles {list(cell.bundles)} are not in the rollout or standby role"
+    )
+
+
+def _validate_rollout_cells(pm: PlacementMap) -> None:
+    cells = pm.rollout_cells
+    names = [c.name for c in cells]
+    dups = sorted({n for n in names if names.count(n) > 1})
+    assert not dups, f"placement map rollout cells repeat names {dups}"
+    starts = [c.start for c in cells]
+    assert starts == sorted(starts, reverse=True), (
+        f"placement map rollout cells must list the cells started at startup before the stopped ones, got "
+        f"{[(c.name, c.start) for c in cells]}"
+    )
+    owner: dict[int, str] = {}
+    for cell in cells:
+        assert cell.bundles or not cell.start, f"rollout cell {cell.name!r} starts at startup but names no bundles"
+        rollout_cell_binding(pm, cell)
+        for b in cell.bundles:
+            assert b not in owner, f"rollout cells {owner[b]!r} and {cell.name!r} share bundle {b}"
+            owner[b] = cell.name
 
 
 def validate_placement_map(pm: PlacementMap, *, trainer_num_gpus: int, rollout_num_gpus: int) -> None:
@@ -198,14 +273,23 @@ def validate_placement_map(pm: PlacementMap, *, trainer_num_gpus: int, rollout_n
     assert (
         len(pm.rollout) == rollout_num_gpus
     ), f"placement map gives rollout {len(pm.rollout)} bundles but the args ask for {rollout_num_gpus}"
+    _validate_rollout_cells(pm)
 
 
-def _slice_pg_info(info: PlacementGroupInfo, indices: tuple[int, ...]) -> PlacementGroupInfo:
+def slice_pg_info(info: PlacementGroupInfo, indices: Sequence[int]) -> PlacementGroupInfo:
+    """The view of ``info`` made of its entries at ``indices`` (positions in ``info``, in the order given).
+
+    Public so callers can build a view for ``RayWorkerManager.set_pg_view`` / ``rebind_cell`` from the startup views.
+    """
     return PlacementGroupInfo(
         info.pg,
         [info.pg_reordered_bundle_indices[i] for i in indices],
         [info.pg_reordered_gpu_ids[i] for i in indices],
     )
+
+
+# kept for callers of the former private name
+_slice_pg_info = slice_pg_info
 
 
 def create_placement_groups(
@@ -247,9 +331,9 @@ def _create_placement_groups_from_map(
     logger.info(f"Creating placement group with {pm.num_bundles} GPUs from explicit map {pm}...")
     full = PlacementGroupInfo(*_create_placement_group(pm.num_bundles))
     ans = {
-        "actor": _slice_pg_info(full, pm.trainer),
-        "rollout": _slice_pg_info(full, pm.rollout),
-        STANDBY_PG_NAME: _slice_pg_info(full, pm.standby),
+        "actor": slice_pg_info(full, pm.trainer),
+        "rollout": slice_pg_info(full, pm.rollout),
+        STANDBY_PG_NAME: slice_pg_info(full, pm.standby),
     }
     if args.use_critic:
         ans["critic"] = ans["actor"]

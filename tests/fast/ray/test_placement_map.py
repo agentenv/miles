@@ -11,8 +11,10 @@ from miles.ray.placement_group import (
     STANDBY_PG_NAME,
     PlacementGroupInfo,
     PlacementMap,
+    RolloutCellDecl,
     create_placement_groups,
     parse_placement_map,
+    rollout_cell_binding,
     validate_placement_map,
 )
 
@@ -125,3 +127,70 @@ class TestExplicitPlacementMap:
         with pytest.raises(AssertionError, match="list of ints"):
             parse_placement_map({"trainer": ["0"]})
         assert parse_placement_map(None) is None
+
+
+class TestRolloutCells:
+    _MAP = {
+        "trainer": [0, 1],
+        "rollout": [2, 3, 4],
+        "standby": [5],
+        "rollout_cells": [
+            {"name": "c0", "bundles": [2]},
+            {"name": "c1", "bundles": [3]},
+            {"name": "c2", "bundles": [4]},
+            {"name": "s0", "bundles": [5], "start": False},
+            {"name": "t0", "start": False},
+        ],
+    }
+
+    def test_cells_are_parsed_and_own_no_extra_bundle(self, requested):
+        pm = parse_placement_map(self._MAP)
+        assert pm.num_bundles == 6
+        assert pm.rollout_cells[3] == RolloutCellDecl(name="s0", bundles=(5,), start=False)
+        assert pm.rollout_cells[4] == RolloutCellDecl(name="t0", bundles=(), start=False)
+        assert [rollout_cell_binding(pm, c) for c in pm.rollout_cells] == [
+            ("rollout", 0),
+            ("rollout", 1),
+            ("rollout", 2),
+            ("standby", 0),
+            None,
+        ]
+        create_placement_groups(_args(), placement_map=pm)
+        assert requested == [6]
+
+    def test_no_cells_is_the_default(self):
+        assert parse_placement_map({"trainer": [0], "rollout": [1]}).rollout_cells == ()
+
+    @pytest.mark.parametrize(
+        "cells, match",
+        [
+            ([{"name": "a", "bundles": [2]}, {"name": "a", "bundles": [3]}], "repeat names"),
+            ([{"name": "a", "bundles": [2]}, {"name": "b", "bundles": [2]}], "share bundle 2"),
+            ([{"name": "a", "bundles": [0]}], "not in the rollout or standby role"),
+            ([{"name": "a", "bundles": [2, 4]}], "not a consecutive run"),
+            ([{"name": "a", "start": False}, {"name": "b", "bundles": [2]}], "before the stopped ones"),
+            ([{"name": "a"}], "names no bundles"),
+        ],
+    )
+    def test_bad_cells_are_rejected_before_any_pg_is_created(self, requested, cells, match):
+        raw = {"trainer": [0, 1], "rollout": [2, 3, 4], "standby": [5], "rollout_cells": cells}
+        with pytest.raises(AssertionError, match=match):
+            create_placement_groups(_args(), placement_map=raw)
+        assert requested == []
+
+    @pytest.mark.parametrize(
+        "cells",
+        [{"name": "a"}, [{"name": ""}], [{"name": "a", "bundles": ["2"]}], [{"name": "a", "start": 0}], [{"id": "a"}]],
+    )
+    def test_malformed_cells_are_rejected_when_parsed(self, cells):
+        with pytest.raises(AssertionError):
+            parse_placement_map({"trainer": [0], "rollout": [1], "rollout_cells": cells})
+
+
+class TestSlicePgInfo:
+    def test_the_public_slicer_keeps_the_given_order(self):
+        from miles.ray.placement_group import _slice_pg_info, slice_pg_info
+
+        info = PlacementGroupInfo(pg="pg", pg_reordered_bundle_indices=[7, 8, 9], pg_reordered_gpu_ids=[0, 1, 2])
+        assert slice_pg_info(info, [2, 0]) == PlacementGroupInfo("pg", [9, 7], [2, 0])
+        assert _slice_pg_info is slice_pg_info

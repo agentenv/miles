@@ -151,6 +151,25 @@ class InferenceController:
         )
 
     @with_lock
+    async def describe_cells(self) -> dict[str, dict[str, Any]]:
+        """Every declared engine cell with its worker-manager state and binding, plus how this controller sees it.
+
+        Adds ``tracked`` (a server took it in), ``serving`` and ``awaiting_admission`` to the provider's
+        ``describe_declared_cells`` (``state`` unbound / stopped / running, ``pg_name``, ``bundles``, ``gpu_ids``).
+        Read-only; a caller lists the declared cells here instead of carrying them in its own launch arguments.
+        """
+        provider = self._engine_provider
+        if not hasattr(provider, "describe_declared_cells"):
+            raise NotImplementedError(f"{type(provider).__name__} cannot describe its declared cells")
+        cells = await provider.describe_declared_cells()
+        for cell_id, desc in cells.items():
+            tracked = self._find_cell_or_none(cell_id)
+            desc["tracked"] = tracked is not None
+            desc["serving"] = tracked is not None and tracked.is_serving
+            desc["awaiting_admission"] = tracked is not None and self._is_awaiting_admission(tracked)
+        return cells
+
+    @with_lock
     async def restore_membership_state(
         self,
         *,
