@@ -15,6 +15,7 @@ from miles.utils.lora.hf_lora_targets import (
 from miles.utils.lora.utils import is_lora_enabled, matches_lora_target, targets_expert_leaves
 from miles_plugins.models.inkling.lora import resolve_inkling_adapter_targets
 from miles_plugins.models.kimi_k3.lora import resolve_kimi_k3_adapter_targets
+from miles_plugins.models.qwen3_8_next.lora import resolve_qwen3_8_next_adapter_targets
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,16 @@ def add_lora_arguments(parser):
         type=float,
         default=0.0,
         help="LoRA dropout rate (default: 0.0)",
+    )
+    parser.add_argument(
+        "--lora-expert-rank",
+        type=int,
+        default=0,
+        help=(
+            "LoRA rank of the routed-expert projections for models with native per-expert "
+            "expert LoRA (Qwen3.8-Next). 0 follows --lora-rank. Must be <= --lora-rank: the "
+            "adapter keeps a single r for serving and expert tensors are zero-padded to it."
+        ),
     )
     parser.add_argument(
         "--lora-type",
@@ -209,6 +220,12 @@ def validate_lora_args(args):
         return
     assert args.train_backend == "megatron", "LoRA injection is not implemented for FSDP; use --train-backend megatron"
     assert args.lora_rank > 0, "LoRA requires a positive --lora-rank, including when loading an adapter"
+    expert_rank = getattr(args, "lora_expert_rank", 0) or 0
+    assert 0 <= expert_rank <= args.lora_rank, (
+        f"--lora-expert-rank must be in [0, --lora-rank], got {expert_rank} with --lora-rank {args.lora_rank}: "
+        "SGLang keeps one r per adapter, so expert LoRA is zero-padded up to --lora-rank at export"
+    )
+    args.lora_expert_rank = expert_rank or args.lora_rank
     hf_config = load_hf_config(args.hf_checkpoint)
     args.hf_lora_targets, args.lora_adapter_targets = _resolve_lora_targets(args, hf_config)
 
@@ -279,6 +296,12 @@ def _resolve_lora_targets(args, hf_config):
             adapter_targets = resolve_inkling_adapter_targets(hf_config.to_dict(), hf_targets)
         elif hf_config.model_type == "kimi_k3":
             adapter_targets = resolve_kimi_k3_adapter_targets(
+                hf_targets,
+                canonical=args.lora_type == "canonical_lora",
+                experts_shared_outer_loras=args.experts_shared_outer_loras,
+            )
+        elif hf_config.model_type in ("qwen4_exp", "qwen4_exp_text"):
+            adapter_targets = resolve_qwen3_8_next_adapter_targets(
                 hf_targets,
                 canonical=args.lora_type == "canonical_lora",
                 experts_shared_outer_loras=args.experts_shared_outer_loras,

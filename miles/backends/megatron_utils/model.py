@@ -34,7 +34,7 @@ from miles.backends.training_utils.weight_update.snapshot_publisher import Snaps
 from miles.utils.audit_utils.witness.allocator import WitnessInfo
 from miles.utils.audit_utils.witness.module import witness_dump_and_clear_stale
 from miles.utils.dumper_utils import DumperMegatronUtil, DumperPhase
-from miles.utils.lora.utils import is_multi_lora_enabled
+from miles.utils.lora.utils import is_multi_lora_enabled, is_qwen3_8_next_model
 from miles.utils.memory_utils import clear_memory
 from miles.utils.test_utils.ft_test_actions import FTTestActionActorExecutor
 from miles.utils.tracking_utils.structured_log import log_structured
@@ -171,9 +171,18 @@ def setup_model_and_optimizer(
                 provider_func = wrap_model_provider_with_kimi_k3_lora(provider_func, args)
                 if args.offload_train:
                     patch_param_grad_buffer_for_colocate_mode_lora()
+            elif is_qwen3_8_next_model(args):
+                assert args.lora_type == "lora", "Native Qwen3.8-Next LoRA does not implement --lora-type canonical_lora"
+                from miles_plugins.models.qwen3_8_next.lora import wrap_model_provider_with_qwen3_8_next_lora
+
+                from .lora.utils import patch_param_grad_buffer_for_colocate_mode_lora
+
+                provider_func = wrap_model_provider_with_qwen3_8_next_lora(provider_func, args)
+                if args.offload_train:
+                    patch_param_grad_buffer_for_colocate_mode_lora()
             else:
                 raise AssertionError(
-                    "Native LoRA injection is only implemented for Inkling and Kimi K3; "
+                    "Native LoRA injection is only implemented for Inkling, Kimi K3 and Qwen3.8-Next; "
                     "use --megatron-to-hf-mode bridge"
                 )
         model = get_model(provider_func, ModelType.encoder_or_decoder)

@@ -199,6 +199,12 @@ _HF_LORA_MODELS = {
     "qwen3_5_moe": _HfLoraModelSpec(
         _qwen3_5_moe_targets, layer_prefix="model.language_model.layers.*", unwrap_text_config=True
     ),
+    # Qwen3.8-Next: GDN + QSA attention, 512 routed + 1 shared expert; the QSA indexer,
+    # hyper-connections and PLE stay frozen (no SGLang LoRA support).
+    "qwen4_exp_text": _HfLoraModelSpec(_qwen3_5_moe_targets),
+    "qwen4_exp": _HfLoraModelSpec(
+        _qwen3_5_moe_targets, layer_prefix="model.language_model.layers.*", unwrap_text_config=True
+    ),
     "gpt_oss": _HfLoraModelSpec(_gpt_oss_targets),
     "deepseek_v2": _HfLoraModelSpec(_deepseek_targets),
     "deepseek_v3": _HfLoraModelSpec(_deepseek_targets),

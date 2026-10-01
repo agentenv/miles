@@ -22,6 +22,14 @@ def is_lora_enabled(args: Namespace) -> bool:
     return getattr(args, "lora_rank", 0) > 0 or getattr(args, "lora_adapter_path", None) is not None
 
 
+def is_qwen3_8_next_model(args: Namespace) -> bool:
+    """Qwen3.8-Next (HF ``qwen4_exp``) trains through its own provider plugin; the recipe
+    names the model ``qwen4_exp`` and points ``--custom-model-provider-path`` at the plugin."""
+    provider = getattr(args, "custom_model_provider_path", None) or ""
+    model_name = (getattr(args, "model_name", None) or "").lower()
+    return "qwen3_8_next" in provider or model_name.startswith(("qwen4_exp", "qwen3.8", "qwen3_8"))
+
+
 def lora_rollout_enabled(args: Namespace) -> bool:
     """LoRA enabled AND the rollout side participates; false under --lora-train-only.
 

@@ -71,6 +71,14 @@ class HfWeightIteratorDirect(MegatronHfWeightIteratorBase):
             from miles_plugins.models.inkling.lora import export_inkling_lora_hf_named
 
             return export_inkling_lora_hf_named(self.model)
+        from miles.utils.lora.utils import is_qwen3_8_next_model
+
+        if is_qwen3_8_next_model(self.args):
+            from miles_plugins.models.qwen3_8_next.lora import export_qwen3_8_next_lora_hf_chunks
+
+            return [
+                named_tensor for chunk in export_qwen3_8_next_lora_hf_chunks(self.model) for named_tensor in chunk
+            ]
         raise NotImplementedError(f"Raw LoRA export is not implemented for model {self.model_name!r}")
 
     def _convert_to_hf_param_units(self, named_params: Sequence[tuple[str, torch.Tensor]]):
