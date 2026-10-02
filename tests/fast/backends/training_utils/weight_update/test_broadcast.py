@@ -10,6 +10,7 @@ import pytest
 import torch
 
 from miles.backends.training_utils.weight_update.protocols.broadcast import (
+    RolloutEngineJoinError,
     UpdateWeightFromDistributed,
     connect_rollout_engines_from_distributed,
     disconnect_rollout_engines_from_distributed,
@@ -17,6 +18,7 @@ from miles.backends.training_utils.weight_update.protocols.broadcast import (
     update_weights_from_distributed,
 )
 from miles.utils import async_utils
+from miles.utils.workers.worker_handle import ExternalFailureError
 
 _BROADCAST_MODULE = "miles.backends.training_utils.weight_update.protocols.broadcast"
 
@@ -202,7 +204,7 @@ class TestConnectDoesNotWaitForADeadEngine:
         ):
             ray_mock._private.services.get_node_ip_address.return_value = "10.0.0.1"
             started = time.monotonic()
-            with pytest.raises(RuntimeError, match=r"engine 1 failed to join .*ConnectionError\('engine process died'\)"):
+            with pytest.raises(RuntimeError, match=r"engine 1 failed to join .*ConnectionError\('engine process died'\)") as info:
                 connect_rollout_engines_from_distributed(
                     Namespace(rollout_num_gpus_per_engine=1),
                     "miles-pp_0",
@@ -212,6 +214,40 @@ class TestConnectDoesNotWaitForADeadEngine:
         released.set()
         assert blocked.is_set(), "rank 0 had started its rendezvous"
         assert elapsed < 5.0, f"the connect waited {elapsed:.1f}s for the rendezvous instead of failing fast"
+        # A27 (1r5 d2): the trainer is healthy, the engine failed. The cell must not treat it as a worker failure.
+        assert isinstance(info.value, RolloutEngineJoinError)
+        assert isinstance(info.value, ExternalFailureError)
+
+    def test_a_failed_connect_leaves_no_group_to_destroy_twice(self) -> None:
+        """The old group is torn down before connecting; the next (re)connect must not destroy it again."""
+        initial_parallel_state = SimpleNamespace(
+            pp=SimpleNamespace(size=1, rank=0), tp=SimpleNamespace(rank=0), intra_dp_cp=SimpleNamespace(rank=0)
+        )
+        with patch(f"{_BROADCAST_MODULE}.get_parallel_state", return_value=initial_parallel_state):
+            protocol = UpdateWeightFromDistributed(Namespace())
+        old_group = MagicMock(name="old_group")
+        protocol._model_update_groups = old_group
+        connect_kwargs = dict(
+            engine_gpu_counts=[1],
+            engine_gpu_offsets=[0],
+            parallel_state=SimpleNamespace(pp=SimpleNamespace(rank=0)),
+            placement=SimpleNamespace(gather_pp=False),
+            selector="all",
+        )
+        with (
+            patch(f"{_BROADCAST_MODULE}.get_data_replica_rank_and_size", return_value=(0, 1)),
+            patch(f"{_BROADCAST_MODULE}.disconnect_rollout_engines_from_distributed") as disconnect,
+            patch(
+                f"{_BROADCAST_MODULE}.connect_rollout_engines_from_distributed",
+                side_effect=[RolloutEngineJoinError("engine 0 failed to join"), MagicMock(name="new_group")],
+            ),
+        ):
+            with pytest.raises(RolloutEngineJoinError):
+                protocol.connect([MagicMock(name="dead")], **connect_kwargs)
+            assert protocol._model_update_groups is None
+            protocol.connect([MagicMock(name="old_member")], **connect_kwargs)
+        destroyed = [call.args[2] for call in disconnect.call_args_list]
+        assert destroyed == [old_group, None], "the destroyed old group was not handed to destroy a second time"
 
     def test_a_rendezvous_timeout_surfaces_as_the_connect_error(self) -> None:
         with (

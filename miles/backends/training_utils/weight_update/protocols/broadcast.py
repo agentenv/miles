@@ -18,6 +18,7 @@ from miles.backends.training_utils.weight_update.utils import get_data_replica_r
 from miles.utils import async_utils
 from miles.utils.distributed_lock import create_world_ticket_lock
 from miles.utils.distributed_utils import init_process_group
+from miles.utils.workers.worker_handle import ExternalFailureError
 
 
 class UpdateWeightFromDistributed(WeightTransferProtocol):
@@ -66,6 +67,8 @@ class UpdateWeightFromDistributed(WeightTransferProtocol):
             disconnect_rollout_engines_from_distributed(
                 self.args, self.group_name, self._model_update_groups, self.rollout_engines
             )
+            # The old group is gone even if the connect below fails: a later reconnect must not destroy it twice.
+            self._model_update_groups = None
             self._model_update_groups = connect_rollout_engines_from_distributed(
                 self.args, self.group_name, rollout_engines, engine_gpu_counts=engine_gpu_counts
             )
@@ -82,6 +85,10 @@ class UpdateWeightFromDistributed(WeightTransferProtocol):
             )
             async_utils.wait_futures(futures)
             bucket.clear()
+
+
+class RolloutEngineJoinError(ExternalFailureError, RuntimeError):
+    """A rollout engine failed to join the weight update group; the trainer ranks are healthy."""
 
 
 def connect_rollout_engines_from_distributed(
@@ -159,7 +166,7 @@ def connect_rollout_engines_from_distributed(
             pending.discard(future)
             if (error := future.exception()) is not None:
                 index = futures.index(future)
-                raise RuntimeError(
+                raise RolloutEngineJoinError(
                     f"engine {index} failed to join weight update group {group_name} while rank 0 waited for "
                     f"the rendezvous; connect aborted instead of waiting for the group timeout ({error!r})"
                 ) from error

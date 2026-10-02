@@ -30,6 +30,7 @@ from miles.backends.training_utils.weight_update.utils import record_lora_checks
 from miles.utils.distributed_utils import get_gloo_group
 from miles.utils.lora.utils import LORA_ADAPTER_NAME
 from miles.utils.timer import timer
+from miles.utils.workers.worker_handle import ExternalFailureError
 
 logger = logging.getLogger(__name__)
 
@@ -76,14 +77,38 @@ class WeightUpdater:
         engine_gpu_counts: Sequence[int] | None = None,
         engine_gpu_offsets: Sequence[int] | None = None,
     ) -> None:
-        self.protocol.connect(
-            rollout_engines,
-            engine_gpu_counts,
-            engine_gpu_offsets,
-            self.parallel_state,
-            self._hf_weight_iterator.placement,
-            self._hf_weight_iterator.weight_update_selector,
-        )
+        """Connect every rank to the engines; an engine-side failure is raised on every rank, the trainer stays up.
+
+        Only the sender rank talks to the engines, so only it can see an engine fail to join (A27: an engine killed
+        during a member publish). The outcome is agreed over the gloo group so that the other ranks raise the same
+        ``ExternalFailureError`` instead of waiting in the next collective for a rank that already gave up; the
+        trainer cell then stays alive (see ``TrainerCell._execute_raw``) and the next publication reconnects.
+        """
+        try:
+            self.protocol.connect(
+                rollout_engines,
+                engine_gpu_counts,
+                engine_gpu_offsets,
+                self.parallel_state,
+                self._hf_weight_iterator.placement,
+                self._hf_weight_iterator.weight_update_selector,
+            )
+        except ExternalFailureError as e:
+            failure: str | None = f"{type(e).__name__}: {e}"
+            cause: BaseException | None = e
+        else:
+            failure, cause = None, None
+        gloo_group = get_gloo_group()
+        failures: list[str | None] = [None] * dist.get_world_size(group=gloo_group)
+        dist.all_gather_object(failures, failure, group=gloo_group)
+        if any(f is not None for f in failures):
+            # The previous group was torn down before connecting: whatever the connection status said, the next
+            # publication has to connect again.
+            self.conn_status.mark_trainer_stale()
+            rank, message = next((r, f) for r, f in enumerate(failures) if f is not None)
+            if cause is not None:
+                raise cause
+            raise ExternalFailureError(f"rank {rank} could not connect the rollout engines: {message}")
         assert self.protocol.is_sender is not None, "connect() must set is_sender"
         self._registered_adapters.clear()
 
