@@ -772,6 +772,43 @@ class TestPerCellErrorIsolation:
             assert len(train_calls) == 2
 
 
+class TestUpdateWeightsExternalFailure:
+    """A27 (GPU 1r5 d2): an engine that dies during a member publish fails the trainer's connect. That is not a
+    trainer failure: the cell must stay alive, the group must not retry against the same engines, and the next
+    train step and publication must run on the same cell."""
+
+    async def test_an_engine_side_failure_keeps_the_cell_and_is_not_retried(self):
+        group = await _make_alive_controller(num_cells=1)
+        handles = get_raw_actor_handles(_cell(group, 0))
+        for handle in handles:
+            ray.get(handle.set_external_failure_methods.remote(["update_weights"]))
+
+        with pytest.raises(NonRetryableError, match="rollout engine side.*Injected external failure"):
+            await group.update_weights(info=None, rollout_id=1)
+
+        assert _cell(group, 0).is_alive
+        assert not _was_killed(group, 0)
+        for handle in handles:
+            calls = [c for c in ray.get(handle.get_calls.remote()) if c[0] == "update_weights"]
+            assert len(calls) == 1, "the failing publication was not retried against the same engines"
+
+    async def test_training_and_the_next_publication_continue_on_the_same_cell(self):
+        group = await _make_alive_controller(num_cells=1)
+        handles = get_raw_actor_handles(_cell(group, 0))
+        for handle in handles:
+            ray.get(handle.set_external_failure_methods.remote(["update_weights"]))
+            ray.get(handle.set_update_weights_return_value.remote(7))
+        with pytest.raises(NonRetryableError):
+            await group.update_weights(info=None, rollout_id=1)
+
+        results = await group.train(rollout_id=2, rollout_data_pack=_DUMMY_DATA_PACK)
+        assert len(results) == len(handles)
+        for handle in handles:  # the old members are back: the publication succeeds on the same cell
+            ray.get(handle.set_external_failure_methods.remote([]))
+        assert await group.update_weights(info=None, rollout_id=2) == 7
+        assert _cell(group, 0).is_alive
+
+
 class TestExecuteFirstAliveFallback:
     async def test_first_cell_fails_retry_falls_back_to_next(self):
         """If the first alive cell fails, retry in save_model kills+stops it and picks the next."""

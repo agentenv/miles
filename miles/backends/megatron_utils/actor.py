@@ -38,6 +38,7 @@ from miles.utils.reloadable_process_group import destroy_process_groups, monkey_
 from miles.utils.replay_base import all_replay_managers, routing_replay_manager
 from miles.utils.test_utils.ft_test_actions import FTTestActionActorExecutor
 from miles.utils.timer import Timer, inverse_timer, timer
+from miles.utils.workers.worker_handle import ExternalFailureError
 from miles.utils.tracking_utils.structured_log import with_logs
 from miles.utils.tracking_utils.tracking import init_tracking
 from miles.utils.types import RolloutBatch
@@ -908,11 +909,18 @@ class MegatronTrainRayActor(TrainRayActor):
             # Connection setup also allocates CUDA tensors (e.g. NCCL object
             # collectives). Do not reuse unmapped, offloaded allocator blocks.
             with torch_memory_saver.disable() if self.args.offload_train else nullcontext():
-                self.weight_updater.connect_rollout_engines(
-                    rollout_engines,
-                    engine_gpu_counts=engine_gpu_counts,
-                    engine_gpu_offsets=engine_gpu_offsets,
-                )
+                try:
+                    self.weight_updater.connect_rollout_engines(
+                        rollout_engines,
+                        engine_gpu_counts=engine_gpu_counts,
+                        engine_gpu_offsets=engine_gpu_offsets,
+                    )
+                except ExternalFailureError:
+                    # Raised on every rank (the updater agrees on the outcome over gloo): the engines failed, this
+                    # actor is healthy and stays up for the next publication. Leave it as the normal path would.
+                    if process_groups_are_temporary:
+                        destroy_process_groups()
+                    raise
                 self.weight_updater.conn_status.mark_reconnected(snapshot_cell_id_to_hashes)
                 dist.barrier(group=get_gloo_group())
 

@@ -13,7 +13,7 @@ from tests.fast.ray.train.conftest import (
 
 from miles.ray.train import cell as cell_module
 from miles.utils.workers.rpc.client.misc import ServerRestartedError
-from miles.utils.workers.worker_handle import BaseWorkerHandle
+from miles.utils.workers.worker_handle import BaseWorkerHandle, ExternalFailureError
 from miles.utils.workers.worker_info import WorkerInfo
 from miles.utils.workers.worker_provider.ray import RayWorkerProvider
 
@@ -294,6 +294,31 @@ class TestPartialWorkerFailure:
         assert not cell.is_errored
         for handle in handles:
             assert ray.get(handle.get_calls.remote())
+
+
+class TestExternalFailure:
+    """A27 (GPU 1r5 d2): the trainer's connect to a SIGKILLed engine raised; the cell killed all four healthy
+    trainer ranks, the next train step found no cell and the whole island (old engines included) went down."""
+
+    async def test_an_external_failure_leaves_the_cell_alive_with_every_rank_running(self):
+        cell = make_cell(actor_count=3)
+        cell._mark_as_alive(indep_dp_info=make_indep_dp_info())
+        handles = get_raw_actor_handles(cell)
+        for handle in handles:
+            ray.get(handle.set_external_failure_methods.remote(["update_weights"]))
+
+        with pytest.raises(ExternalFailureError, match="Injected external failure"):
+            await cell.execute("update_weights", info=None)
+
+        assert cell.is_alive and not cell.is_errored
+        for handle in handles:
+            assert ray.get(handle.get_calls.remote())  # reachable: nobody was killed
+
+        for handle in handles:
+            ray.get(handle.set_external_failure_methods.remote([]))
+        results = await cell.execute("train", rollout_id=1)  # the cell still serves calls
+        assert len(results) == 3
+        assert all(ray.get(handle.get_calls.remote())[-1][0] == "train" for handle in handles)
 
 
 class TestAsyncInitFailure:

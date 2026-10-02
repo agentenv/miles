@@ -34,6 +34,7 @@ from miles.utils.workers.cell_operations.base import BaseCellOperations
 from miles.utils.workers.rpc.common.wire_types import Pickled
 from miles.utils.workers.types import DeploymentIdentity
 from miles.utils.workers.worker_provider.base import BaseWorkerProvider, CellInfo, StopWatchFn
+from miles.utils.workers.worker_handle import ExternalFailureError
 from miles.utils.workers.worker_provider.utils import apply_cell_observation
 
 logger = logging.getLogger(__name__)
@@ -391,11 +392,16 @@ class TrainerController:
         """Broadcast weights to rollout engines and answer the version they now serve."""
         log_structured(logger.info, tag="ft", op="update_weights", phase="start", rollout=rollout_id)
         # TODO: allow using all cells to update weights (instead of first alive cell)
-        # Catch with vanilla retry: cells w/ exceptions are auto marked errored, thus retry will find the next one
-        weight_versions = await retry(
-            lambda _: self._execute_first_alive("update_weights", info=info),
-            max_attempts=_RETRY_MAX_ATTEMPTS,
-        )
+        # Catch with vanilla retry: cells w/ exceptions are auto marked errored, thus retry will find the next one.
+        # An ExternalFailureError (a rollout engine failed, the cell is fine) is not retried: the same engines
+        # would fail again and the caller (yeto) decides what to do with the membership.
+        async def _attempt(_: int) -> list:
+            try:
+                return await self._execute_first_alive("update_weights", info=info)
+            except ExternalFailureError as e:
+                raise NonRetryableError(f"update_weights failed on the rollout engine side: {e}") from e
+
+        weight_versions = await retry(_attempt, max_attempts=_RETRY_MAX_ATTEMPTS)
         return weight_versions[0]
 
     async def get_deployment_identity(self) -> DeploymentIdentity:

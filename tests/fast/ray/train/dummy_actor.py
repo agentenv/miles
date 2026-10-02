@@ -10,6 +10,11 @@ import ray
 
 from miles.backends.megatron_utils.ft.types import TrainStepOutcome, TrainStepOutput
 from miles.utils.ft_utils.heartbeat_utils import HeartbeatStatus, SimpleHeartbeat
+from miles.utils.workers.worker_handle import ExternalFailureError
+
+
+class DummyExternalFailure(ExternalFailureError):
+    """Stands in for a rollout engine failing while this (healthy) worker talked to it."""
 
 
 @ray.remote(num_gpus=0, num_cpus=0)
@@ -18,6 +23,7 @@ class DummyTrainActor:
     def __init__(self):
         self._calls: list[tuple[str, tuple, dict]] = []
         self._fail_methods: set[str] = set()
+        self._external_failure_methods: set[str] = set()
         self._train_return_value: Any = TrainStepOutput(outcome=TrainStepOutcome.NORMAL)
         self._train_return_values_per_attempt: list[Any] = []
         self._update_weights_return_value: Any = None
@@ -28,6 +34,9 @@ class DummyTrainActor:
 
     def set_fail_methods(self, methods: list[str]) -> None:
         self._fail_methods = set(methods)
+
+    def set_external_failure_methods(self, methods: list[str]) -> None:
+        self._external_failure_methods = set(methods)
 
     def set_train_return_value(self, value: Any) -> None:
         self._train_return_value = value
@@ -42,6 +51,8 @@ class DummyTrainActor:
         self._calls.append((method, args, kwargs))
         if method in self._fail_methods:
             raise RuntimeError(f"Injected failure in {method}")
+        if method in self._external_failure_methods:
+            raise DummyExternalFailure(f"Injected external failure in {method}")
 
     def get_calls(self) -> list[tuple[str, tuple, dict]]:
         return list(self._calls)

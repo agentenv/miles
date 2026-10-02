@@ -3,7 +3,7 @@ import sys
 from argparse import Namespace
 from collections.abc import Iterator
 from types import ModuleType, SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 import torch
@@ -89,3 +89,67 @@ class TestSendCheckpoint:
             train_actor.send_ckpt(dst_rank=1)
 
         assert not checkpoint_transfer_attempted
+
+
+class TestUpdateWeightsWhenAnEngineFailsToJoin:
+    """A27 (GPU 1r5 d2): the engines failed, not the trainer. The actor must raise the engine-side error as is
+    (so the cell keeps it alive) and leave its temporary process groups as the normal path would."""
+
+    @staticmethod
+    def _make_actor(actor_module: ModuleType, *, offload_train: bool, asleep: bool):
+        from miles.backends.training_utils.weight_update.protocols.broadcast import RolloutEngineJoinError
+
+        actor = object.__new__(actor_module.MegatronTrainRayActor)
+        actor.args = Namespace(
+            debug_train_only=False, debug_rollout_only=False, offload_train=offload_train, debug_skip_weight_update=False
+        )
+        actor._heartbeat = Mock()
+        actor._asleep = asleep
+        actor.weight_updater = Mock()
+        actor.weight_updater.conn_status.needs_reconnect.return_value = True
+        actor.weight_updater.connect_rollout_engines.side_effect = RolloutEngineJoinError("engine 0 failed to join")
+        return actor
+
+    @staticmethod
+    def _info():
+        from miles.ray.rollout.inference_controller import UpdatableEngines
+
+        return UpdatableEngines(
+            rollout_engines=[Mock()], engine_gpu_counts=[1], engine_gpu_offsets=[0], snapshot_cell_id_to_hashes={"c": "h"}
+        )
+
+    def test_the_engine_failure_propagates_and_the_connection_is_not_marked_reconnected(
+        self, actor_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from miles.utils.workers.worker_handle import ExternalFailureError
+
+        actor = self._make_actor(actor_module, offload_train=False, asleep=False)
+        destroy = Mock()
+        monkeypatch.setattr(actor_module, "destroy_process_groups", destroy)
+        monkeypatch.setattr(actor_module, "reload_process_groups", Mock())
+        monkeypatch.setattr(actor_module, "dist", Mock())
+
+        with pytest.raises(ExternalFailureError, match="engine 0 failed to join"):
+            actor.update_weights(self._info())
+
+        actor.weight_updater.conn_status.mark_reconnected.assert_not_called()
+        actor.weight_updater.update_weights.assert_not_called()
+        destroy.assert_not_called()
+
+    def test_temporary_process_groups_are_destroyed_again_on_the_failure_path(
+        self, actor_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from miles.utils.workers.worker_handle import ExternalFailureError
+
+        actor = self._make_actor(actor_module, offload_train=True, asleep=True)
+        monkeypatch.setattr(actor_module, "torch_memory_saver", MagicMock())  # disable() is a context manager
+        reload, destroy = Mock(), Mock()
+        monkeypatch.setattr(actor_module, "reload_process_groups", reload)
+        monkeypatch.setattr(actor_module, "destroy_process_groups", destroy)
+        monkeypatch.setattr(actor_module, "dist", Mock())
+
+        with pytest.raises(ExternalFailureError):
+            actor.update_weights(self._info())
+
+        reload.assert_called_once()
+        destroy.assert_called_once()
