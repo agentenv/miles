@@ -17,6 +17,7 @@ ROLLOUT_DATA_TENSOR_DTYPES = {
     "tokens": "int32",
     "target_tokens": "int32",
     "loss_masks": "int32",
+    "segment_ids": "int32",
     "rollout_log_probs": "float32",
     "rollout_sampling_mask_ids": "int32",
     "rollout_sampling_mask_offsets": "int64",
@@ -100,6 +101,19 @@ def convert_samples_to_train_data(
             sample.loss_mask = [0] * sample.response_length
         loss_masks.append(sample.loss_mask)
     train_data["loss_masks"] = loss_masks
+
+    # CompactionRL per-token segment ids (cross-segment GAE); only emitted when a sample provides them.
+    if any(s.metadata and "segment_ids" in s.metadata for s in samples):
+        segment_ids = []
+        for sample in samples:
+            seg = (sample.metadata or {}).get("segment_ids")
+            if seg is None:
+                seg = [0] * sample.response_length
+            assert len(seg) == sample.response_length, (
+                f"segment_ids length {len(seg)} != response length {sample.response_length}"
+            )
+            segment_ids.append(list(seg))
+        train_data["segment_ids"] = segment_ids
 
     train_data["rollout_mask_sums"] = _compute_rollout_mask_sums(train_data["rollout_ids"], loss_masks)
 
@@ -378,6 +392,7 @@ def _package_shards(args, data: dict[str, Any], partitions) -> list[dict[str, An
             "rewards",
             "truncated",
             "loss_masks",
+            "segment_ids",
             "round_number",
             "sample_indices",
             "rollout_ids",

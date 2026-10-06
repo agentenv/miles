@@ -107,6 +107,7 @@ def compute_advantages_and_returns(
         response_lengths=response_lengths,
         max_seq_lens=max_seq_lens,
         values=values,
+        segment_ids=rollout_data.get("segment_ids"),
     )
 
     # Apply on-policy distillation KL penalty to advantages (orthogonal to advantage estimator)

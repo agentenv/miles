@@ -714,9 +714,30 @@ def get_advantages_and_returns_batch(
     gamma,
     lambd,
     chunked: bool = True,
+    gae_variant: str = "vanilla",
+    gae_lambd_mode: str = "fixed",
+    gae_length_alpha: float = 1.5,
+    gae_critic_lambd: float = 1.0,
+    segment_ids_list=None,
 ):
     """
     Batched GAE with CP support, computed over trainable tokens only.
+
+    GAE variants (``gae_variant``; the default reproduces the original
+    vanilla/chunked GAE element-wise):
+      - ``vanilla``: standard GAE with ``lambd``.
+      - ``length_adaptive``: per-sample ``lambda = 1 - 1/(alpha * l)``, ``l`` the
+        response length (VAPO). Equivalent to ``gae_lambd_mode="length_adaptive"``,
+        which can be combined with ``decoupled`` / ``cross_segment``.
+      - ``decoupled``: advantages use the policy lambda, returns (critic targets)
+        use ``gae_critic_lambd`` (VAPO).
+      - ``cross_segment``: CompactionRL. ``segment_ids_list[i]`` (shape ``[R_i]``,
+        non-decreasing) gives each response token's segment. GAE is local to
+        each segment (bootstrap 0 at every segment end, no bootstrapping across
+        a compaction boundary; terminal reward stays at the last trainable
+        token) and the local advantage is multiplied by ``(gamma*lambda)^{N_{>s}}``
+        with ``N_{>s}`` the number of trainable tokens in later segments.
+        Without segment ids (or a single segment) it equals vanilla.
 
     Semantics:
       - Masked tokens (`loss_mask == 0`, e.g. tool/env observations in
@@ -817,9 +838,47 @@ def get_advantages_and_returns_batch(
                 packed_rewards[i, :K] = full_rewards_list[i][idx]
                 packed_rewards[i, K - 1] += terminal_rewards[i]
 
+        if gae_variant not in GAE_VARIANTS:
+            raise ValueError(f"unknown gae_variant {gae_variant!r}; expected one of {GAE_VARIANTS}")
+        if gae_lambd_mode not in GAE_LAMBD_MODES:
+            raise ValueError(f"unknown gae_lambd_mode {gae_lambd_mode!r}; expected one of {GAE_LAMBD_MODES}")
+        length_adaptive = gae_variant == "length_adaptive" or gae_lambd_mode == "length_adaptive"
+        extended = gae_variant != "vanilla" or length_adaptive
+
         if max_len == 0:
             packed_advantages = torch.zeros(B, 0, device=device, dtype=dtype)
             packed_returns = torch.zeros(B, 0, device=device, dtype=dtype)
+        elif extended:
+            if length_adaptive:
+                lam_list = [length_adaptive_lambda(response_lengths[i], gae_length_alpha) for i in range(B)]
+            else:
+                lam_list = [float(lambd)] * B
+            lam_actor = torch.tensor(lam_list, device=device, dtype=dtype)
+
+            packed_segments = None
+            if gae_variant == "cross_segment" and segment_ids_list is not None:
+                assert B == len(segment_ids_list)
+                packed_segments = torch.zeros(B, max_len, device=device, dtype=torch.long)
+                for i in range(B):
+                    K = trainable_lengths[i]
+                    if K > 0:
+                        seg = torch.as_tensor(segment_ids_list[i], device=device, dtype=torch.long)
+                        seg = seg[: response_lengths[i]][trainable_indices[i]]
+                        if K > 1 and bool((seg[1:] < seg[:-1]).any()):
+                            raise ValueError(f"segment ids of sample {i} must be non-decreasing")
+                        packed_segments[i, :K] = seg
+                        packed_segments[i, K:] = seg[-1]
+            valid = torch.zeros(B, max_len, device=device, dtype=dtype)
+            for i in range(B):
+                valid[i, : trainable_lengths[i]] = 1
+
+            packed_advantages = segmented_gae(packed_rewards, packed_values, gamma, lam_actor, packed_segments, valid)
+            if gae_variant == "decoupled":
+                lam_critic = torch.full((B,), float(gae_critic_lambd), device=device, dtype=dtype)
+                critic_adv = segmented_gae(packed_rewards, packed_values, gamma, lam_critic, packed_segments, valid)
+                packed_returns = critic_adv + packed_values
+            else:
+                packed_returns = packed_advantages + packed_values
         elif not chunked:
             packed_advantages, packed_returns = vanilla_gae(
                 rewards=packed_rewards,
@@ -870,6 +929,52 @@ def get_advantages_and_returns_batch(
             returns_list.append(ret_full)
 
     return advantages_list, returns_list
+
+
+GAE_VARIANTS = ("vanilla", "length_adaptive", "decoupled", "cross_segment")
+GAE_LAMBD_MODES = ("fixed", "length_adaptive")
+
+
+def length_adaptive_lambda(response_length: int, alpha: float = 1.5) -> float:
+    """VAPO length-adaptive lambda ``1 - 1/(alpha * l)``, clamped to ``[0, 1]``."""
+    if response_length <= 0:
+        return 0.0
+    return min(1.0, max(0.0, 1.0 - 1.0 / (alpha * response_length)))
+
+
+def segmented_gae(
+    rewards: torch.Tensor,
+    values: torch.Tensor,
+    gamma: float,
+    lambd: torch.Tensor,
+    segment_ids: torch.Tensor | None,
+    valid: torch.Tensor,
+) -> torch.Tensor:
+    """GAE with per-row lambda and optional CompactionRL segment structure.
+
+    rewards/values/valid: [B, T]; lambd: [B]; segment_ids: [B, T] long or None.
+    Returns advantages [B, T]. With ``segment_ids=None`` this is vanilla GAE.
+    """
+    B, T = rewards.shape
+    w = gamma * lambd  # [B]
+    last = torch.zeros(B, device=rewards.device, dtype=rewards.dtype)
+    seg_cnt = torch.zeros(B, device=rewards.device, dtype=rewards.dtype)
+    later = torch.zeros(B, device=rewards.device, dtype=rewards.dtype)
+    adv_rev = []
+    for t in reversed(range(T)):
+        if t == T - 1:
+            is_end = torch.ones(B, device=rewards.device, dtype=torch.bool)
+        elif segment_ids is None:
+            is_end = torch.zeros(B, device=rewards.device, dtype=torch.bool)
+        else:
+            is_end = segment_ids[:, t + 1] != segment_ids[:, t]
+        next_value = torch.where(is_end, torch.zeros_like(last), values[:, min(t + 1, T - 1)])
+        delta = rewards[:, t] + gamma * next_value - values[:, t]
+        last = delta + w * torch.where(is_end, torch.zeros_like(last), last)
+        later = torch.where(is_end, later + seg_cnt, later)
+        seg_cnt = torch.where(is_end, torch.zeros_like(seg_cnt), seg_cnt) + valid[:, t]
+        adv_rev.append(last * torch.pow(w, later) if segment_ids is not None else last)
+    return torch.stack(adv_rev[::-1], dim=1)
 
 
 def vanilla_gae(

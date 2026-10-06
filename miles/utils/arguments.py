@@ -1754,6 +1754,25 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--entropy-coef", type=float, default=0.0, help="Entropy loss coef")
             parser.add_argument("--gamma", type=float, default=1.0, help="PPO GAE gamma")
             parser.add_argument("--lambd", type=float, default=1.0, help="PPO GAE lambd")
+            parser.add_argument(
+                "--gae-variant",
+                type=str,
+                choices=["vanilla", "length_adaptive", "decoupled", "cross_segment"],
+                default="vanilla",
+                help="PPO GAE variant. cross_segment (CompactionRL) reads per-token segment ids from "
+                "sample.metadata['segment_ids']; without them it equals vanilla.",
+            )
+            parser.add_argument(
+                "--gae-lambd-mode",
+                type=str,
+                choices=["fixed", "length_adaptive"],
+                default="fixed",
+                help="Policy lambda: fixed (--lambd) or length_adaptive (1 - 1/(alpha * response_len)).",
+            )
+            parser.add_argument("--gae-length-alpha", type=float, default=1.5, help="alpha for length-adaptive lambda")
+            parser.add_argument(
+                "--gae-critic-lambd", type=float, default=1.0, help="critic-target lambda for --gae-variant decoupled"
+            )
             parser.add_argument("--normalize-advantages", action="store_true", default=False)
             parser.add_argument(
                 "--disable-grpo-std-normalization",

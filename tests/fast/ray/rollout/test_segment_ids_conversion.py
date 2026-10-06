@@ -1,0 +1,25 @@
+"""segment_ids (CompactionRL cross-segment GAE) flow from Sample.metadata into train shards. No Ray needed."""
+
+from miles.ray.rollout.train_data_conversion import convert_samples_to_train_data, split_train_data_by_dp_raw
+from tests.fast.ray.rollout.conftest import make_args, make_sample
+
+
+def _convert(samples):
+    args = make_args()
+    return args, convert_samples_to_train_data(args, samples, {}, None, None)
+
+
+def test_no_segment_ids_key_when_absent():
+    _, data = _convert([make_sample(index=0), make_sample(index=1)])
+    assert "segment_ids" not in data
+
+
+def test_segment_ids_emitted_and_sharded():
+    a = make_sample(index=0, response_length=4)
+    a.metadata = {"segment_ids": [0, 0, 1, 1]}
+    b = make_sample(index=1, response_length=3)
+    _, data = _convert([a, b])
+    assert data["segment_ids"] == [[0, 0, 1, 1], [0, 0, 0]]
+    args = make_args(balance_data=False)
+    shards = split_train_data_by_dp_raw(args, data, dp_size=1)
+    assert shards[0]["segment_ids"] == [[0, 0, 1, 1], [0, 0, 0]]
