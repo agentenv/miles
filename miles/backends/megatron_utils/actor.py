@@ -636,17 +636,22 @@ class MegatronTrainRayActor(TrainRayActor):
         compute_advantages_and_returns(self.args, rollout_data)
 
         self.args.loss_type = "value_loss"
-        train_step_outcome: TrainStepOutcome = train(
-            rollout_id,
-            self.model,
-            self.optimizer,
-            self.opt_param_scheduler,
-            data_iterator,
-            num_microbatches,
-            get_num_rollouts(self.args, rollout_data, len(num_microbatches)),
-            witness_info=None,
-            attempt=0,
-        )
+        # --num-critic-epochs (alias --critic-updates-per-step): value targets are fixed
+        # for this rollout; each extra update rebuilds the consumed iterator (SAO 16a9bea4).
+        for critic_epoch in range(getattr(self.args, "num_critic_epochs", 1)):
+            if critic_epoch > 0:
+                data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
+            train_step_outcome: TrainStepOutcome = train(
+                rollout_id,
+                self.model,
+                self.optimizer,
+                self.opt_param_scheduler,
+                data_iterator,
+                num_microbatches,
+                get_num_rollouts(self.args, rollout_data, len(num_microbatches)),
+                witness_info=None,
+                attempt=0,
+            )
 
         self._heartbeat.bump()
         values = None

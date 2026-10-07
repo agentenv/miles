@@ -1641,6 +1641,21 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 default=0,
                 help="number of iterations to linearly warmup for critic model.",
             )
+            parser.add_argument(
+                "--num-critic-epochs",
+                "--critic-updates-per-step",
+                dest="num_critic_epochs",
+                type=int,
+                default=1,
+                help="Critic optimizer updates per rollout batch (one actor step), reusing the fixed value "
+                "targets. --critic-updates-per-step is an alias (CompactionRL: 2; SAO: --num-critic-epochs 2).",
+            )
+            parser.add_argument(
+                "--critic-freeze-attention",
+                action="store_true",
+                default=False,
+                help="Freeze critic attention modules while keeping its value head and non-attention blocks trainable.",
+            )
 
             parser.add_argument("--eps-clip", type=float, default=0.2, help="PPO clip range")
             parser.add_argument("--eps-clip-high", type=float, default=None, help="PPO clip upper range")
@@ -3646,6 +3661,8 @@ def miles_validate_args(args):
         # DIS directly compares the current learner with the policy that
         # generated each token. Avoid the redundant old-policy scoring pass.
         args.use_rollout_logprobs = True
+    if getattr(args, "num_critic_epochs", 1) < 1:
+        raise ValueError("--num-critic-epochs/--critic-updates-per-step must be positive")
     if args.value_loss_type == "classification":
         if args.value_num_bins < 2:
             raise ValueError("classification value loss requires --value-num-bins >= 2")

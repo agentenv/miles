@@ -69,7 +69,9 @@ from .fp32_param_utils import enforce_marked_param_dtypes
 from .lora.bridge import _ensure_model_list, _setup_lora_model_via_bridge  # noqa: F401
 
 
-def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer) -> OptimizerParamScheduler | None:
+def get_optimizer_param_scheduler(
+    args: Namespace, optimizer: MegatronOptimizer, role: str = "actor"
+) -> OptimizerParamScheduler | None:
     """Create and configure the optimizer learning-rate/weight-decay scheduler.
 
     This configures iteration-based schedules derived from the global batch size
@@ -83,7 +85,11 @@ def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer)
         OptimizerParamScheduler: Initialized scheduler bound to ``optimizer``.
     """
     # Iteration-based training.
-    args.train_iters = args.num_rollout * args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size
+    # The critic takes --num-critic-epochs optimizer steps per rollout batch (SAO 16a9bea4).
+    updates_per_batch = getattr(args, "num_critic_epochs", 1) if role == "critic" else 1
+    args.train_iters = (
+        args.num_rollout * args.rollout_batch_size * args.n_samples_per_prompt * updates_per_batch
+    ) // args.global_batch_size
     if args.lr_decay_iters is None:
         args.lr_decay_iters = args.train_iters
     lr_decay_steps = args.lr_decay_iters * args.global_batch_size
@@ -241,7 +247,7 @@ def setup_model_and_optimizer(
 
         setup_optimizer_state_streaming(args, optimizer)
 
-    opt_param_scheduler = get_optimizer_param_scheduler(args, optimizer)
+    opt_param_scheduler = get_optimizer_param_scheduler(args, optimizer, role)
     return model, optimizer, opt_param_scheduler
 
 

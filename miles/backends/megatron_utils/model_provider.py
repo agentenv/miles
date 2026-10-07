@@ -20,6 +20,7 @@ from megatron.training.arguments import core_transformer_config_from_args
 from miles.utils.audit_utils.witness.module import install_witness
 from miles.utils.function_registry import load_function
 from miles.utils.replay_base import routing_replay_manager
+from miles.backends.training_utils.critic_freeze import freeze_attention_parameters
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +106,13 @@ def _apply_bridge_runtime_config(provider, args: argparse.Namespace) -> None:
 
 # Adapt from https://github.com/volcengine/verl/blob/c3b20575d2bc815fcccd84bddb4c0401fc4b632b/verl/models/llama/megatron/layers/parallel_linear.py#L82
 
+def _maybe_freeze_critic_attention(args: argparse.Namespace, model: torch.nn.Module, role: str) -> None:
+    if role != "critic" or not getattr(args, "critic_freeze_attention", False):
+        return
+    tensors, elements = freeze_attention_parameters(model)
+    logger.info("Froze critic attention parameters: tensors=%d elements=%d", tensors, elements)
+
+
 def _value_head_output_size(args: argparse.Namespace) -> int:
     if getattr(args, "value_loss_type", "mse") == "classification":
         return getattr(args, "value_num_bins", 51)
@@ -168,6 +176,7 @@ def get_model_provider_func(
                 model.output_layer = LinearForLastLayer(
                     input_size=model.config.hidden_size, output_size=_value_head_output_size(args), config=model.config
                 )
+            _maybe_freeze_critic_attention(args, model, role)
             _maybe_install_witness(args, model)
             return model
 
@@ -201,6 +210,7 @@ def get_model_provider_func(
                 model.output_layer = LinearForLastLayer(
                     input_size=model.config.hidden_size, output_size=_value_head_output_size(args), config=model.config
                 )
+            _maybe_freeze_critic_attention(args, model, role)
             assert not getattr(args, "enable_witness", False), "Witness is not supported yet in this mode"
             # Gemma-4 forward returns (logits, loss_mask); keep logits only.
             _bridge_forward = model.forward
@@ -344,7 +354,10 @@ def get_model_provider_func(
             model = GPTModel(**kwargs)
 
         if post_process and role == "critic":
-            model.output_layer = LinearForLastLayer(input_size=config.hidden_size, output_size=1, config=config)
+            model.output_layer = LinearForLastLayer(
+                input_size=config.hidden_size, output_size=_value_head_output_size(args), config=config
+            )
+        _maybe_freeze_critic_attention(args, model, role)
 
         _maybe_install_witness(args, model)
 
