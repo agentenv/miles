@@ -21,6 +21,7 @@ from miles.utils.audit_utils.witness.module import install_witness
 from miles.utils.function_registry import load_function
 from miles.utils.replay_base import routing_replay_manager
 from miles.backends.training_utils.critic_freeze import freeze_attention_parameters
+from miles.backends.megatron_utils.critic_head import critic_head_owner
 
 logger = logging.getLogger(__name__)
 
@@ -207,7 +208,7 @@ def get_model_provider_func(
                 provider._pg_collection = pg_collection
             model = provider.provide(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
             if post_process and role == "critic":
-                model.output_layer = LinearForLastLayer(
+                critic_head_owner(model).output_layer = LinearForLastLayer(
                     input_size=model.config.hidden_size, output_size=_value_head_output_size(args), config=model.config
                 )
             _maybe_freeze_critic_attention(args, model, role)

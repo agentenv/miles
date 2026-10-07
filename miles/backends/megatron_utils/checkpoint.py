@@ -17,6 +17,7 @@ from miles.utils import megatron_bridge_utils
 from miles_plugins.models.deepseek_v4.arguments import assert_checkpoint_is_current, is_dsv4_model
 
 from .lora.utils import is_lora_enabled, is_lora_model, load_lora_adapter, save_lora_checkpoint
+from .critic_head import iter_value_heads
 from .model_provider import LinearForLastLayer
 
 try:
@@ -196,10 +197,7 @@ def _is_megatron_checkpoint(path: str | Path) -> bool:
 @contextmanager
 def _hide_critic_value_head_from_hf_load(ddp_model):
     value_heads = [
-        (chunk, name, head)
-        for chunk in unwrap_model(ddp_model)
-        for name, head in chunk.named_children()
-        if isinstance(head, LinearForLastLayer)
+        head for chunk in unwrap_model(ddp_model) for head in iter_value_heads(chunk, LinearForLastLayer)
     ]
     for chunk, name, _ in value_heads:
         delattr(chunk, name)
