@@ -104,6 +104,12 @@ def _apply_bridge_runtime_config(provider, args: argparse.Namespace) -> None:
 
 
 # Adapt from https://github.com/volcengine/verl/blob/c3b20575d2bc815fcccd84bddb4c0401fc4b632b/verl/models/llama/megatron/layers/parallel_linear.py#L82
+
+def _value_head_output_size(args: argparse.Namespace) -> int:
+    if getattr(args, "value_loss_type", "mse") == "classification":
+        return getattr(args, "value_num_bins", 51)
+    return 1
+
 class LinearForLastLayer(torch.nn.Linear):
     def __init__(
         self,
@@ -160,7 +166,7 @@ def get_model_provider_func(
             # Apply critic output layer if needed
             if post_process and role == "critic":
                 model.output_layer = LinearForLastLayer(
-                    input_size=model.config.hidden_size, output_size=1, config=model.config
+                    input_size=model.config.hidden_size, output_size=_value_head_output_size(args), config=model.config
                 )
             _maybe_install_witness(args, model)
             return model
@@ -193,7 +199,7 @@ def get_model_provider_func(
             model = provider.provide(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
             if post_process and role == "critic":
                 model.output_layer = LinearForLastLayer(
-                    input_size=model.config.hidden_size, output_size=1, config=model.config
+                    input_size=model.config.hidden_size, output_size=_value_head_output_size(args), config=model.config
                 )
             assert not getattr(args, "enable_witness", False), "Witness is not supported yet in this mode"
             # Gemma-4 forward returns (logits, loss_mask); keep logits only.

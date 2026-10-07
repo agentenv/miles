@@ -358,6 +358,37 @@ def compute_gmpo_loss(
     return torch.cat(losses, dim=0), torch.cat(clipfracs, dim=0), clip_stats
 
 
+@torch.compile(dynamic=True)
+def compute_sao_dis_policy_loss(
+    log_probs: torch.Tensor,
+    rollout_log_probs: torch.Tensor,
+    advantages: torch.Tensor,
+    eps_low: float,
+    eps_high: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute SAO Direct Double-Sided Importance Sampling (DIS).
+
+    Ported verbatim from agentenv/miles feat/sao-tbench21-e2e-validation
+    (16a9bea4, introduced in e25048ed). The behavior model is the policy that
+    generated each token (recorded rollout log probabilities). Tokens at or
+    outside the strict trust-region bounds are removed rather than clipped.
+
+    Returns per-token ``(loss, ratio, rejected, below, above)`` tensors. The
+    ratio intentionally remains in the autograd graph: the published
+    objective contains ``f(r(theta)) * A * log pi_theta``.
+    """
+    log_ratio = _safe_clamp_log_ratio(log_probs - rollout_log_probs)
+    ratio = log_ratio.exp()
+    lower = 1.0 - eps_low
+    upper = 1.0 + eps_high
+    below = ratio <= lower
+    above = ratio >= upper
+    accepted = ~(below | above)
+    calibrated_ratio = torch.where(accepted, ratio, torch.zeros_like(ratio))
+    loss = -calibrated_ratio * advantages * log_probs
+    return loss, ratio, (~accepted).float(), below.float(), above.float()
+
+
 def compute_log_probs(
     logits: torch.Tensor,
     tokens: torch.Tensor,

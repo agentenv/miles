@@ -1673,6 +1673,58 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             )
             parser.add_argument("--value-clip", type=float, default=0.2, help="the clip for value loss")
             parser.add_argument(
+                "--policy-objective",
+                choices=["ppo", "sao_dis"],
+                default="ppo",
+                help="Policy-gradient objective. sao_dis uses current/rollout ratios and strict rejection.",
+            )
+            parser.add_argument(
+                "--sao-dis-eps-low",
+                type=float,
+                default=0.3,
+                help="SAO DIS lower deviation; the strict lower ratio bound is 1-eps-low.",
+            )
+            parser.add_argument(
+                "--sao-dis-eps-high",
+                type=float,
+                default=5.0,
+                help="SAO DIS upper deviation; the strict upper ratio bound is 1+eps-high.",
+            )
+            parser.add_argument(
+                "--value-loss-type",
+                type=str,
+                default="mse",
+                choices=["mse", "classification"],
+                help="Scalar MSE or categorical value prediction.",
+            )
+            parser.add_argument(
+                "--value-num-bins",
+                type=int,
+                default=51,
+                help="Number of support bins for classification value prediction.",
+            )
+            parser.add_argument(
+                "--value-reward-range",
+                type=float,
+                nargs=2,
+                default=[0.0, 1.0],
+                metavar=("LOW", "HIGH"),
+                help="Categorical value support range.",
+            )
+            parser.add_argument(
+                "--value-target-type",
+                type=str,
+                default="hl_gauss",
+                choices=["two_hot", "hl_gauss"],
+                help="Projection from scalar returns to categorical targets.",
+            )
+            parser.add_argument(
+                "--hl-gauss-sigma-ratio",
+                type=float,
+                default=0.75,
+                help="HL-Gauss sigma divided by categorical bin width.",
+            )
+            parser.add_argument(
                 "--kl-coef",
                 type=float,
                 default=0.00,
@@ -3583,6 +3635,24 @@ def miles_validate_args(args):
             "The 'reinforce_plus_plus' and 'reinforce_plus_plus_baseline' advantage estimators "
             "require advantage normalization. Please add `--normalize-advantages` to your command."
         )
+
+    if args.policy_objective == "sao_dis":
+        if not 0 <= args.sao_dis_eps_low < 1:
+            raise ValueError("--sao-dis-eps-low must be in [0, 1)")
+        if args.sao_dis_eps_high <= 0:
+            raise ValueError("--sao-dis-eps-high must be positive")
+        if args.use_tis or args.get_mismatch_metrics or args.use_opsm:
+            raise ValueError("SAO DIS cannot be combined with TIS, mismatch correction, or OPSM")
+        # DIS directly compares the current learner with the policy that
+        # generated each token. Avoid the redundant old-policy scoring pass.
+        args.use_rollout_logprobs = True
+    if args.value_loss_type == "classification":
+        if args.value_num_bins < 2:
+            raise ValueError("classification value loss requires --value-num-bins >= 2")
+        if len(args.value_reward_range) != 2 or args.value_reward_range[0] >= args.value_reward_range[1]:
+            raise ValueError("--value-reward-range must satisfy LOW < HIGH")
+        if args.hl_gauss_sigma_ratio <= 0:
+            raise ValueError("--hl-gauss-sigma-ratio must be positive")
 
     if args.use_rollout_logprobs:
         assert not args.use_tis, "use_rollout_logprobs and use_tis cannot be set at the same time."
