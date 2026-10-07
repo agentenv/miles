@@ -99,12 +99,12 @@ def test_compute_advantages_default_args_pass_no_variant_kwargs(monkeypatch):
                                loss_masks=[torch.ones(1)], total_lengths=[1], response_lengths=[1],
                                values=[torch.zeros(1)])
     assert not any(k.startswith("gae_") for k in seen)
-    args.gae_variant = "cross_segment"
+    args.gae_variant = "cross_segment_whole_rollout"
     seen.clear()
     adv_mod.compute_advantages(args, kl=[torch.zeros(1)], rewards=[1.0], log_probs=None,
                                loss_masks=[torch.ones(1)], total_lengths=[1], response_lengths=[1],
                                values=[torch.zeros(1)], segment_ids=[[0]])
-    assert seen["gae_variant"] == "cross_segment" and seen["segment_ids_list"] == [[0]]
+    assert seen["gae_variant"] == "cross_segment_whole_rollout" and seen["segment_ids_list"] == [[0]]
 
 
 def test_arguments_defaults():
@@ -160,7 +160,7 @@ def test_decoupled_with_length_adaptive_policy_lambda():
 def test_cross_segment_matches_reference(masked, lambd_mode):
     values, rewards, term, masks = _batch(5, lengths=(6, 10, 3, 8), masked=masked)
     segs = [[0, 0, 1, 1, 1, 2], [0] * 3 + [1] * 4 + [2] * 3, [0, 0, 0], [0, 1, 1, 1, 2, 2, 3, 3]]
-    a, r = _run(values, rewards, term, masks, 0.95, 0.9, gae_variant="cross_segment",
+    a, r = _run(values, rewards, term, masks, 0.95, 0.9, gae_variant="cross_segment_whole_rollout",
                 gae_lambd_mode=lambd_mode, segment_ids_list=segs)
     for i, (v, rw, t, m) in enumerate(zip(values, rewards, term, masks)):
         idx, rr, vv = _ref_inputs(v, rw, t, m)
@@ -178,7 +178,7 @@ def test_cross_segment_two_segments_factor_n2():
     values, rewards, term, masks = _batch(6, lengths=(7,))
     seg = [[0, 0, 0, 1, 1, 1, 1]]
     g, l = 0.9, 0.8
-    a, _ = _run(values, rewards, term, masks, g, l, gae_variant="cross_segment", segment_ids_list=seg)
+    a, _ = _run(values, rewards, term, masks, g, l, gae_variant="cross_segment_whole_rollout", segment_ids_list=seg)
     local, _ = vanilla_gae(rewards[0][None, :3], values[0][None, :3], g, l)
     assert torch.allclose(a[0][:3], local[0] * (g * l) ** 4, atol=1e-12)
 
@@ -187,7 +187,7 @@ def test_cross_segment_degenerates_to_vanilla():
     values, rewards, term, masks = _batch(7, masked=True)
     base_a, base_r = _run(values, rewards, term, masks, 0.97, 0.9, chunked=False)
     for segs in (None, [[3] * v.numel() for v in values]):
-        a, r = _run(values, rewards, term, masks, 0.97, 0.9, gae_variant="cross_segment", segment_ids_list=segs)
+        a, r = _run(values, rewards, term, masks, 0.97, 0.9, gae_variant="cross_segment_whole_rollout", segment_ids_list=segs)
         for i in range(len(values)):
             assert torch.allclose(a[i], base_a[i], atol=1e-12) and torch.allclose(r[i], base_r[i], atol=1e-12)
 
@@ -195,9 +195,15 @@ def test_cross_segment_degenerates_to_vanilla():
 def test_cross_segment_rejects_decreasing_ids_and_unknown_variant():
     values, rewards, term, masks = _batch(8, lengths=(4,))
     with pytest.raises(ValueError):
-        _run(values, rewards, term, masks, 1.0, 1.0, gae_variant="cross_segment", segment_ids_list=[[1, 1, 0, 0]])
+        _run(values, rewards, term, masks, 1.0, 1.0, gae_variant="cross_segment_whole_rollout", segment_ids_list=[[1, 1, 0, 0]])
     with pytest.raises(ValueError):
         _run(values, rewards, term, masks, 1.0, 1.0, gae_variant="bogus")
+
+
+def test_ambiguous_cross_segment_value_rejected():
+    values, rewards, term, masks = _batch(8, lengths=(4,))
+    with pytest.raises(ValueError, match="cross_segment_per_sample.*cross_segment_whole_rollout"):
+        _run(values, rewards, term, masks, 1.0, 1.0, gae_variant="cross_segment", segment_ids_list=[[0, 0, 1, 1]])
 
 
 # ---------------- cross_segment_per_sample (CompactionRL, one sample per segment) ----------------
@@ -252,7 +258,7 @@ def test_per_sample_zero_after_equals_vanilla_and_requires_tokens_after():
 
 
 def test_compute_advantages_forwards_tokens_after_only_for_per_sample():
-    args = argparse.Namespace(gae_variant="cross_segment", gae_lambd_mode="fixed")
+    args = argparse.Namespace(gae_variant="cross_segment_whole_rollout", gae_lambd_mode="fixed")
     assert "tokens_after_list" not in adv_mod._gae_variant_kwargs(args, None, [1], [2])
     args.gae_variant = "cross_segment_per_sample"
     kw = adv_mod._gae_variant_kwargs(args, None, [1], [2])

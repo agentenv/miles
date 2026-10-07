@@ -127,8 +127,15 @@ def compute_advantages_and_returns(
     rollout_data["advantages"] = advantages
     rollout_data["returns"] = returns
     if getattr(args, "positive_example_lm_loss_coef", 0.0):
-        rollout_data["positive_example_flags"] = positive_example_flags(
-            rewards, getattr(args, "positive_example_reward_threshold", 0.0)
+        flags = positive_example_flags_from_rollout(args, rollout_data, rewards)
+        mask_sums = [float(m.sum()) for m in loss_masks]
+        rollout_data["positive_example_lm_weights"] = positive_example_lm_weights(
+            flags,
+            mask_sums,
+            step_groups=_local_step_groups(args, rollout_data),
+            per_token=args.calculate_per_token_loss,
+            num_rollouts=_step_num_rollouts(args, rollout_data),
+            all_reduce_sum=_dp_all_reduce_sum,
         )
 
 
@@ -256,5 +263,105 @@ def log_train_advantage_computation_event(rollout_data: RolloutBatch) -> None:
 
 
 def positive_example_flags(rewards: list[float], threshold: float) -> list[float]:
-    """Per-sample 1.0 / 0.0: reward > threshold (VAPO positive-example LM loss)."""
+    """Per-sample 1.0 / 0.0: reward > threshold (only for --positive-example-source reward)."""
     return [1.0 if float(r) > threshold else 0.0 for r in rewards]
+
+
+def positive_example_flags_from_rollout(args: Namespace, rollout_data: RolloutBatch, rewards) -> list[float]:
+    """VAPO positive judgement. Default: explicit success field; reward threshold only when declared binary."""
+    source = getattr(args, "positive_example_source", "success")
+    if source == "reward":
+        threshold = getattr(args, "positive_example_reward_threshold", None)
+        return positive_example_flags(rewards, 0.0 if threshold is None else float(threshold))
+    if source != "success":
+        raise ValueError(f"unknown --positive-example-source {source!r}")
+    success = rollout_data.get("positive_example_success")
+    if success is None:
+        raise ValueError(
+            "--positive-example-source success needs sample.metadata['success'] (or 'is_correct') from the "
+            "reward function; none of the samples carries it. Use --positive-example-source reward only if a "
+            "positive reward always means complete success."
+        )
+    success = [int(x) for x in success]
+    missing = [i for i, x in enumerate(success) if x not in (0, 1)]
+    if missing:
+        raise ValueError(f"samples {missing[:8]} lack the boolean success field (metadata 'success'/'is_correct')")
+    return [float(x) for x in success]
+
+
+def positive_example_lm_weights(
+    flags: list[float],
+    mask_sums: list[float],
+    *,
+    step_groups: list[list[int]],
+    per_token: bool,
+    num_rollouts: list[int] | None,
+    all_reduce_sum=None,
+) -> list[float]:
+    """Per-sample weights w_i so that sum_i w_i * sum_t(-logp) after Miles' own loss normalization equals
+    VAPO eq. 9: sum over positive tokens / P, with P the global positive-token count of the optimizer step.
+
+    Miles divides the summed loss by the step's global normalizer D: the global token count
+    (sum_i max(mask_i.sum(), 1), as in ``loss_function``'s ``num_tokens``) under --calculate-per-token-loss,
+    else the step's rollout count (``num_rollouts``). Hence w_i = flag_i * D / P (0 when P == 0).
+    ``step_groups`` lists the local sample indices of each optimizer step; ``all_reduce_sum`` sums a
+    float64 tensor over the effective DP group in place (None = single rank).
+    """
+    n_steps = len(step_groups)
+    stats = torch.zeros(n_steps, 2, dtype=torch.float64)
+    for k, group in enumerate(step_groups):
+        for i in group:
+            stats[k, 0] += flags[i] * mask_sums[i]
+            stats[k, 1] += max(mask_sums[i], 1.0)
+    if all_reduce_sum is not None:
+        all_reduce_sum(stats)
+    weights = [0.0] * len(flags)
+    for k, group in enumerate(step_groups):
+        positive_tokens = float(stats[k, 0])
+        if positive_tokens <= 0:
+            continue
+        if per_token:
+            denominator = float(stats[k, 1])
+        else:
+            if num_rollouts is None:
+                raise ValueError("per-sample loss needs the per-step rollout count")
+            denominator = float(num_rollouts[k])
+        for i in group:
+            weights[i] = flags[i] * denominator / positive_tokens
+    return weights
+
+
+def _local_step_groups(args: Namespace, rollout_data: RolloutBatch) -> list[list[int]]:
+    """Local sample indices per optimizer step, matching ``get_data_iterator``."""
+    num_local = len(rollout_data["total_lengths"])
+    if "micro_batch_indices" in rollout_data:
+        groups, cursor = [], 0
+        indices = rollout_data["micro_batch_indices"]
+        for num_mbs in rollout_data["num_microbatches"]:
+            groups.append([i for mb in indices[cursor : cursor + num_mbs] for i in mb])
+            cursor += num_mbs
+        return groups
+    dp_size = get_parallel_state().effective_dp.size
+    global_batch_size = rollout_data.get("dynamic_global_batch_size", args.global_batch_size)
+    local_gbs = global_batch_size // dp_size
+    return [list(range(k * local_gbs, (k + 1) * local_gbs)) for k in range(num_local // local_gbs)]
+
+
+def _step_num_rollouts(args: Namespace, rollout_data: RolloutBatch) -> list[int] | None:
+    if args.calculate_per_token_loss:
+        return None
+    from miles.backends.training_utils.data import get_num_rollouts
+
+    return list(get_num_rollouts(args, rollout_data, len(_local_step_groups(args, rollout_data))))
+
+
+def _dp_all_reduce_sum(stats: torch.Tensor) -> None:
+    import torch.distributed as dist
+
+    if not (dist.is_available() and dist.is_initialized()):
+        return
+    group = get_parallel_state().effective_dp.group
+    device = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
+    reduced = stats.to(device)
+    dist.all_reduce(reduced, op=dist.ReduceOp.SUM, group=group)
+    stats.copy_(reduced.cpu())

@@ -537,7 +537,7 @@ class FSDPTrainRayActor(TrainRayActor):
                             "returns",
                             "ref_log_probs",
                             "rollout_log_probs",
-                            "positive_example_flags",
+                            "positive_example_lm_weights",
                             *sampling_mask_keys,
                         ],
                         self.args.data_pad_size_multiplier,

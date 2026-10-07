@@ -1824,13 +1824,14 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--gae-variant",
                 type=str,
-                choices=["vanilla", "length_adaptive", "decoupled", "cross_segment", "cross_segment_per_sample"],
+                choices=["vanilla", "length_adaptive", "decoupled", "cross_segment_whole_rollout", "cross_segment_per_sample"],
                 default="vanilla",
                 help="PPO GAE variant. cross_segment_per_sample (CompactionRL, one sample per compaction "
                 "segment) runs local GAE per sample and multiplies the advantage by (gamma*lambda)^tokens_after "
                 "from sample.metadata['tokens_after'] (optional metadata 'gae_length' sets l for length-adaptive "
-                "lambda). cross_segment is the legacy one-sample-per-rollout layout reading per-token "
-                "sample.metadata['segment_ids'] (earlier segments get no terminal reward; deprecated).",
+                "lambda). cross_segment_whole_rollout is an explicit CONTROL mode (one sample per rollout "
+                "with per-token sample.metadata['segment_ids']; earlier segments get no terminal reward, "
+                "which differs from CompactionRL eq. 15). The ambiguous value cross_segment is rejected.",
             )
             parser.add_argument(
                 "--gae-lambd-mode",
@@ -1847,14 +1848,26 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 "--positive-example-lm-loss-coef",
                 type=float,
                 default=0.0,
-                help="VAPO positive-example LM loss weight mu: adds mu * NLL over the response tokens of samples "
-                "whose reward > --positive-example-reward-threshold to the policy loss (0 disables).",
+                help="VAPO positive-example LM loss weight mu (paper eq. 9-10): adds mu * NLL over the response "
+                "tokens of positive samples, normalized by the global (all micro-batches and DP ranks of the "
+                "optimizer step) count of positive-sample tokens (0 disables).",
+            )
+            parser.add_argument(
+                "--positive-example-source",
+                type=str,
+                choices=["success", "reward"],
+                default="success",
+                help="How a sample is judged positive. success (default): the explicit boolean "
+                "sample.metadata['success'] (or 'is_correct') set by the reward function; a missing field is an "
+                "error. reward: reward > --positive-example-reward-threshold; only valid when the reward is a "
+                "binary success signal (a positive reward always means complete success).",
             )
             parser.add_argument(
                 "--positive-example-reward-threshold",
                 type=float,
-                default=0.0,
-                help="A sample counts as a positive (correct) example when its reward is strictly greater than this.",
+                default=None,
+                help="With --positive-example-source reward: a sample is positive when reward > this (default 0.0). "
+                "Rejected with --positive-example-source success.",
             )
             parser.add_argument("--normalize-advantages", action="store_true", default=False)
             parser.add_argument(
@@ -3110,6 +3123,22 @@ def _compute_custom_inference_engine_provider_path(args: argparse.Namespace) -> 
 _DEPLOY_INSTANCE_ID_PATTERN = re.compile(DNS_LABEL_PATTERN)
 
 
+def validate_positive_example_args(args: argparse.Namespace) -> None:
+    """VAPO positive-example LM loss: the positive judgement must be explicit (success field) unless the
+    reward is declared to be a binary success signal (--positive-example-source reward)."""
+    source = getattr(args, "positive_example_source", "success")
+    threshold = getattr(args, "positive_example_reward_threshold", None)
+    if source not in ("success", "reward"):
+        raise ValueError(f"--positive-example-source must be success or reward, got {source!r}")
+    if source == "success" and threshold is not None:
+        raise ValueError(
+            "--positive-example-reward-threshold is only valid with --positive-example-source reward "
+            "(declares that a reward above the threshold always means complete success)"
+        )
+    if getattr(args, "positive_example_lm_loss_coef", 0.0) < 0:
+        raise ValueError("--positive-example-lm-loss-coef must be >= 0")
+
+
 def _validate_deploy_component(args: argparse.Namespace) -> None:
     component = DeployComponent(args.deploy_component)
 
@@ -3666,6 +3695,7 @@ def miles_validate_args(args):
         args.use_rollout_logprobs = True
     if getattr(args, "num_critic_epochs", 1) < 1:
         raise ValueError("--num-critic-epochs/--critic-updates-per-step must be positive")
+    validate_positive_example_args(args)
     if args.value_loss_type == "classification":
         if args.value_num_bins < 2:
             raise ValueError("classification value loss requires --value-num-bins >= 2")

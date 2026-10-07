@@ -761,10 +761,11 @@ def get_advantages_and_returns_batch(
       - ``vanilla``: standard GAE with ``lambd``.
       - ``length_adaptive``: per-sample ``lambda = 1 - 1/(alpha * l)``, ``l`` the
         response length (VAPO). Equivalent to ``gae_lambd_mode="length_adaptive"``,
-        which can be combined with ``decoupled`` / ``cross_segment``.
+        which can be combined with ``decoupled`` / ``cross_segment_*``.
       - ``decoupled``: advantages use the policy lambda, returns (critic targets)
         use ``gae_critic_lambd`` (VAPO).
-      - ``cross_segment``: CompactionRL. ``segment_ids_list[i]`` (shape ``[R_i]``,
+      - ``cross_segment_whole_rollout`` (control/ablation mode, formerly
+        ``cross_segment``): CompactionRL. ``segment_ids_list[i]`` (shape ``[R_i]``,
         non-decreasing) gives each response token's segment. GAE is local to
         each segment (bootstrap 0 at every segment end, no bootstrapping across
         a compaction boundary; terminal reward stays at the last trainable
@@ -884,6 +885,13 @@ def get_advantages_and_returns_batch(
                 packed_rewards[i, :K] = full_rewards_list[i][idx]
                 packed_rewards[i, K - 1] += terminal_rewards[i]
 
+        if gae_variant == "cross_segment":
+            raise ValueError(
+                "gae_variant 'cross_segment' is ambiguous and no longer accepted; use "
+                "'cross_segment_per_sample' (CompactionRL eq. 13-15, one sample per segment) or "
+                "'cross_segment_whole_rollout' (control mode: one sample per rollout, earlier segments "
+                "get no terminal reward)"
+            )
         if gae_variant not in GAE_VARIANTS:
             raise ValueError(f"unknown gae_variant {gae_variant!r}; expected one of {GAE_VARIANTS}")
         if gae_lambd_mode not in GAE_LAMBD_MODES:
@@ -914,7 +922,7 @@ def get_advantages_and_returns_batch(
             lam_actor = torch.tensor(lam_list, device=device, dtype=dtype)
 
             packed_segments = None
-            if gae_variant == "cross_segment" and segment_ids_list is not None:
+            if gae_variant == "cross_segment_whole_rollout" and segment_ids_list is not None:
                 assert B == len(segment_ids_list)
                 packed_segments = torch.zeros(B, max_len, device=device, dtype=torch.long)
                 for i in range(B):
@@ -993,7 +1001,7 @@ def get_advantages_and_returns_batch(
     return advantages_list, returns_list
 
 
-GAE_VARIANTS = ("vanilla", "length_adaptive", "decoupled", "cross_segment", "cross_segment_per_sample")
+GAE_VARIANTS = ("vanilla", "length_adaptive", "decoupled", "cross_segment_whole_rollout", "cross_segment_per_sample")
 GAE_LAMBD_MODES = ("fixed", "length_adaptive")
 
 

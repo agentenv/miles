@@ -15,7 +15,7 @@ Variants
 - decoupled:        policy advantages use lambda_policy, value targets use
                     lambda_critic (VAPO "decoupled GAE", typically lambda_critic = 1):
                     A = GAE(lambda_policy), R = GAE(lambda_critic) + V.
-- cross_segment:    CompactionRL.  For segment s with n_s tokens,
+- cross_segment_whole_rollout (control mode, formerly cross_segment): CompactionRL.  For segment s with n_s tokens,
                     A^loc_{s,i} = sum_{l=0}^{n_s-i} (gamma*lambda)^l delta_{s,i+l},
                     where the bootstrap value after the last token of every segment
                     is 0 (no bootstrapping across a compaction boundary) and the

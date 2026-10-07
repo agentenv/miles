@@ -37,6 +37,7 @@ ROLLOUT_DATA_VALUE_SPEC: dict[str, ValueSpec] = {
     "round_number": ValueSpec(codec="ndarray", dtype="int64"),
     "tokens_after": ValueSpec(codec="ndarray", dtype="int64"),
     "gae_length": ValueSpec(codec="ndarray", dtype="int64"),
+    "positive_example_success": ValueSpec(codec="ndarray", dtype="int64"),
     "sample_indices": ValueSpec(codec="ndarray", dtype="int64"),
     "rollout_ids": ValueSpec(codec="ndarray", dtype="int64"),
     "rollout_mask_sums": ValueSpec(codec="ndarray", dtype="int64"),
@@ -126,6 +127,11 @@ def convert_samples_to_train_data(
             int((s.metadata or {}).get("gae_length") or s.response_length) for s in samples
         ]
 
+    # VAPO positive-example LM loss: explicit success judgement from the reward function
+    # (sample.metadata['success'] / 'is_correct'); 1 / 0, -1 = missing (error at use).
+    if any(s.metadata and (SUCCESS_KEYS[0] in s.metadata or SUCCESS_KEYS[1] in s.metadata) for s in samples):
+        train_data["positive_example_success"] = [sample_success_flag(s.metadata) for s in samples]
+
     train_data["rollout_mask_sums"] = _compute_rollout_mask_sums(train_data["rollout_ids"], loss_masks)
 
     # overwriting the raw reward
@@ -199,6 +205,29 @@ def convert_samples_to_train_data(
         train_data["dynamic_global_batch_size"] = x
 
     return train_data
+
+
+SUCCESS_KEYS = ("success", "is_correct")
+
+
+def sample_success_flag(metadata: dict | None) -> int:
+    """1 / 0 from the boolean metadata success field; -1 when absent. Non-boolean values are rejected."""
+    metadata = metadata or {}
+    found = []
+    for key in SUCCESS_KEYS:
+        if key in metadata and metadata[key] is not None:
+            value = metadata[key]
+            if isinstance(value, bool):
+                found.append(int(value))
+            elif isinstance(value, int) and value in (0, 1):
+                found.append(int(value))
+            else:
+                raise ValueError(f"sample.metadata[{key!r}] must be a boolean success flag, got {value!r}")
+    if not found:
+        return -1
+    if len(set(found)) != 1:
+        raise ValueError(f"sample.metadata success/is_correct disagree: {found}")
+    return found[0]
 
 
 def _compute_rollout_mask_sums(rollout_ids: list[int], loss_masks: list[list[int]]) -> list[int]:
@@ -406,6 +435,7 @@ def _package_shards(args, data: dict[str, Any], partitions) -> list[dict[str, An
             "segment_ids",
             "tokens_after",
             "gae_length",
+            "positive_example_success",
             "round_number",
             "sample_indices",
             "rollout_ids",

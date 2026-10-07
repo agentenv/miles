@@ -497,20 +497,21 @@ def policy_loss_function(
 def _positive_example_lm_loss(
     *, args: Namespace, batch: RolloutBatch, log_probs: torch.Tensor, max_seq_lens: list[int] | None
 ) -> torch.Tensor:
-    """VAPO positive-example LM loss: NLL over the response tokens of positive samples.
+    """VAPO positive-example LM loss (eq. 9): NLL summed over positive-sample response tokens.
 
-    Reduced like the policy loss (per token or per sample, per --calculate-per-token-loss),
-    so the outer normalizer is the micro/global batch's, not the positive tokens' count.
+    Each sample carries a precomputed weight w_i = flag_i * D / P (see
+    ``loss.positive_example_lm_weights``), so after Miles divides the summed loss by the step's global
+    normalizer D the term equals sum over positive tokens / P, P = global positive-token count of the step.
     """
-    flags = batch.get("positive_example_flags")
-    if flags is None:
-        raise ValueError("--positive-example-lm-loss-coef needs batch['positive_example_flags']")
-    positive_masks = [mask * float(flag) for mask, flag in zip(batch["loss_masks"], flags, strict=True)]
+    weights = batch.get("positive_example_lm_weights")
+    if weights is None:
+        raise ValueError("--positive-example-lm-loss-coef needs batch['positive_example_lm_weights']")
+    positive_masks = [mask * float(w) for mask, w in zip(batch["loss_masks"], weights, strict=True)]
     positive_reducer = get_sum_of_sample_mean(
         batch["total_lengths"],
         batch["response_lengths"],
         positive_masks,
-        args.calculate_per_token_loss,
+        True,  # plain weighted token sum; the normalization lives in the weights
         args.qkv_format,
         max_seq_lens,
     )
