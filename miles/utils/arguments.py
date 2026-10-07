@@ -1773,6 +1773,19 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--gae-critic-lambd", type=float, default=1.0, help="critic-target lambda for --gae-variant decoupled"
             )
+            parser.add_argument(
+                "--positive-example-lm-loss-coef",
+                type=float,
+                default=0.0,
+                help="VAPO positive-example LM loss weight mu: adds mu * NLL over the response tokens of samples "
+                "whose reward > --positive-example-reward-threshold to the policy loss (0 disables).",
+            )
+            parser.add_argument(
+                "--positive-example-reward-threshold",
+                type=float,
+                default=0.0,
+                help="A sample counts as a positive (correct) example when its reward is strictly greater than this.",
+            )
             parser.add_argument("--normalize-advantages", action="store_true", default=False)
             parser.add_argument(
                 "--disable-grpo-std-normalization",

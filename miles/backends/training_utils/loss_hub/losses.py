@@ -378,6 +378,17 @@ def policy_loss_function(
         if args.kl_loss_coef != 0:
             loss = loss + args.kl_loss_coef * kl_loss
 
+    positive_lm_loss = None
+    positive_lm_coef = getattr(args, "positive_example_lm_loss_coef", 0.0)
+    if positive_lm_coef:
+        positive_lm_loss = _positive_example_lm_loss(
+            args=args,
+            batch=batch,
+            log_probs=torch.where(active_tokens, log_probs, log_probs.new_zeros(())),
+            max_seq_lens=max_seq_lens,
+        )
+        loss = loss + positive_lm_coef * positive_lm_loss
+
     # make sure the gradient could backprop correctly; fp32 sum avoids fp16 inf -> nan
     if log_probs.numel() == 0:
         loss += 0 * logits.sum(dtype=torch.float32)
@@ -429,6 +440,9 @@ def policy_loss_function(
     if args.use_kl_loss:
         reported_loss["kl_loss"] = kl_loss.clone().detach()
 
+    if positive_lm_loss is not None:
+        reported_loss["positive_lm_loss"] = positive_lm_loss.clone().detach()
+
     if args.get_mismatch_metrics or args.use_tis:
         # Aggregate mismatch/TIS/RS related metrics with the *pre-RS* masks.
         # See comment above where `sum_of_sample_mean_for_mismatch_metrics` is defined.
@@ -447,6 +461,29 @@ def policy_loss_function(
         reported_loss["opd_reverse_kl"] = sum_of_sample_mean(opd_reverse_kl).clone().detach()
 
     return loss, reported_loss
+
+
+def _positive_example_lm_loss(
+    *, args: Namespace, batch: RolloutBatch, log_probs: torch.Tensor, max_seq_lens: list[int] | None
+) -> torch.Tensor:
+    """VAPO positive-example LM loss: NLL over the response tokens of positive samples.
+
+    Reduced like the policy loss (per token or per sample, per --calculate-per-token-loss),
+    so the outer normalizer is the micro/global batch's, not the positive tokens' count.
+    """
+    flags = batch.get("positive_example_flags")
+    if flags is None:
+        raise ValueError("--positive-example-lm-loss-coef needs batch['positive_example_flags']")
+    positive_masks = [mask * float(flag) for mask, flag in zip(batch["loss_masks"], flags, strict=True)]
+    positive_reducer = get_sum_of_sample_mean(
+        batch["total_lengths"],
+        batch["response_lengths"],
+        positive_masks,
+        args.calculate_per_token_loss,
+        args.qkv_format,
+        max_seq_lens,
+    )
+    return -positive_reducer(log_probs)
 
 
 def value_loss_function(

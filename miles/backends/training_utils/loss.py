@@ -124,6 +124,10 @@ def compute_advantages_and_returns(
 
     rollout_data["advantages"] = advantages
     rollout_data["returns"] = returns
+    if getattr(args, "positive_example_lm_loss_coef", 0.0):
+        rollout_data["positive_example_flags"] = positive_example_flags(
+            rewards, getattr(args, "positive_example_reward_threshold", 0.0)
+        )
 
 
 def loss_function(
@@ -247,3 +251,8 @@ def log_train_advantage_computation_event(rollout_data: RolloutBatch) -> None:
         ),
         print_log=False,
     )
+
+
+def positive_example_flags(rewards: list[float], threshold: float) -> list[float]:
+    """Per-sample 1.0 / 0.0: reward > threshold (VAPO positive-example LM loss)."""
+    return [1.0 if float(r) > threshold else 0.0 for r in rewards]
