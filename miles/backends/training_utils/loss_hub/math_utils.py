@@ -750,6 +750,8 @@ def get_advantages_and_returns_batch(
     gae_length_alpha: float = 1.5,
     gae_critic_lambd: float = 1.0,
     segment_ids_list=None,
+    tokens_after_list=None,
+    gae_length_list=None,
 ):
     """
     Batched GAE with CP support, computed over trainable tokens only.
@@ -769,6 +771,19 @@ def get_advantages_and_returns_batch(
         token) and the local advantage is multiplied by ``(gamma*lambda)^{N_{>s}}``
         with ``N_{>s}`` the number of trainable tokens in later segments.
         Without segment ids (or a single segment) it equals vanilla.
+        Legacy one-sample-per-rollout layout: earlier segments see no terminal
+        reward. CompactionRL (arXiv 2607.05378 sec. 4.2) optimises every segment
+        as its own sample instead; use ``cross_segment_per_sample``.
+      - ``cross_segment_per_sample``: CompactionRL, one sample per compaction
+        segment. Each sample runs ordinary local GAE (terminal reward at its last
+        trainable token, bootstrap 0 after it), i.e. eq. 13; the advantage is then
+        multiplied by ``(gamma*lambda)^{tokens_after_list[i]}`` (eq. 14,
+        ``N_{>s}`` = optimised tokens of later segments of the same rollout).
+        Returns (critic targets) are the *local* advantage plus values
+        (uncorrected; the paper only says "standard PPO value regression").
+        For length-adaptive lambda, ``l = gae_length_list[i]`` when given (e.g.
+        the whole rollout's optimised length, so all segments of a rollout share
+        one lambda), else the sample's response length.
 
     Semantics:
       - Masked tokens (`loss_mask == 0`, e.g. tool/env observations in
@@ -880,8 +895,20 @@ def get_advantages_and_returns_batch(
             packed_advantages = torch.zeros(B, 0, device=device, dtype=dtype)
             packed_returns = torch.zeros(B, 0, device=device, dtype=dtype)
         elif extended:
+            per_sample = gae_variant == "cross_segment_per_sample"
+            if per_sample:
+                if tokens_after_list is None:
+                    raise ValueError("cross_segment_per_sample needs per-sample tokens_after (sample.metadata)")
+                assert B == len(tokens_after_list)
+                if any(int(n) < 0 for n in tokens_after_list):
+                    raise ValueError("tokens_after must be >= 0")
             if length_adaptive:
-                lam_list = [length_adaptive_lambda(response_lengths[i], gae_length_alpha) for i in range(B)]
+                lengths = list(response_lengths)
+                if per_sample and gae_length_list is not None:
+                    assert B == len(gae_length_list)
+                    lengths = [response_lengths[i] if gae_length_list[i] is None else int(gae_length_list[i])
+                               for i in range(B)]
+                lam_list = [length_adaptive_lambda(lengths[i], gae_length_alpha) for i in range(B)]
             else:
                 lam_list = [float(lambd)] * B
             lam_actor = torch.tensor(lam_list, device=device, dtype=dtype)
@@ -910,6 +937,10 @@ def get_advantages_and_returns_batch(
                 packed_returns = critic_adv + packed_values
             else:
                 packed_returns = packed_advantages + packed_values
+            if per_sample:
+                n_after = torch.tensor([float(n) for n in tokens_after_list], device=device, dtype=dtype)
+                factor = torch.pow(gamma * lam_actor, n_after)
+                packed_advantages = packed_advantages * factor[:, None]
         elif not chunked:
             packed_advantages, packed_returns = vanilla_gae(
                 rewards=packed_rewards,
@@ -962,7 +993,7 @@ def get_advantages_and_returns_batch(
     return advantages_list, returns_list
 
 
-GAE_VARIANTS = ("vanilla", "length_adaptive", "decoupled", "cross_segment")
+GAE_VARIANTS = ("vanilla", "length_adaptive", "decoupled", "cross_segment", "cross_segment_per_sample")
 GAE_LAMBD_MODES = ("fixed", "length_adaptive")
 
 

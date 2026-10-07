@@ -23,3 +23,22 @@ def test_segment_ids_emitted_and_sharded():
     args = make_args(balance_data=False)
     shards = split_train_data_by_dp_raw(args, data, dp_size=1)
     assert shards[0]["segment_ids"] == [[0, 0, 1, 1], [0, 0, 0]]
+
+
+def test_tokens_after_and_gae_length_emitted_and_sharded():
+    a = make_sample(index=0, response_length=4)
+    a.metadata = {"tokens_after": 7, "gae_length": 11}
+    b = make_sample(index=1, response_length=3)
+    b.metadata = {"tokens_after": 0}
+    _, data = _convert([a, b])
+    assert data["tokens_after"] == [7, 0]
+    assert data["gae_length"] == [11, 3]  # missing -> own response length
+    assert "segment_ids" not in data
+    args = make_args(balance_data=False)
+    shards = split_train_data_by_dp_raw(args, data, dp_size=1)
+    assert shards[0]["tokens_after"] == [7, 0] and shards[0]["gae_length"] == [11, 3]
+
+
+def test_no_tokens_after_key_when_absent():
+    _, data = _convert([make_sample(index=0)])
+    assert "tokens_after" not in data and "gae_length" not in data

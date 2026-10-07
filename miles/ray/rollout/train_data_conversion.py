@@ -35,6 +35,8 @@ ROLLOUT_DATA_VALUE_SPEC: dict[str, ValueSpec] = {
     "rewards": ValueSpec(codec="ndarray", dtype="float32"),
     "truncated": ValueSpec(codec="ndarray", dtype="int64"),
     "round_number": ValueSpec(codec="ndarray", dtype="int64"),
+    "tokens_after": ValueSpec(codec="ndarray", dtype="int64"),
+    "gae_length": ValueSpec(codec="ndarray", dtype="int64"),
     "sample_indices": ValueSpec(codec="ndarray", dtype="int64"),
     "rollout_ids": ValueSpec(codec="ndarray", dtype="int64"),
     "rollout_mask_sums": ValueSpec(codec="ndarray", dtype="int64"),
@@ -114,6 +116,15 @@ def convert_samples_to_train_data(
             )
             segment_ids.append(list(seg))
         train_data["segment_ids"] = segment_ids
+
+    # CompactionRL one-sample-per-segment layout (--gae-variant cross_segment_per_sample):
+    # tokens_after = N_{>s}; gae_length = optional length l for length-adaptive lambda.
+    if any(s.metadata and "tokens_after" in s.metadata for s in samples):
+        train_data["tokens_after"] = [int((s.metadata or {}).get("tokens_after", 0)) for s in samples]
+    if any(s.metadata and "gae_length" in s.metadata for s in samples):
+        train_data["gae_length"] = [
+            int((s.metadata or {}).get("gae_length") or s.response_length) for s in samples
+        ]
 
     train_data["rollout_mask_sums"] = _compute_rollout_mask_sums(train_data["rollout_ids"], loss_masks)
 
@@ -393,6 +404,8 @@ def _package_shards(args, data: dict[str, Any], partitions) -> list[dict[str, An
             "truncated",
             "loss_masks",
             "segment_ids",
+            "tokens_after",
+            "gae_length",
             "round_number",
             "sample_indices",
             "rollout_ids",

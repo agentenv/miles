@@ -1824,10 +1824,13 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--gae-variant",
                 type=str,
-                choices=["vanilla", "length_adaptive", "decoupled", "cross_segment"],
+                choices=["vanilla", "length_adaptive", "decoupled", "cross_segment", "cross_segment_per_sample"],
                 default="vanilla",
-                help="PPO GAE variant. cross_segment (CompactionRL) reads per-token segment ids from "
-                "sample.metadata['segment_ids']; without them it equals vanilla.",
+                help="PPO GAE variant. cross_segment_per_sample (CompactionRL, one sample per compaction "
+                "segment) runs local GAE per sample and multiplies the advantage by (gamma*lambda)^tokens_after "
+                "from sample.metadata['tokens_after'] (optional metadata 'gae_length' sets l for length-adaptive "
+                "lambda). cross_segment is the legacy one-sample-per-rollout layout reading per-token "
+                "sample.metadata['segment_ids'] (earlier segments get no terminal reward; deprecated).",
             )
             parser.add_argument(
                 "--gae-lambd-mode",

@@ -198,3 +198,64 @@ def test_cross_segment_rejects_decreasing_ids_and_unknown_variant():
         _run(values, rewards, term, masks, 1.0, 1.0, gae_variant="cross_segment", segment_ids_list=[[1, 1, 0, 0]])
     with pytest.raises(ValueError):
         _run(values, rewards, term, masks, 1.0, 1.0, gae_variant="bogus")
+
+
+# ---------------- cross_segment_per_sample (CompactionRL, one sample per segment) ----------------
+
+@pytest.mark.parametrize("masked", [False, True])
+@pytest.mark.parametrize("lambd_mode", ["fixed", "length_adaptive"])
+@pytest.mark.parametrize("with_gae_length", [False, True])
+def test_per_sample_matches_reference(masked, lambd_mode, with_gae_length):
+    values, rewards, term, masks = _batch(11, lengths=(6, 10, 3, 8), masked=masked)
+    after = [13, 0, 4, 1]
+    glen = [40, 10, 25, None] if with_gae_length else None
+    a, r = _run(values, rewards, term, masks, 0.95, 0.9, gae_variant="cross_segment_per_sample",
+                gae_lambd_mode=lambd_mode, tokens_after_list=after, gae_length_list=glen)
+    for i, (v, rw, t, m) in enumerate(zip(values, rewards, term, masks)):
+        idx, rr, vv = _ref_inputs(v, rw, t, m)
+        if not idx.numel():
+            continue
+        l_len = glen[i] if (glen and glen[i] is not None) else v.numel()
+        lam = ref.length_adaptive_lambda(l_len) if lambd_mode == "length_adaptive" else 0.9
+        ea, er = ref.gae_cross_segment_per_sample(rr, vv, after[i], 0.95, lam)
+        assert torch.allclose(a[i][idx], ea, atol=1e-12) and torch.allclose(r[i][idx], er, atol=1e-12)
+        assert torch.all(a[i][m == 0] == 0) and torch.all(r[i][m == 0] == 0)
+
+
+def test_per_sample_segments_of_one_rollout_reproduce_eq15():
+    # split one rollout into per-segment samples (R at every segment end); V = 0
+    g, l, R = 1.0, 0.7, 2.0
+    seg = [0, 0, 0, 1, 1, 2, 2, 2, 2]
+    T = len(seg)
+    parts = ref.split_rollout_into_segment_samples(torch.zeros(T, dtype=D), torch.zeros(T, dtype=D), seg, R)
+    values = [p[1] for p in parts]
+    rewards = [torch.zeros_like(p[1]) for p in parts]
+    masks = [torch.ones(p[1].numel(), dtype=torch.int) for p in parts]
+    a, _ = _run(values, rewards, [R] * len(parts), masks, g, l, gae_variant="cross_segment_per_sample",
+                tokens_after_list=[p[2] for p in parts])
+    flat = torch.cat(a)
+    assert torch.allclose(flat, torch.tensor([R * (g * l) ** (T - 1 - t) for t in range(T)], dtype=D), atol=1e-12)
+
+
+def test_per_sample_zero_after_equals_vanilla_and_requires_tokens_after():
+    values, rewards, term, masks = _batch(12, masked=True)
+    base_a, base_r = _run(values, rewards, term, masks, 0.97, 0.9, chunked=False)
+    a, r = _run(values, rewards, term, masks, 0.97, 0.9, gae_variant="cross_segment_per_sample",
+                tokens_after_list=[0] * len(values))
+    for i in range(len(values)):
+        assert torch.allclose(a[i], base_a[i], atol=1e-12) and torch.allclose(r[i], base_r[i], atol=1e-12)
+    with pytest.raises(ValueError):
+        _run(values, rewards, term, masks, 0.97, 0.9, gae_variant="cross_segment_per_sample")
+    with pytest.raises(ValueError):
+        _run(values, rewards, term, masks, 0.97, 0.9, gae_variant="cross_segment_per_sample",
+             tokens_after_list=[-1] * len(values))
+
+
+def test_compute_advantages_forwards_tokens_after_only_for_per_sample():
+    args = argparse.Namespace(gae_variant="cross_segment", gae_lambd_mode="fixed")
+    assert "tokens_after_list" not in adv_mod._gae_variant_kwargs(args, None, [1], [2])
+    args.gae_variant = "cross_segment_per_sample"
+    kw = adv_mod._gae_variant_kwargs(args, None, [1], [2])
+    assert kw["tokens_after_list"] == [1] and kw["gae_length_list"] == [2]
+    args.gae_variant = "vanilla"
+    assert adv_mod._gae_variant_kwargs(args, None, [1], [2]) == {}

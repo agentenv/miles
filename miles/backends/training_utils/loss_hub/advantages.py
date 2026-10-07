@@ -13,7 +13,7 @@ from miles.backends.training_utils.parallel import get_parallel_state
 from miles.utils.distributed_utils import distributed_masked_whiten
 
 
-def _gae_variant_kwargs(args: Namespace, segment_ids) -> dict:
+def _gae_variant_kwargs(args: Namespace, segment_ids, tokens_after=None, gae_length=None) -> dict:
     """Extra GAE-variant kwargs; empty (original call) when the variant is left at its defaults."""
     variant = getattr(args, "gae_variant", "vanilla")
     mode = getattr(args, "gae_lambd_mode", "fixed")
@@ -25,6 +25,11 @@ def _gae_variant_kwargs(args: Namespace, segment_ids) -> dict:
         gae_length_alpha=getattr(args, "gae_length_alpha", 1.5),
         gae_critic_lambd=getattr(args, "gae_critic_lambd", 1.0),
         segment_ids_list=segment_ids,
+        **(
+            dict(tokens_after_list=tokens_after, gae_length_list=gae_length)
+            if variant == "cross_segment_per_sample"
+            else {}
+        ),
     )
 
 
@@ -39,6 +44,8 @@ def compute_advantages(
     values: list[torch.Tensor] | None = None,
     max_seq_lens: list[int] | None = None,
     segment_ids: list | None = None,
+    tokens_after: list | None = None,
+    gae_length: list | None = None,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
     """Dispatch to the configured advantage estimator.
 
@@ -90,7 +97,7 @@ def compute_advantages(
             loss_masks=loss_masks,
             gamma=args.gamma,
             lambd=args.lambd,
-            **_gae_variant_kwargs(args, segment_ids),
+            **_gae_variant_kwargs(args, segment_ids, tokens_after, gae_length),
         )
 
     elif args.advantage_estimator == "reinforce_plus_plus":
