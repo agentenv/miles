@@ -18,6 +18,7 @@ from miles.backends.training_utils.weight_update.utils import get_data_replica_r
 from miles.utils import async_utils
 from miles.utils.distributed_lock import create_world_ticket_lock
 from miles.utils.distributed_utils import init_process_group
+from miles.utils.lora.utils import lora_rollout_enabled
 from miles.utils.workers.worker_handle import ExternalFailureError
 
 
@@ -31,6 +32,12 @@ class UpdateWeightFromDistributed(WeightTransferProtocol):
 
     def __init__(self, args: Namespace) -> None:
         super().__init__(args)
+        if lora_rollout_enabled(args):
+            # LoRA: gather the whole adapter (across PP) onto global rank 0 and send it over one group
+            # "miles-pp_0", as the colocated (cuda_ipc) and bridge paths do. A raw iterator would otherwise keep
+            # PP-local adapters (one sender + group per PP stage), a path with no e2e coverage, and the rank-0
+            # LoRA checksum record (--check-lora-weight-equal) needs the full adapter on rank 0.
+            self.required_placement = WeightUpdatePlacement(gather_pp=True)
         self._model_update_groups = None
         parallel_state = get_parallel_state()
         self._engine_lock: AbstractContextManager = (

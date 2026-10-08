@@ -285,9 +285,12 @@ class MegatronTrainRayActor(TrainRayActor):
         if update_weights:
             is_lora = lora_rollout_enabled(args)
             if is_lora and not args.colocate:
-                assert args.megatron_to_hf_mode == "bridge", (
+                # raw: the broadcast protocol gathers the adapter across PP (see UpdateWeightFromDistributed), so
+                # raw and bridge both send the full adapter from one sender; a raw model without a native LoRA
+                # exporter fails in HfWeightIteratorDirect._export_pp_local_lora.
+                assert args.megatron_to_hf_mode in ("bridge", "raw"), (
                     "LoRA weight sync over distributed engines requires "
-                    f"--megatron-to-hf-mode bridge (got {args.megatron_to_hf_mode!r})."
+                    f"--megatron-to-hf-mode bridge or raw (got {args.megatron_to_hf_mode!r})."
                 )
             self.weight_updater = WeightUpdater(
                 args,

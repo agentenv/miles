@@ -153,3 +153,36 @@ class TestUpdateWeightsWhenAnEngineFailsToJoin:
 
         reload.assert_called_once()
         destroy.assert_called_once()
+
+
+class TestDistributedLoraModeGuard:
+    """LoRA over distributed (non-colocated) engines: raw is allowed since the broadcast protocol gathers the
+    adapter across PP onto one sender; other modes are still refused."""
+
+    def _init(self, actor_module: ModuleType, mode: str, monkeypatch) -> MagicMock:
+        updater = MagicMock(name="WeightUpdater")
+        monkeypatch.setattr(actor_module, "WeightUpdater", updater)
+        monkeypatch.setattr(actor_module, "get_parallel_state", MagicMock())
+        monkeypatch.setattr(actor_module, "build_lora_config", MagicMock(return_value={}))
+        actor = SimpleNamespace(
+            args=Namespace(
+                model_name="qwen4_exp", lora_rank=16, colocate=False, megatron_to_hf_mode=mode,
+                lora_adapter_targets=["q_proj"],
+            ),
+            hf_config=SimpleNamespace(),
+            model=[MagicMock()],
+            _get_actor_weights=MagicMock(),
+        )
+        actor_module.MegatronTrainRayActor._init_weight_updater_and_publisher(
+            actor, update_weights=True, publish_snapshots=False
+        )
+        return updater
+
+    @pytest.mark.parametrize("mode", ["raw", "bridge"])
+    def test_raw_and_bridge_build_the_lora_updater(self, actor_module: ModuleType, mode: str, monkeypatch) -> None:
+        updater = self._init(actor_module, mode, monkeypatch)
+        assert updater.call_args.kwargs["is_lora"] is True
+
+    def test_other_modes_are_refused(self, actor_module: ModuleType, monkeypatch) -> None:
+        with pytest.raises(AssertionError, match="bridge or raw"):
+            self._init(actor_module, "hf", monkeypatch)
