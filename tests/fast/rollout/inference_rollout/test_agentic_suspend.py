@@ -194,3 +194,96 @@ async def test_samples_not_started_wait_for_the_next_rollout_instead_of_aborting
     state.release_new_samples()
     out = await asyncio.wait_for(task, 1.0)
     assert started == [5] and out.status == inference_rollout_common.Sample.Status.COMPLETED
+
+
+async def test_next_rollout_adopts_suspended_groups_tops_up_and_stamps_them(monkeypatch, engine) -> None:
+    """Two rollouts end to end through generate_rollout_async (engine/agent faked):
+    rollout 0 suspends its unfinished groups; rollout 1 adopts them, tops the
+    in-flight set up to the over-sampling size with new groups, and the carried
+    group's samples carry start_rollout_id 0."""
+    from miles.rollout.filter_hub.base_types import FilterOutput
+
+    calls: list[str] = []
+
+    async def fake_hook(_args, name: str):
+        calls.append(name)
+
+    gates: dict[int, asyncio.Event] = {}
+    submitted: list[int] = []
+
+    def fake_submit(state, samples, sample_done_callback=None):
+        tasks = []
+        for group in samples:
+            gi = group[0].group_index
+            submitted.append(gi)
+            gates[gi] = asyncio.Event()
+
+            async def run(group=group, gi=gi):
+                await gates[gi].wait()
+                for s in group:
+                    s.status = s.Status.COMPLETED
+                    s.reward = 1.0
+                return group
+
+            tasks.append(asyncio.create_task(run()))
+        return tasks
+
+    counter = iter(range(100))
+
+    def data_source(n):
+        out = []
+        for _ in range(n):
+            gi = next(counter)
+            out.append([inference_rollout_common.Sample(group_index=gi, index=gi * 10 + i, prompt="p",
+                                                        metadata={}) for i in range(2)])
+        return out
+
+    async def noop(*_a, **_k):
+        return None
+
+    monkeypatch.setattr(inference_rollout_train, "call_agent_hook", fake_hook)
+    monkeypatch.setattr(inference_rollout_train, "submit_generate_tasks", fake_submit)
+    monkeypatch.setattr(inference_rollout_train.dumper_utils, "configure_sglang", noop)
+    monkeypatch.setattr(inference_rollout_train, "recompute_samples_rollout_logprobs_via_prefill", noop)
+    monkeypatch.setattr(inference_rollout_train, "apply_preput_filters",
+                        lambda *_a, **_k: FilterOutput(keep=True, reason=None))
+    monkeypatch.setattr(inference_rollout_train, "load_function", lambda _p: None)
+    args = Namespace(
+        rollout_global_dataset=True, dynamic_sampling_filter_path=None, rollout_batch_size=2,
+        over_sampling_batch_size=4, n_samples_per_prompt=2, agentic_suspend_between_turns=True,
+        agentic_suspend_max_rounds=1, partial_rollout=False, sglang_router_ip="r", sglang_router_port=1,
+        use_miles_router=True, rollout_sample_filter_path=None, rollout_all_samples_process_path=None,
+        rollout_submission_granularity=None, reward_key=None, eval_reward_key=None,
+    )
+    state = SimpleNamespace(args=args, aborted=False, reset=lambda: None, sampling_params={})
+
+    async def release(*gis):
+        await asyncio.sleep(0.01)
+        for gi in gis:
+            gates[gi].set()
+
+    # rollout 0: 4 groups submitted, 0 and 1 finish -> 2 and 3 are suspended
+    releaser = asyncio.create_task(release(0, 1))
+    out0, aborted0 = await inference_rollout_train.generate_rollout_async(state, 0, data_source)
+    await releaser
+    assert [g[0].group_index for g in out0.samples] == [0, 1] and aborted0 == []
+    assert submitted == [0, 1, 2, 3] and set(inference_rollout_train._suspended(state).values()) == {0}
+    assert args.rollout_suspend_stats["suspended_groups"] == 2
+
+    # rollout 1: adopts 2 and 3, tops up with 4 and 5; 3 (carried) and 4 finish first
+    releaser = asyncio.create_task(release(3, 4))
+    out1, _ = await inference_rollout_train.generate_rollout_async(state, 1, data_source)
+    await releaser
+    assert submitted == [0, 1, 2, 3, 4, 5]
+    assert [g[0].group_index for g in out1.samples] == [3, 4]
+    carried = next(g for g in out1.samples if g[0].group_index == 3)
+    fresh = next(g for g in out1.samples if g[0].group_index == 4)
+    assert all(s.metadata["start_rollout_id"] == 0 for s in carried)
+    assert all("start_rollout_id" not in s.metadata for s in fresh)
+    assert args.rollout_resume_stats == {"resumed_groups": 2, "resumed_done_groups": 0}
+    # cut-off of rollout 1: group 2 (started 0) would be 2 rounds old -> cancelled
+    assert args.rollout_suspend_stats["over_age_cancelled_groups"] == 1
+    assert set(inference_rollout_train._suspended(state).values()) == {1}  # group 5 kept
+    assert calls == ["resume", "suspend", "resume", "suspend"]
+    for task in list(inference_rollout_train._suspended(state)):
+        task.cancel()

@@ -252,6 +252,14 @@ async def generate_rollout_async(
     started_at: dict = {}
     if suspend_mode:
         pendings, started_at = await resume(state, rollout_id)
+        # Over-sampling keeps --over-sampling-batch-size groups in flight: top the
+        # resumed groups up with new ones (the stock rule below only submits
+        # while pending < remaining budget, which resumed groups would block).
+        top_up = args.over_sampling_batch_size - len(pendings)
+        if pendings and top_up > 0:
+            samples = data_source(top_up)
+            scheduler.on_submit(samples)
+            pendings.update(submit_generate_tasks(state, samples, scheduler.sample_done_callback))
     data = []
     all_data = []
     do_print = True
