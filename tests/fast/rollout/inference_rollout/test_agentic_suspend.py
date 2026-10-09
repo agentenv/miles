@@ -270,6 +270,24 @@ async def test_next_rollout_adopts_suspended_groups_tops_up_and_stamps_them(monk
     assert submitted == [0, 1, 2, 3] and set(inference_rollout_train._suspended(state).values()) == {0}
     assert args.rollout_suspend_stats["suspended_groups"] == 2
 
+    # a group that finished after the target was reached is kept, not dropped
+    extra_state = SimpleNamespace(args=Namespace(**vars(args)), aborted=False, reset=lambda: None, sampling_params={})
+    submitted.clear()
+    releaser = asyncio.create_task(release(100, 101, 102))
+    counter_before = counter
+    out_x, _ = await inference_rollout_train.generate_rollout_async(
+        extra_state, 0, lambda n: [[inference_rollout_common.Sample(group_index=100 + i, index=1000 + 10 * i + j,
+                                                                    prompt="p", metadata={}) for j in range(2)]
+                                   for i in range(n)])
+    await releaser
+    kept = inference_rollout_train._suspended(extra_state)
+    assert len(out_x.samples) == 2 and len(kept) == 2
+    assert sum(1 for t in kept if t.done()) == extra_state.args.rollout_suspend_stats["suspended_done_groups"]
+    for task in list(kept):
+        task.cancel()
+    submitted[:] = [0, 1, 2, 3]
+    assert counter is counter_before
+
     # rollout 1: adopts 2 and 3, tops up with 4 and 5; 3 (carried) and 4 finish first
     releaser = asyncio.create_task(release(3, 4))
     out1, _ = await inference_rollout_train.generate_rollout_async(state, 1, data_source)
@@ -284,6 +302,6 @@ async def test_next_rollout_adopts_suspended_groups_tops_up_and_stamps_them(monk
     # cut-off of rollout 1: group 2 (started 0) would be 2 rounds old -> cancelled
     assert args.rollout_suspend_stats["over_age_cancelled_groups"] == 1
     assert set(inference_rollout_train._suspended(state).values()) == {1}  # group 5 kept
-    assert calls == ["resume", "suspend", "resume", "suspend"]
+    assert calls == ["resume", "suspend"] * 3
     for task in list(inference_rollout_train._suspended(state)):
         task.cancel()

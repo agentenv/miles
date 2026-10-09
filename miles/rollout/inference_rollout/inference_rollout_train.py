@@ -276,6 +276,11 @@ async def generate_rollout_async(
         done, pendings = await scheduler.wait_for_progress(pendings)
         logger.debug(f"[rollout] asyncio.wait returned: {len(done)} done, {len(pendings)} pending")
         for task in done:
+            if suspend_mode and len(data) >= target_data_size:
+                # enough groups already: keep this finished one for the next rollout
+                # (it is suspended like the unfinished ones) instead of dropping it
+                pendings.add(task)
+                continue
             try:
                 group: list[Sample] = task.result()
             except Exception as e:
