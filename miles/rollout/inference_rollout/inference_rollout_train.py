@@ -108,6 +108,41 @@ async def _abort_engines(args: Namespace) -> None:
             logger.warning(f"Failed to abort worker at {url}: {result}")
 
 
+SUSPEND_IDLE_WAIT_S = 30.0
+
+
+async def _engine_requests(args: Namespace) -> int | None:
+    """Requests running or queued on every engine (SGLang /get_load); None = unknown."""
+    try:
+        urls = await get_worker_urls(args)
+        total = 0
+        for url in urls:
+            entries = await get(f"{url}/get_load")
+            entries = entries if isinstance(entries, list) else [entries]
+            total += sum(int(e.get("num_reqs", 0)) for e in entries if isinstance(e, dict))
+        return total
+    except Exception as exc:  # noqa: BLE001 - unknown, logged
+        logger.warning(f"suspend: engine load unknown: {exc!r}")
+        return None
+
+
+async def _wait_engines_idle(args: Namespace) -> bool:
+    """After the aborts, wait until no request runs on any engine (a request that
+    passed the gate just before it closed is aborted again), so the engines can be
+    offloaded for training. False when not confirmed within SUSPEND_IDLE_WAIT_S."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + SUSPEND_IDLE_WAIT_S
+    while True:
+        load = await _engine_requests(args)
+        if load == 0:
+            return True
+        if loop.time() >= deadline:
+            logger.warning(f"suspend: engines not idle after {SUSPEND_IDLE_WAIT_S}s (load={load})")
+            return False
+        await _abort_engines(args)
+        await asyncio.sleep(SUSPEND_ENGINE_ABORT_INTERVAL_S)
+
+
 def _group_stats(group) -> tuple[int, int]:
     flat = [s for item in group for s in (item if isinstance(item, list) else [item])]
     return len(flat), sum(int(getattr(s, "response_length", 0) or 0) for s in flat)
@@ -138,6 +173,7 @@ async def suspend(state: GenerateState, pendings: set, rollout_id: int) -> dict:
         if attempt:
             await asyncio.sleep(SUSPEND_ENGINE_ABORT_INTERVAL_S)
         await _abort_engines(args)
+    quiet = await _wait_engines_idle(args)
     max_rounds = int(getattr(args, "agentic_suspend_max_rounds", 1))
     stats = {
         "suspended_groups": 0,
@@ -169,6 +205,7 @@ async def suspend(state: GenerateState, pendings: set, rollout_id: int) -> dict:
         stats["over_age_unknown_groups"] += 1
     if to_cancel:
         await asyncio.gather(*to_cancel, return_exceptions=True)
+    stats["engines_idle_confirmed"] = int(quiet)
     args.rollout_suspend_stats = stats
     logger.info(f"Suspended agentic groups at rollout {rollout_id}: {stats}")
     return stats
@@ -330,12 +367,18 @@ async def generate_rollout_async(
     )
 
     # there are still some unfinished requests, abort them
-    if suspend_mode:
+    num_rollout = getattr(args, "num_rollout", None)
+    last_rollout = isinstance(num_rollout, int) and num_rollout > 0 and rollout_id >= num_rollout - 1
+    if suspend_mode and not last_rollout:
         # keep them: suspended between model turns, continued next rollout
         await suspend(state, pendings, rollout_id)
         aborted_samples = []
     else:
+        # (the last rollout of the run suspends nothing: no later rollout would
+        # continue it; the agent's abort hook tears the trajectories down)
         aborted_samples = await abort(state, pendings, rollout_id)
+        if suspend_mode:
+            _suspended(state).clear()
 
     assert len(data) == args.rollout_batch_size, f"Got {len(data)} samples, expected {args.rollout_batch_size}"
     data = sorted(data, key=lambda group: group[0][0].index if isinstance(group[0], list) else group[0].index)

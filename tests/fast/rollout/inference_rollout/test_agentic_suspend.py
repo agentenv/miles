@@ -57,7 +57,9 @@ class FakeAgent:
 def engine(monkeypatch: pytest.MonkeyPatch):
     posted: list[str] = []
 
-    async def fake_get(url: str) -> dict:
+    async def fake_get(url: str):
+        if url.endswith("/get_load"):
+            return [{"num_reqs": 0, "num_waiting_reqs": 0}]
         return {"urls": ["http://w"]}
 
     async def fake_post(url: str, payload: dict) -> None:
@@ -104,6 +106,7 @@ async def test_cutoff_during_a_tool_call_waits_for_the_result_then_parks(monkeyp
     assert calls == ["suspend@0"] and len(engine) == inference_rollout_train.SUSPEND_ENGINE_ABORT_REPEATS
     assert not task.done() and not task.cancelled()  # the tool call is never interrupted
     assert stats["suspended_groups"] == 1 and stats["over_age_cancelled_groups"] == 0
+    assert stats["engines_idle_confirmed"] == 1
     assert state.args.rollout_suspend_stats == stats
     agent.finish_tool.set()  # the tool returns during the suspension
     for _ in range(5):
@@ -305,3 +308,88 @@ async def test_next_rollout_adopts_suspended_groups_tops_up_and_stamps_them(monk
     assert calls == ["resume", "suspend"] * 3
     for task in list(inference_rollout_train._suspended(state)):
         task.cancel()
+
+
+async def test_suspend_aborts_again_until_the_engines_are_idle(monkeypatch) -> None:
+    loads = [2, 1, 0]
+    posted: list[str] = []
+
+    async def fake_get(url: str):
+        if url.endswith("/get_load"):
+            return [{"num_reqs": loads.pop(0), "num_waiting_reqs": 0}]
+        return {"urls": ["http://w"]}
+
+    async def fake_post(url: str, payload: dict) -> None:
+        posted.append(url)
+
+    async def fake_hook(_args, _name):
+        return None
+
+    monkeypatch.setattr(inference_rollout_train, "get", fake_get)
+    monkeypatch.setattr(inference_rollout_train, "post", fake_post)
+    monkeypatch.setattr(inference_rollout_train, "call_agent_hook", fake_hook)
+    monkeypatch.setattr(inference_rollout_train, "SUSPEND_ENGINE_ABORT_INTERVAL_S", 0.0)
+    stats = await inference_rollout_train.suspend(_state(), set(), rollout_id=0)
+    # 3 initial aborts + one more per busy load reading
+    assert len(posted) == inference_rollout_train.SUSPEND_ENGINE_ABORT_REPEATS + 2
+    assert stats["engines_idle_confirmed"] == 1 and loads == []
+
+
+async def test_the_last_rollout_aborts_instead_of_suspending(monkeypatch, engine) -> None:
+    called: list[str] = []
+
+    async def fake_hook(_args, name):
+        called.append(name)
+
+    async def fake_abort(state, pendings, rollout_id):
+        called.append(f"abort:{len(pendings)}")
+        return []
+
+    async def noop(*_a, **_k):
+        return None
+
+    from miles.rollout.filter_hub.base_types import FilterOutput
+
+    gates = []
+
+    def fake_submit(state, samples, sample_done_callback=None):
+        tasks = []
+        for i, group in enumerate(samples):
+            ev = asyncio.Event()
+            gates.append(ev)
+            if len(gates) <= 2:
+                ev.set()
+
+            async def run(group=group, ev=ev):
+                await ev.wait()
+                for s in group:
+                    s.status = s.Status.COMPLETED
+                    s.reward = 1.0
+                return group
+
+            tasks.append(asyncio.create_task(run()))
+        return tasks
+
+    monkeypatch.setattr(inference_rollout_train, "call_agent_hook", fake_hook)
+    monkeypatch.setattr(inference_rollout_train, "abort", fake_abort)
+    monkeypatch.setattr(inference_rollout_train, "submit_generate_tasks", fake_submit)
+    monkeypatch.setattr(inference_rollout_train.dumper_utils, "configure_sglang", noop)
+    monkeypatch.setattr(inference_rollout_train, "recompute_samples_rollout_logprobs_via_prefill", noop)
+    monkeypatch.setattr(inference_rollout_train, "apply_preput_filters",
+                        lambda *_a, **_k: FilterOutput(keep=True, reason=None))
+    monkeypatch.setattr(inference_rollout_train, "load_function", lambda _p: None)
+    args = Namespace(
+        rollout_global_dataset=True, dynamic_sampling_filter_path=None, rollout_batch_size=2,
+        over_sampling_batch_size=4, n_samples_per_prompt=1, agentic_suspend_between_turns=True,
+        agentic_suspend_max_rounds=1, partial_rollout=False, num_rollout=6, sglang_router_ip="r", sglang_router_port=1,
+        rollout_submission_granularity=None, reward_key=None, eval_reward_key=None,
+        rollout_sample_filter_path=None, rollout_all_samples_process_path=None,
+    )
+    state = SimpleNamespace(args=args, aborted=False, reset=lambda: None, sampling_params={})
+    counter = iter(range(100))
+    source = lambda n: [[inference_rollout_common.Sample(group_index=(g := next(counter)), index=g, prompt="p",
+                                                         metadata={})] for _ in range(n)]
+    await inference_rollout_train.generate_rollout_async(state, 5, source)
+    assert called == ["resume", "abort:2"] and inference_rollout_train._suspended(state) == {}
+    for ev in gates:
+        ev.set()
