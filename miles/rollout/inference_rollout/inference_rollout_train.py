@@ -17,7 +17,7 @@ from miles.rollout.submission_scheduler import make_submission_scheduler
 from miles.utils import dumper_utils
 from miles.utils.function_registry import load_function
 from miles.utils.http_utils import get, post, router_worker_base_urls
-from miles.utils.misc import as_completed_async, call_agent_abort_hook
+from miles.utils.misc import call_agent_abort_hook
 from miles.utils.types import Sample
 
 logger = logging.getLogger(__name__)
@@ -44,9 +44,29 @@ async def abort(state: GenerateState, pendings: set, rollout_id: int) -> list[li
 
     # make sure all the pending tasks are finished
     aborted_samples = []
-    async for group in as_completed_async(pendings):
+    # Without partial rollout the drained groups are discarded; keep a tally of
+    # what was thrown away (groups, samples, generated response tokens) on
+    # ``args.rollout_abort_discard_stats`` for the all-samples hook (same keys as
+    # sglang_rollout.abort). A drained task that raised counts toward groups only
+    # (its tokens are unknown) and no longer fails the rollout: its group is
+    # discarded either way.
+    discard = {"groups": 0, "samples": 0, "response_tokens": 0, "unknown_groups": 0}
+    for task in asyncio.as_completed(pendings):
         if not args.partial_rollout:
+            discard["groups"] += 1
+            try:
+                group = await task
+                flat = [s for item in group for s in (item if isinstance(item, list) else [item])]
+                discard["samples"] += len(flat)
+                discard["response_tokens"] += sum(int(getattr(s, "response_length", 0) or 0) for s in flat)
+            except BaseException as exc:  # noqa: BLE001 - a failed surplus group is still discarded
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    raise  # the rollout itself is being cancelled
+                discard["unknown_groups"] += 1
+                logger.warning(f"Discarded aborted group raised {type(exc).__name__}: {exc}")
             continue
+        group = await task
 
         # for partial rollout, collect the partial samples into the data buffer
         for sample in group:
@@ -56,6 +76,9 @@ async def abort(state: GenerateState, pendings: set, rollout_id: int) -> list[li
 
     if args.partial_rollout:
         logger.info(f"Collected {sum(len(x) for x in aborted_samples)} partial samples into the data buffer")
+    else:
+        args.rollout_abort_discard_stats = discard
+        logger.info(f"Discarded aborted groups: {discard}")
 
     return aborted_samples
 
