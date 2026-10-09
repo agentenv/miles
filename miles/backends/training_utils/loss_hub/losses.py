@@ -23,6 +23,7 @@ from miles.backends.training_utils.loss_hub.math_utils import (
     compute_gmpo_loss,
     compute_gspo_kl,
     compute_opsm_mask,
+    compute_dual_clipfrac,
     compute_policy_loss,
     compute_sapo_loss,
     compute_sao_dis_policy_loss,
@@ -220,6 +221,7 @@ def policy_loss_function(
         advantages.new_zeros(()),
     )
 
+    dual_clipfrac = None
     dis_ratio = dis_below = dis_above = None
     if policy_objective == "sao_dis":
         if variant != "policy_loss":
@@ -237,6 +239,11 @@ def policy_loss_function(
             pg_loss, pg_clipfrac = compute_policy_loss(
                 ppo_kl, advantages, args.eps_clip, args.eps_clip_high, getattr(args, "eps_clip_c", None)
             )
+            if getattr(args, "eps_clip_c", None) is not None:
+                # rl-algo-supplement 2.3: share of tokens where the dual-clip lower bound is active
+                dual_clipfrac = compute_dual_clipfrac(
+                    ppo_kl, advantages, args.eps_clip, args.eps_clip_high, args.eps_clip_c
+                )
         elif variant == "cispo":
             pg_loss, pg_clipfrac = compute_cispo_loss(
                 ppo_kl, torch.where(active_tokens, log_probs, 0.0), advantages, args.eps_clip, args.eps_clip_high
@@ -449,6 +456,9 @@ def policy_loss_function(
         "ppo_kl": ppo_kl.clone().detach(),
         "ess_ratio": ess_ratio_sum.squeeze(),
     }
+    if dual_clipfrac is not None:
+        reported_loss["dual_clipfrac"] = sum_of_sample_mean(dual_clipfrac).clone().detach()
+
     if policy_objective == "sao_dis":
         reported_loss.update(
             {

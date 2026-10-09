@@ -277,6 +277,28 @@ def compute_policy_loss(
     return pg_losses, clipfrac
 
 
+def compute_dual_clipfrac(
+    ppo_kl: torch.Tensor,
+    advantages: torch.Tensor,
+    eps_clip: float,
+    eps_clip_high: float,
+    eps_clip_c: float,
+) -> torch.Tensor:
+    """Per-token indicator (float) that the dual-clip lower bound ``-c * A`` is the active term.
+
+    Mirrors :func:`compute_policy_loss` for ``A < 0``: the dual bound applies when
+    ``-c * A < max(-r * A, -clip(r) * A)``.  Observation only (eager, detached): it never
+    touches the loss, so the loss stays bitwise unchanged whether or not this is computed.
+    """
+    with torch.no_grad():
+        ratio = _safe_exp_neg_ppo_kl(ppo_kl)
+        pg_losses1 = -ratio * advantages
+        pg_losses2 = -ratio.clamp(1 - eps_clip, 1 + eps_clip_high) * advantages
+        clip_pg_losses1 = torch.maximum(pg_losses1, pg_losses2)
+        pg_losses3 = -eps_clip_c * advantages
+        return ((advantages < 0) & (pg_losses3 < clip_pg_losses1)).float()
+
+
 @torch.compile(dynamic=True)
 def compute_cispo_loss(
     ppo_kl: torch.Tensor,
