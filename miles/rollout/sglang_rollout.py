@@ -421,10 +421,24 @@ async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
 
     # make sure all the pending tasks are finished
     count = 0
+    # Without partial rollout the drained groups are discarded; keep a tally of
+    # what was thrown away (groups, samples, generated response tokens) on
+    # ``args.rollout_abort_discard_stats`` for the all-samples hook. A task that
+    # raised counts toward groups only (its tokens are unknown).
+    discard = {"groups": 0, "samples": 0, "response_tokens": 0, "unknown_groups": 0}
     while state.pendings:
         done, state.pendings = await asyncio.wait(state.pendings, return_when=asyncio.FIRST_COMPLETED)
 
         if not args.partial_rollout:
+            for task in done:
+                discard["groups"] += 1
+                try:
+                    group = task.result()
+                    flat = [s for item in group for s in (item if isinstance(item, list) else [item])]
+                    discard["samples"] += len(flat)
+                    discard["response_tokens"] += sum(int(getattr(s, "response_length", 0) or 0) for s in flat)
+                except BaseException:  # noqa: BLE001 - a failed task is still a discarded group
+                    discard["unknown_groups"] += 1
             continue
 
         # for partial rollout, collect the partial samples into the data buffer
@@ -438,6 +452,9 @@ async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
 
     if args.partial_rollout:
         logger.info(f"Collected {count} partial samples into the data buffer")
+    else:
+        args.rollout_abort_discard_stats = discard
+        logger.info(f"Discarded aborted groups: {discard}")
 
     return aborted_samples
 

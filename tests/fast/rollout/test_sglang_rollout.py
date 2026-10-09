@@ -56,3 +56,49 @@ class TestAbort:
         assert aborted_groups == [[sample]]
         assert sample.metadata["start_rollout_id"] == 23
         assert "Failed to abort worker at http://unresponsive: worker cannot answer" in caplog.text
+
+    async def test_abort_without_partial_rollout_tallies_discarded_groups(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Discarded (not buffered) groups are tallied: groups, samples, response tokens."""
+        args = Namespace(
+            partial_rollout=False,
+            sglang_router_ip="router",
+            sglang_router_port=30000,
+            use_miles_router=True,
+        )
+        state = SimpleNamespace(args=args, aborted=False)
+
+        async def fake_get(url: str) -> dict[str, list[str]]:
+            return {"urls": ["http://w"]}
+
+        async def fake_post(url: str, payload: dict[str, bool]) -> None:
+            return None
+
+        async def fake_agent_abort_hook(hook_args: Namespace) -> None:
+            return None
+
+        async def finish(lengths: list[int]) -> list[SimpleNamespace]:
+            return [SimpleNamespace(response="x", response_length=n, metadata={}) for n in lengths]
+
+        async def fail() -> list[SimpleNamespace]:
+            raise RuntimeError("agent crashed")
+
+        state.pendings = {
+            asyncio.create_task(finish([3, 5])),
+            asyncio.create_task(finish([7, 0])),
+            asyncio.create_task(fail()),
+        }
+        await asyncio.sleep(0)
+        monkeypatch.setattr(sglang_rollout, "GenerateState", lambda state_args: state)
+        monkeypatch.setattr(sglang_rollout, "get", fake_get)
+        monkeypatch.setattr(sglang_rollout, "post", fake_post)
+        monkeypatch.setattr(sglang_rollout, "call_agent_abort_hook", fake_agent_abort_hook)
+
+        assert await sglang_rollout.abort(args, rollout_id=4) == []
+        assert args.rollout_abort_discard_stats == {
+            "groups": 3,
+            "samples": 4,
+            "response_tokens": 15,
+            "unknown_groups": 1,
+        }
