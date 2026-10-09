@@ -60,6 +60,25 @@ async def call_agent_abort_hook(args) -> None:
         logger.warning(f"Agent abort hook {module_path}.abort failed: {e}")
 
 
+def load_agent_hook(args, name: str):
+    """The agent plugin's sibling ``name`` callable (same module as
+    ``--custom-agent-function-path``); raises when it is missing."""
+    agent_function_path = getattr(args, "custom_agent_function_path", None)
+    module_path, _, _ = (agent_function_path or "").rpartition(".")
+    if not module_path:
+        raise ValueError(f"agent hook {name!r} needs --custom-agent-function-path")
+    hook = load_function(f"{module_path}.{name}")
+    if hook is None:
+        raise AttributeError(f"agent module {module_path} defines no {name}() hook")
+    return hook
+
+
+async def call_agent_hook(args, name: str):
+    """Invoke a REQUIRED agent hook (``suspend`` / ``resume`` of
+    --agentic-suspend-between-turns); a failure propagates (fail closed)."""
+    return await load_agent_hook(args, name)(args)
+
+
 class SingletonMeta(type):
     """
     A metaclass for creating singleton classes.

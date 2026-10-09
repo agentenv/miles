@@ -17,7 +17,7 @@ from miles.rollout.submission_scheduler import make_submission_scheduler
 from miles.utils import dumper_utils
 from miles.utils.function_registry import load_function
 from miles.utils.http_utils import get, post, router_worker_base_urls
-from miles.utils.misc import call_agent_abort_hook
+from miles.utils.misc import call_agent_abort_hook, call_agent_hook
 from miles.utils.types import Sample
 
 logger = logging.getLogger(__name__)
@@ -83,6 +83,121 @@ async def abort(state: GenerateState, pendings: set, rollout_id: int) -> list[li
     return aborted_samples
 
 
+SUSPEND_ENGINE_ABORT_REPEATS = 3
+SUSPEND_ENGINE_ABORT_INTERVAL_S = 0.5
+
+
+def _suspended(state: GenerateState) -> dict:
+    """Groups suspended between model turns (--agentic-suspend-between-turns):
+    ``{task: start_rollout_id}``; lives on the persistent GenerateState so the
+    tasks (running on Miles' background event loop) cross the rollout boundary."""
+    suspended = getattr(state, "suspended_groups", None)
+    if suspended is None:
+        suspended = {}
+        state.suspended_groups = suspended
+    return suspended
+
+
+async def _abort_engines(args: Namespace) -> None:
+    urls = await get_worker_urls(args)
+    results = await asyncio.gather(
+        *[post(f"{url}/abort_request", {"abort_all": True}) for url in urls], return_exceptions=True
+    )
+    for url, result in zip(urls, results, strict=True):
+        if isinstance(result, Exception):
+            logger.warning(f"Failed to abort worker at {url}: {result}")
+
+
+def _group_stats(group) -> tuple[int, int]:
+    flat = [s for item in group for s in (item if isinstance(item, list) else [item])]
+    return len(flat), sum(int(getattr(s, "response_length", 0) or 0) for s in flat)
+
+
+async def suspend(state: GenerateState, pendings: set, rollout_id: int) -> dict:
+    """Cut-off under --agentic-suspend-between-turns: keep the unfinished groups.
+
+    1. The agent's ``suspend`` hook closes its model-turn gate: a tool call that
+       is running is NOT interrupted; when it returns, its result is written
+       into the conversation and the next model request waits at the gate.
+    2. The engines abort the model turns still in flight (repeated a few times
+       to catch a request that passed the gate just before it closed); the agent
+       retries such a turn after ``resume`` (an aborted turn is not recorded).
+    3. The pending group tasks are kept (not awaited) with the rollout that
+       started them; a group that could no longer be trained within
+       ``--agentic-suspend-max-rounds`` rollouts is cancelled (the agent
+       releases its environment) and counted.
+
+    Returns the stats also stored on ``args.rollout_suspend_stats``."""
+    args = state.args
+    suspended = _suspended(state)
+    hold = getattr(state, "hold_new_samples", None)
+    if callable(hold):
+        hold()  # samples not started yet wait for the next rollout
+    await call_agent_hook(args, "suspend")
+    for attempt in range(SUSPEND_ENGINE_ABORT_REPEATS):
+        if attempt:
+            await asyncio.sleep(SUSPEND_ENGINE_ABORT_INTERVAL_S)
+        await _abort_engines(args)
+    max_rounds = int(getattr(args, "agentic_suspend_max_rounds", 1))
+    stats = {
+        "suspended_groups": 0,
+        "suspended_done_groups": 0,
+        "over_age_cancelled_groups": 0,
+        "over_age_cancelled_samples": 0,
+        "over_age_cancelled_tokens": 0,
+        "over_age_unknown_groups": 0,
+    }
+    to_cancel = []
+    for task in pendings:
+        started = suspended.get(task, rollout_id)
+        if (rollout_id + 1) - started > max_rounds:
+            to_cancel.append(task)
+            suspended.pop(task, None)
+            continue
+        suspended[task] = started
+        stats["suspended_groups"] += 1
+        if task.done():
+            stats["suspended_done_groups"] += 1
+    for task in to_cancel:
+        stats["over_age_cancelled_groups"] += 1
+        if task.done() and not task.cancelled() and task.exception() is None:
+            samples, tokens = _group_stats(task.result())
+            stats["over_age_cancelled_samples"] += samples
+            stats["over_age_cancelled_tokens"] += tokens
+            continue
+        task.cancel()
+        stats["over_age_unknown_groups"] += 1
+    if to_cancel:
+        await asyncio.gather(*to_cancel, return_exceptions=True)
+    args.rollout_suspend_stats = stats
+    logger.info(f"Suspended agentic groups at rollout {rollout_id}: {stats}")
+    return stats
+
+
+async def resume(state: GenerateState, rollout_id: int) -> tuple[set, dict]:
+    """Start of a rollout under --agentic-suspend-between-turns: reopen the
+    agent's gate and adopt the suspended group tasks as pending."""
+    suspended = _suspended(state)
+    await call_agent_hook(state.args, "resume")
+    release = getattr(state, "release_new_samples", None)
+    if callable(release):
+        release()
+    adopted = set(suspended)
+    state.args.rollout_resume_stats = {
+        "resumed_groups": len(adopted),
+        "resumed_done_groups": sum(1 for t in adopted if t.done()),
+    }
+    return adopted, dict(suspended)
+
+
+def _stamp_start_rollout(group, started: int) -> None:
+    for item in group:
+        for sample in item if isinstance(item, list) else [item]:
+            metadata = getattr(sample, "metadata", None)
+            if isinstance(metadata, dict) and "start_rollout_id" not in metadata:
+                metadata["start_rollout_id"] = started
+
+
 async def get_worker_urls(args: Namespace):
     if parse(sglang_router.__version__) <= parse("0.2.1") or args.use_miles_router:
         response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/list_workers")
@@ -133,6 +248,10 @@ async def generate_rollout_async(
     scheduler = make_submission_scheduler(args, default="group")
 
     pendings = set()
+    suspend_mode = bool(getattr(args, "agentic_suspend_between_turns", False))
+    started_at: dict = {}
+    if suspend_mode:
+        pendings, started_at = await resume(state, rollout_id)
     data = []
     all_data = []
     do_print = True
@@ -152,8 +271,17 @@ async def generate_rollout_async(
             try:
                 group: list[Sample] = task.result()
             except Exception as e:
+                if suspend_mode:
+                    started_at.pop(task, None)
+                    _suspended(state).pop(task, None)
                 logger.error(f"[rollout] Task raised exception: {e!r}", exc_info=True)
                 continue
+
+            started = started_at.pop(task, None) if suspend_mode else None
+            if started is not None:
+                _suspended(state).pop(task, None)
+                if started < rollout_id:
+                    _stamp_start_rollout(group, started)
 
             if do_print:
                 sample = group[0][0] if isinstance(group[0], list) else group[0]
@@ -189,7 +317,12 @@ async def generate_rollout_async(
     )
 
     # there are still some unfinished requests, abort them
-    aborted_samples = await abort(state, pendings, rollout_id)
+    if suspend_mode:
+        # keep them: suspended between model turns, continued next rollout
+        await suspend(state, pendings, rollout_id)
+        aborted_samples = []
+    else:
+        aborted_samples = await abort(state, pendings, rollout_id)
 
     assert len(data) == args.rollout_batch_size, f"Got {len(data)} samples, expected {args.rollout_batch_size}"
     data = sorted(data, key=lambda group: group[0][0].index if isinstance(group[0], list) else group[0].index)

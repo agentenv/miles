@@ -872,6 +872,32 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--agentic-suspend-between-turns",
+                action="store_true",
+                default=False,
+                help=(
+                    "Agentic multi-turn rollouts (--custom-agent-function-path): at the over-sampling "
+                    "cut-off, suspend the unfinished trajectories between two model turns instead of "
+                    "discarding them, and continue them in the next rollout. The agent module must "
+                    "define async suspend(args) / resume(args): suspend closes the agent's model-turn "
+                    "gate (a tool call that is running finishes and its result is written back; the "
+                    "next model request waits at the gate), then the engines abort the model turns in "
+                    "flight (the agent retries such a turn after resume). Mutually exclusive with "
+                    "--partial-rollout."
+                ),
+            )
+            parser.add_argument(
+                "--agentic-suspend-max-rounds",
+                type=int,
+                default=1,
+                help=(
+                    "With --agentic-suspend-between-turns: a suspended trajectory may be continued in "
+                    "at most this many later rollouts after the one that started it; at a cut-off, "
+                    "suspended trajectories that could not be trained within that window are "
+                    "cancelled (the agent releases their environments) and counted."
+                ),
+            )
+            parser.add_argument(
                 "--max-weight-staleness",
                 type=int,
                 default=None,
@@ -3317,6 +3343,12 @@ def miles_validate_args(args):
     assert not (
         args.use_session_server and args.partial_rollout
     ), "--use-session-server does not support --partial-rollout"
+
+    if getattr(args, "agentic_suspend_between_turns", False):
+        assert not args.partial_rollout, "--agentic-suspend-between-turns is exclusive with --partial-rollout"
+        assert getattr(args, "custom_agent_function_path", None), "--agentic-suspend-between-turns requires --custom-agent-function-path"
+        assert args.use_session_server, "--agentic-suspend-between-turns requires --use-session-server"
+        assert args.agentic_suspend_max_rounds >= 1, "--agentic-suspend-max-rounds must be >= 1"
 
     if args.use_session_server == "v2":
         unsupported = [

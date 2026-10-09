@@ -55,6 +55,17 @@ class GenerateState:
     def reset(self) -> None:
         self.aborted = False
 
+    def hold_new_samples(self) -> None:
+        """--agentic-suspend-between-turns: samples that have not started yet wait
+        (instead of being aborted) until :meth:`release_new_samples`."""
+        self.new_samples_released = asyncio.Event()
+
+    def release_new_samples(self) -> None:
+        event = getattr(self, "new_samples_released", None)
+        if event is not None:
+            event.set()
+        self.new_samples_released = None
+
 
 async def generate_and_rm(
     state: GenerateState,
@@ -85,6 +96,9 @@ async def generate_and_rm(
     logger.debug(f"{log_prefix} Waiting for semaphore...")
     try:
         async with state.generate_fn_semaphore:
+            held = getattr(state, "new_samples_released", None)
+            if held is not None and not evaluation:
+                await held.wait()
             if state.aborted:
                 sample.status = Sample.Status.ABORTED
                 return sample
