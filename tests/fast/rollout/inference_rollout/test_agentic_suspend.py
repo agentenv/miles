@@ -302,6 +302,12 @@ async def test_next_rollout_adopts_suspended_groups_tops_up_and_stamps_them(monk
     assert all(s.metadata["start_rollout_id"] == 0 for s in carried)
     assert all("start_rollout_id" not in s.metadata for s in fresh)
     assert args.rollout_resume_stats == {"resumed_groups": 2, "resumed_done_groups": 0}
+    # over-sampling tally (yeto rl-algo-supplement 2.4): resumed groups are counted apart
+    m = {k.removeprefix("rollout/over_sampling/"): v for k, v in out1.metrics.items()
+         if k.startswith("rollout/over_sampling/")}
+    assert m["resumed_groups"] == 2 and m["submitted_groups"] == 2
+    assert (m["submitted_groups"] + m["resumed_groups"]
+            == m["completed_groups"] + m["failed_groups"] + m["inflight_groups_at_end"])
     # cut-off of rollout 1: group 2 (started 0) would be 2 rounds old -> cancelled
     assert args.rollout_suspend_stats["over_age_cancelled_groups"] == 1
     assert set(inference_rollout_train._suspended(state).values()) == {1}  # group 5 kept

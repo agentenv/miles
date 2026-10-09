@@ -289,12 +289,14 @@ async def generate_rollout_async(
     started_at: dict = {}
     if suspend_mode:
         pendings, started_at = await resume(state, rollout_id)
+        metric_gatherer.on_groups_resumed(len(pendings))
         # Over-sampling keeps --over-sampling-batch-size groups in flight: top the
         # resumed groups up with new ones (the stock rule below only submits
         # while pending < remaining budget, which resumed groups would block).
         top_up = args.over_sampling_batch_size - len(pendings)
         if pendings and top_up > 0:
             samples = data_source(top_up)
+            metric_gatherer.on_submit(len(samples))
             scheduler.on_submit(samples)
             pendings.update(submit_generate_tasks(state, samples, scheduler.sample_done_callback))
     data = []
@@ -305,6 +307,7 @@ async def generate_rollout_async(
         while scheduler.has_capacity(pending_groups=len(pendings), group_budget=target_data_size - len(data)):
             # get samples from the buffer and submit the generation requests.
             samples = data_source(args.over_sampling_batch_size)
+            metric_gatherer.on_submit(len(samples))
             scheduler.on_submit(samples)
             pendings.update(submit_generate_tasks(state, samples, scheduler.sample_done_callback))
 
@@ -324,6 +327,7 @@ async def generate_rollout_async(
                 if suspend_mode:
                     started_at.pop(task, None)
                     _suspended(state).pop(task, None)
+                metric_gatherer.on_group_failed()
                 logger.error(f"[rollout] Task raised exception: {e!r}", exc_info=True)
                 continue
 
@@ -345,9 +349,11 @@ async def generate_rollout_async(
 
             assert len(group) == args.n_samples_per_prompt
             all_data.append(group)
+            metric_gatherer.on_group_completed()
             metric_gatherer.on_group_before_dynamic_filter(args, group)
             filter_output = apply_preput_filters(args, dynamic_filter, group)
             if not filter_output.keep:
+                metric_gatherer.on_group_filtered()
                 metric_gatherer.on_dynamic_filter_drop(reason=filter_output.reason)
                 continue
 
@@ -355,9 +361,15 @@ async def generate_rollout_async(
             # NOTE: here we have not stored all the unused samples back to the data buffer.
             if len(data) < target_data_size:
                 data.append(group)
+                metric_gatherer.on_group_kept()
                 pbar.update(args.n_samples_per_prompt)
+            else:
+                metric_gatherer.on_group_surplus()
 
     pbar.close()
+    metric_gatherer.on_rollout_end(len(pendings))
+    # read by the all-samples hook like rollout_abort_discard_stats (yeto rl-algo-supplement 2.6)
+    args.rollout_over_sampling_stats = metric_gatherer.over_sampling_stats()
     sample = data[-1][0][0] if isinstance(data[-1][0], list) else data[-1][0]
     logger.info(
         "Finish rollout: text_preview=%s, label=%s, reward_summary=%s",
