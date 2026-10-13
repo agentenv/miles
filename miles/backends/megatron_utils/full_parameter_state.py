@@ -712,6 +712,29 @@ def apply_full_parameter_shard_values(
     return len(staged)
 
 
+def require_full_parameter_actor(args, action: str) -> None:
+    """Refuse a LoRA actor unless it opted into the LoRA hybrid profile.
+
+    A hybrid actor streams every ``requires_grad`` parameter (adapters plus
+    recipe-unfrozen base parameters); the rest of the profile (DP=1, FP32
+    optimizer masters for every trainable parameter) is unchanged.
+    """
+
+    from miles.utils.lora.utils import full_parameter_lora_hybrid_enabled, is_lora_enabled
+
+    hybrid = full_parameter_lora_hybrid_enabled(args)
+    if not is_lora_enabled(args):
+        if hybrid:
+            raise RuntimeError("--full-parameter-lora-hybrid requires a LoRA actor (--lora-rank > 0)")
+        return
+    if not hybrid:
+        raise RuntimeError(
+            f"full-parameter DiLoCo cannot {action} a LoRA actor without --full-parameter-lora-hybrid"
+        )
+    if getattr(args, "lora_base_cpu_backup", False):
+        raise RuntimeError("--full-parameter-lora-hybrid is incompatible with --lora-base-cpu-backup")
+
+
 def full_parameter_topology() -> FullParameterTopology:
     from miles.backends.training_utils.parallel import get_parallel_state
 
@@ -798,10 +821,7 @@ def full_parameter_shard_manifest(
 ) -> FullParameterShardManifest:
     """Describe this actor rank without copying any parameter payload."""
 
-    from miles.utils.lora.utils import is_lora_enabled
-
-    if is_lora_enabled(actor.args):
-        raise RuntimeError("full-parameter DiLoCo cannot describe a LoRA actor")
+    require_full_parameter_actor(actor.args, "describe")
     topology = full_parameter_topology()
     named_parameters, optimizer_owned = _actor_parameter_context(actor)
     specs, _masters = _specs_and_masters(
@@ -921,10 +941,7 @@ def full_parameter_optimizer_state(
 ) -> FullParameterOptimizerState:
     """Return a bounded proof of real optimizer progress on one actor rank."""
 
-    from miles.utils.lora.utils import is_lora_enabled
-
-    if is_lora_enabled(actor.args):
-        raise RuntimeError("full-parameter DiLoCo cannot inspect a LoRA actor")
+    require_full_parameter_actor(actor.args, "inspect")
     assert_full_parameter_boundary_clear(actor)
     installed = getattr(actor, "_external_full_policy_version", None)
     local_step_generation = getattr(
@@ -1128,10 +1145,7 @@ def record_full_parameter_local_step(
 ) -> FullParameterLocalStepReceipt:
     """Commit one local-step generation after exact scheduler progress."""
 
-    from miles.utils.lora.utils import is_lora_enabled
-
-    if is_lora_enabled(actor.args):
-        raise RuntimeError("full-parameter DiLoCo cannot record a LoRA actor")
+    require_full_parameter_actor(actor.args, "record")
     _reject_prepared_full_parameter_boundary_mutation(actor)
     if not _ROLE.fullmatch(role):
         raise RuntimeError("full-parameter local-step role is invalid")
@@ -1187,10 +1201,7 @@ def export_full_parameter_shard(
     local_step_generation: int = 0,
     role: str = "actor",
 ) -> FullParameterShardState:
-    from miles.utils.lora.utils import is_lora_enabled
-
-    if is_lora_enabled(actor.args):
-        raise RuntimeError("full-parameter DiLoCo cannot export a LoRA actor")
+    require_full_parameter_actor(actor.args, "export")
     assert_full_parameter_boundary_clear(actor)
     _validate_scheduler_tracking_congruence(actor)
     installed, generation, _exported, _anchor = _require_full_parameter_tracking(actor)
@@ -1217,10 +1228,7 @@ def validate_full_parameter_shard(
     *,
     role: str = "actor",
 ) -> int:
-    from miles.utils.lora.utils import is_lora_enabled
-
-    if is_lora_enabled(actor.args):
-        raise RuntimeError("full-parameter DiLoCo cannot validate a LoRA actor")
+    require_full_parameter_actor(actor.args, "validate")
     assert_full_parameter_boundary_clear(actor)
     _validate_scheduler_tracking_congruence(actor)
     if state.local_step_generation != 0:
@@ -1251,10 +1259,7 @@ def apply_full_parameter_shard(
     *,
     role: str = "actor",
 ) -> int:
-    from miles.utils.lora.utils import is_lora_enabled
-
-    if is_lora_enabled(actor.args):
-        raise RuntimeError("full-parameter DiLoCo cannot apply to a LoRA actor")
+    require_full_parameter_actor(actor.args, "apply to")
     _reject_prepared_full_parameter_boundary_mutation(actor)
     if state.local_step_generation != 0:
         raise RuntimeError("a global full-parameter cut cannot contain local steps")
@@ -1419,10 +1424,7 @@ def export_full_parameter_chunked_shard(
 ) -> FullParameterChunkedShardState:
     """Export bounded owner chunks without materializing a rank or global cut."""
 
-    from miles.utils.lora.utils import is_lora_enabled
-
-    if is_lora_enabled(actor.args):
-        raise RuntimeError("full-parameter DiLoCo cannot export a LoRA actor")
+    require_full_parameter_actor(actor.args, "export")
     assert_full_parameter_boundary_clear(actor)
     _validate_scheduler_tracking_congruence(actor)
     _validate_non_negative_integer(policy_version, "policy version")
@@ -1500,10 +1502,7 @@ def prepare_full_parameter_chunked_shard(
 ) -> int:
     """Validate every immutable chunk and stage only its refs for later commit."""
 
-    from miles.utils.lora.utils import is_lora_enabled
-
-    if is_lora_enabled(actor.args):
-        raise RuntimeError("full-parameter DiLoCo cannot prepare a LoRA actor")
+    require_full_parameter_actor(actor.args, "prepare")
     token = _validate_commit_token(commit_token)
     state_identity_hash = full_parameter_chunked_shard_identity(state)
     prepared = getattr(actor, "_external_full_parameter_prepared_cut", None)

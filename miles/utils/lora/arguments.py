@@ -116,6 +116,17 @@ def add_lora_arguments(parser):
         ),
     )
     parser.add_argument(
+        "--full-parameter-lora-hybrid",
+        action="store_true",
+        default=False,
+        help=(
+            "Let the full-parameter transport stream a LoRA actor: every trainable parameter "
+            "(the LoRA adapters plus any base parameters a recipe unfroze, e.g. DeepSeek V4 "
+            "clone experts) is one full-parameter shard. Requires LoRA and is incompatible "
+            "with --lora-base-cpu-backup (a restored base backup would undo applied cuts)."
+        ),
+    )
+    parser.add_argument(
         "--lora-train-only",
         action="store_true",
         default=False,

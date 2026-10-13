@@ -928,3 +928,50 @@ def test_chunked_export_rejects_unbounded_ray_objects(monkeypatch):
             max_chunk_bytes=FULL_PARAMETER_MAX_CHUNK_BYTES,
             ray_module=_FakeRay(),
         )
+
+
+def _manifest_actor(**args):
+    named = parameters()
+    masters = [parameter.main_param for _name, parameter in named]
+    actor = SimpleNamespace(
+        args=SimpleNamespace(lora_rank=0, lora_adapter_path=None, **args),
+        optimizer=SimpleNamespace(optimizer=SimpleNamespace(param_groups=[{"params": masters}], state={})),
+    )
+    return actor, named
+
+
+@pytest.mark.parametrize(
+    ("args", "message"),
+    [
+        ({"lora_rank": 8}, "without --full-parameter-lora-hybrid"),
+        ({"full_parameter_lora_hybrid": True}, "requires a LoRA actor"),
+        (
+            {"lora_rank": 8, "full_parameter_lora_hybrid": True, "lora_base_cpu_backup": True},
+            "incompatible with --lora-base-cpu-backup",
+        ),
+    ],
+)
+def test_lora_actor_needs_the_hybrid_profile(monkeypatch, args, message):
+    actor, named = _manifest_actor()
+    vars(actor.args).update(args)
+    monkeypatch.setattr(
+        "miles.backends.megatron_utils.full_parameter_state._named_actor_parameters",
+        lambda _actor: named,
+    )
+    monkeypatch.setattr("miles.backends.megatron_utils.full_parameter_state.full_parameter_topology", topology)
+    with pytest.raises(RuntimeError, match=message):
+        full_parameter_shard_manifest(actor)
+
+
+def test_lora_hybrid_actor_streams_every_trainable_parameter(monkeypatch):
+    actor, named = _manifest_actor(full_parameter_lora_hybrid=True, lora_base_cpu_backup=False)
+    actor.args.lora_rank = 8
+    monkeypatch.setattr(
+        "miles.backends.megatron_utils.full_parameter_state._named_actor_parameters",
+        lambda _actor: named,
+    )
+    monkeypatch.setattr("miles.backends.megatron_utils.full_parameter_state.full_parameter_topology", topology)
+
+    manifest = full_parameter_shard_manifest(actor)
+
+    assert [spec.name for spec in manifest.specs] == sorted(name for name, _parameter in named)

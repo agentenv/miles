@@ -22,6 +22,11 @@ def is_lora_enabled(args: Namespace) -> bool:
     return getattr(args, "lora_rank", 0) > 0 or getattr(args, "lora_adapter_path", None) is not None
 
 
+def full_parameter_lora_hybrid_enabled(args: Namespace) -> bool:
+    """LoRA actor whose full trainable set rides the full-parameter transport."""
+    return bool(getattr(args, "full_parameter_lora_hybrid", False))
+
+
 def is_qwen3_8_next_model(args: Namespace) -> bool:
     """Qwen3.8-Next (HF ``qwen4_exp``) trains through its own provider plugin; the recipe
     names the model ``qwen4_exp`` and points ``--custom-model-provider-path`` at the plugin."""
