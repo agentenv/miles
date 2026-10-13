@@ -11,6 +11,7 @@ from megatron.training.async_utils import maybe_finalize_async_save
 from torch_memory_saver import torch_memory_saver
 
 from miles.backends.megatron_utils.ft.types import TrainStepOutput
+from miles.backends.megatron_utils.full_parameter_state import assert_full_parameter_boundary_clear
 from miles.backends.megatron_utils.hf_export import save_hf_model
 from miles.backends.megatron_utils.lora.utils import is_lora_enabled, lora_rollout_enabled
 from miles.backends.megatron_utils.rematerialize_utils import build_main_cast_context
@@ -591,6 +592,8 @@ class MegatronTrainRayActor(TrainRayActor):
         external_data: TrainStepOutput | None = None,
     ) -> TrainStepOutput:
         self._heartbeat.bump()
+        # A pending full-parameter commit must resolve before any local step.
+        assert_full_parameter_boundary_clear(self)
         self._last_rollout_id = rollout_id
         if self.args.offload_train and self._asleep:
             self.wake_up()

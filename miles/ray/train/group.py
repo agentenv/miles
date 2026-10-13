@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from miles.backends.megatron_utils.ft.types import TrainStepOutcome, TrainStepOutput
+from miles.ray import full_parameter_transport
 from miles.ray.rollout.inference_controller import UpdatableEngines
 from miles.ray.specs.train import compute_trainer_num_cells, compute_trainer_pool_id
 from miles.ray.train.cell import TrainerCell
@@ -33,8 +34,8 @@ from miles.utils.tracking_utils.structured_log import log_structured
 from miles.utils.workers.cell_operations.base import BaseCellOperations
 from miles.utils.workers.rpc.common.wire_types import Pickled
 from miles.utils.workers.types import DeploymentIdentity
-from miles.utils.workers.worker_provider.base import BaseWorkerProvider, CellInfo, StopWatchFn
 from miles.utils.workers.worker_handle import ExternalFailureError
+from miles.utils.workers.worker_provider.base import BaseWorkerProvider, CellInfo, StopWatchFn
 from miles.utils.workers.worker_provider.utils import apply_cell_observation
 
 logger = logging.getLogger(__name__)
@@ -478,6 +479,44 @@ class TrainerController:
             [cell.execute("run_plugin", fn_path=fn_path, kwargs=kwargs) for cell in self._cells]
         )
         return [item for sublist in cell_results for item in sublist]
+
+    # -- full-parameter transport (yeto full-parameter DiLoCo) ----------------
+    # Every rank is reached through ``run_plugin``; see
+    # ``miles.ray.full_parameter_transport`` for the transaction protocol.
+
+    async def full_parameter_shard_manifests(self) -> tuple:
+        """Topology/spec metadata of every rank, without parameter payloads."""
+        return await full_parameter_transport.shard_manifests(self)
+
+    async def install_full_parameter_fragment_plans(self, plans: tuple) -> int:
+        """Install one exact-coverage fragment plan on every owner rank."""
+        return await full_parameter_transport.install_fragment_plans(self, plans)
+
+    async def export_full_parameter_chunked_cut(
+        self, policy_version: int, local_step_generation: int = 0, *, max_chunk_bytes: int
+    ):
+        """Export small descriptors and nested Ray ObjectRefs only."""
+        return await full_parameter_transport.export_chunked_cut(
+            self, policy_version, local_step_generation, max_chunk_bytes=max_chunk_bytes
+        )
+
+    async def apply_full_parameter_chunked_cut(
+        self, cut, *, commit_token: str | None = None, max_commit_attempts: int = 3
+    ) -> int:
+        """Prepare, idempotently converge, then finalize every rank."""
+        return await full_parameter_transport.apply_chunked_cut(
+            self, cut, commit_token=commit_token, max_commit_attempts=max_commit_attempts
+        )
+
+    async def record_full_parameter_local_step(self, *, base_policy_version: int, rollout_id: int) -> tuple:
+        """Record exact successful scheduler progress on every rank."""
+        return await full_parameter_transport.record_local_step(
+            self, base_policy_version=base_policy_version, rollout_id=rollout_id
+        )
+
+    async def full_parameter_optimizer_states(self) -> tuple:
+        """One bounded optimizer-progress proof from every rank."""
+        return await full_parameter_transport.optimizer_states(self)
 
     async def get_cell_statuses(self) -> dict[str, CellStatus]:
         return {cell_id: cell.cell_status() for cell_id, cell in list(self._cells_by_id.items())}
