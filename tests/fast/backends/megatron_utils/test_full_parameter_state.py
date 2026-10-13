@@ -975,3 +975,29 @@ def test_lora_hybrid_actor_streams_every_trainable_parameter(monkeypatch):
     manifest = full_parameter_shard_manifest(actor)
 
     assert [spec.name for spec in manifest.specs] == sorted(name for name, _parameter in named)
+
+
+
+def _stub_megatron_argument_imports(monkeypatch):
+    import sys
+    import types
+
+    for name, attributes in (
+        ("megatron.core.tokenizers.utils.build_tokenizer", {"vocab_size_with_padding": None}),
+        ("megatron.training.arguments", {"parse_args": None, "validate_args": None}),
+    ):
+        monkeypatch.setitem(sys.modules, name, types.SimpleNamespace(**attributes))
+    monkeypatch.delitem(sys.modules, "miles.backends.megatron_utils.arguments", raising=False)
+
+
+@pytest.mark.parametrize(("hybrid", "distributed"), [(False, True), (True, False)])
+def test_lora_hybrid_keeps_complete_fp32_masters(monkeypatch, hybrid, distributed):
+    _stub_megatron_argument_imports(monkeypatch)
+    from miles.backends.megatron_utils.arguments import set_default_megatron_args
+
+    args = SimpleNamespace(optimizer="adam", fp16=False, seq_length=128, full_parameter_lora_hybrid=hybrid)
+    try:
+        set_default_megatron_args(args)
+    except AttributeError:
+        pass  # later defaults read fields this stub omits; the optimizer choice is already made
+    assert args.use_distributed_optimizer is distributed
