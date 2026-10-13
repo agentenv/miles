@@ -990,14 +990,23 @@ def _stub_megatron_argument_imports(monkeypatch):
     monkeypatch.delitem(sys.modules, "miles.backends.megatron_utils.arguments", raising=False)
 
 
+def _megatron_default_args(**overrides):
+    """Every field ``set_default_megatron_args`` reads, for a non-DSV4 Adam run."""
+
+    values = dict(
+        optimizer="adam", fp16=False, seq_length=128, multi_latent_attention=False, rope_type="rope",
+        vocab_size=0, padded_vocab_size=None, tokenizer_model="tok", tokenizer_type="HuggingFaceTokenizer",
+        hf_checkpoint="/models/x", spec=None,
+    )
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
 @pytest.mark.parametrize(("hybrid", "distributed"), [(False, True), (True, False)])
 def test_lora_hybrid_keeps_complete_fp32_masters(monkeypatch, hybrid, distributed):
     _stub_megatron_argument_imports(monkeypatch)
     from miles.backends.megatron_utils.arguments import set_default_megatron_args
 
-    args = SimpleNamespace(optimizer="adam", fp16=False, seq_length=128, full_parameter_lora_hybrid=hybrid)
-    try:
-        set_default_megatron_args(args)
-    except AttributeError:
-        pass  # later defaults read fields this stub omits; the optimizer choice is already made
+    args = _megatron_default_args(full_parameter_lora_hybrid=hybrid)
+    set_default_megatron_args(args)
     assert args.use_distributed_optimizer is distributed

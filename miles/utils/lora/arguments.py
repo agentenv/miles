@@ -123,7 +123,9 @@ def add_lora_arguments(parser):
             "Let the full-parameter transport stream a LoRA actor: every trainable parameter "
             "(the LoRA adapters plus any base parameters a recipe unfroze, e.g. DeepSeek V4 "
             "clone experts) is one full-parameter shard. Requires LoRA and is incompatible "
-            "with --lora-base-cpu-backup (a restored base backup would undo applied cuts)."
+            "with --lora-base-cpu-backup (a restored base backup would undo applied cuts). "
+            "Cost: every weight update then also sends base weights, by default all of them; "
+            "a model recipe should narrow the base export to its trainable parameters."
         ),
     )
     parser.add_argument(
