@@ -1,20 +1,6 @@
-from dataclasses import dataclass
-from enum import auto
+# Re-export: the train-step types moved to ``miles.utils.train_step_types`` so
+# that light actors (event logger, HTTP utils) do not import the whole
+# ``miles.backends.megatron_utils`` package.
+from miles.utils.train_step_types import TrainStepOutcome, TrainStepOutput
 
-from miles.utils.object_store import StoreObjectRef
-
-try:
-    from enum import StrEnum
-except ImportError:
-    from backports.strenum import StrEnum
-
-
-class TrainStepOutcome(StrEnum):
-    NORMAL = auto()
-    DISCARDED_SHOULD_RETRY = auto()
-
-
-@dataclass(frozen=True)
-class TrainStepOutput:
-    outcome: TrainStepOutcome
-    values: StoreObjectRef | None = None
+__all__ = ["TrainStepOutcome", "TrainStepOutput"]

@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import socket
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Generic, TypeVar
@@ -135,6 +136,40 @@ def get_free_port(start_port=10000, consecutive=1):
     raise RuntimeError(f"No {consecutive} consecutive free ports in [{lowest_start}, {_MAX_PORT}]")
 
 
+# Ports this process probed free and keeps bound until their real user binds them.
+_HELD_PORTS: dict[int, socket.socket] = {}
+
+
+def hold_port(port: int) -> None:
+    """Keep ``port`` bound (not listening) in this process so nothing else takes it.
+
+    The probe in :func:`get_free_port` closes its socket, so between the probe
+    and the real bind another process can take the port (an explicit bind, or
+    the kernel handing it out as an ephemeral port).  A held socket blocks both.
+    It sets SO_REUSEADDR and never listens, so a later SO_REUSEADDR listener on
+    the same port (torch's TCPStore) still binds while the hold is open.
+    """
+    if port in _HELD_PORTS:
+        return
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("", port))
+    except OSError:
+        sock.close()
+        raise
+    _HELD_PORTS[port] = sock
+
+
+def release_held_port(port: int) -> bool:
+    """Close the hold on ``port``; return whether this process held it."""
+    sock = _HELD_PORTS.pop(port, None)
+    if sock is None:
+        return False
+    sock.close()
+    return True
+
+
 def get_gpu_uuids(gpu_ids: list[int]) -> list[str | None]:
     """Best-effort NVML UUIDs so the dashboard can reconcile GPU index
     spaces across processes; None entries when NVML is unavailable."""
@@ -175,8 +210,12 @@ class NodeProbeMixin:
         return get_node_external_ip()
 
     @staticmethod
-    def _get_free_port_block(*, start_port: int, count: int) -> int:
-        return get_free_port(start_port=start_port, consecutive=count)
+    def _get_free_port_block(*, start_port: int, count: int, hold: bool = False) -> int:
+        port = get_free_port(start_port=start_port, consecutive=count)
+        if hold:
+            for offset in range(count):
+                hold_port(port + offset)
+        return port
 
     @staticmethod
     def _to_local_gpu_ids(*, gpu_ids: list[int]) -> list[int]:

@@ -635,8 +635,13 @@ class _BaseActorManager(Generic[SpecT]):
             if self.worker_in_cell_index != 0 and port_info.mode == "master":
                 continue
             if port_info.allow_dynamic:
+                # The master port is bound much later (the cell's init_process_group);
+                # the worker holds it until then so nothing else on the node takes it.
                 port = await self.manager.port_allocator.alloc(
-                    self.actor_handle, node_ip=node_ip, consecutive=port_info.num_consecutive
+                    self.actor_handle,
+                    node_ip=node_ip,
+                    consecutive=port_info.num_consecutive,
+                    hold=port_info.mode == "master",
                 )
             else:
                 port = port_info.static_port + (self.parent.cell_index if port_info.offset_by_cell else 0)

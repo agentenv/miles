@@ -11,7 +11,6 @@ import torch
 import torch.distributed as dist
 
 import miles.utils.eval_config
-from miles.backends.megatron_utils.ft.types import TrainStepOutput
 from miles.ray.rollout.inference_controller import UpdatableEngines
 from miles.utils import object_store
 from miles.utils.audit_utils.process_identity import TrainProcessIdentity
@@ -23,10 +22,11 @@ from miles.utils.ft_utils.indep_dp import IndepDPInfo
 from miles.utils.init_once import InitOnce, init_once
 from miles.utils.logging_utils import configure_logger, rebind_env_reporting
 from miles.utils.memory_utils import clear_memory, print_memory
-from miles.utils.misc import NodeProbeMixin, get_current_node_ip, get_free_port
+from miles.utils.misc import NodeProbeMixin, get_current_node_ip, get_free_port, release_held_port
 from miles.utils.object_store import StoreObjectRef
 from miles.utils.test_utils.det_process_group import DET_NCCL_BACKEND_NAME, register_det_nccl_backend
 from miles.utils.test_utils.fault_injector import inject_fault as _inject_fault
+from miles.utils.train_step_types import TrainStepOutput
 from miles.utils.workers.env_vars import CELL_INDEX_ENV_VAR
 from miles.utils.workers.rpc.common.metadata import rpc
 from miles.utils.workers.rpc.common.wire_types import Pickled
@@ -86,6 +86,8 @@ class TrainRayActor(NodeProbeMixin):
         return get_current_node_ip(), get_free_port(start_port=random.randint(20000, 21000))
 
     def configure_master_addr_and_port(self, *, master_addr: str, master_port: int) -> None:
+        # rank 0 held this port since allocation; free it for init_process_group
+        release_held_port(master_port)
         os.environ["MASTER_ADDR"] = master_addr
         os.environ["MASTER_PORT"] = str(master_port)
 

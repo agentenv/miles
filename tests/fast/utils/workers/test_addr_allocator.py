@@ -42,6 +42,21 @@ class TestPortAllocator:
         assert second > first
         assert cursors._next_port_of_ip["10.0.0.1"] == second + 1
 
+    async def test_only_a_hold_request_asks_the_actor_to_hold(self):
+        """The master port is held by its worker; other probes keep the old call so every actor still accepts it."""
+        actor = MagicMock()
+
+        async def _probe(**kwargs):
+            return 20000
+
+        actor._get_free_port_block.remote.side_effect = _probe
+        cursors = PortAllocator()
+        await cursors.alloc(actor, node_ip="10.0.0.1")
+        await cursors.alloc(actor, node_ip="10.0.0.1", hold=True)
+        calls = [c.kwargs for c in actor._get_free_port_block.remote.call_args_list]
+        assert "hold" not in calls[0]
+        assert calls[1]["hold"] is True
+
     async def test_alloc_starts_from_the_base_port_on_an_unseen_node(self):
         """A node with no cursor yet starts at the base port, away from ray's range."""
         cursors = PortAllocator()

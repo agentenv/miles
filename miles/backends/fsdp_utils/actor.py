@@ -8,7 +8,6 @@ import torch.distributed as dist
 from tqdm import tqdm
 
 from miles.backends.fsdp_utils.adaptations import routing_replay
-from miles.backends.megatron_utils.ft.types import TrainStepOutcome, TrainStepOutput
 from miles.backends.training_utils.ci_utils import check_grad_norm
 from miles.backends.training_utils.data import DataIterator, get_batch, get_data_iterator, get_rollout_data
 from miles.backends.training_utils.log_utils import (
@@ -35,6 +34,7 @@ from miles.utils.processing_utils import load_processor, load_tokenizer
 from miles.utils.profile_utils import TrainProfiler
 from miles.utils.timer import Timer, inverse_timer, timer
 from miles.utils.tracking_utils.tracking import init_tracking
+from miles.utils.train_step_types import TrainStepOutcome, TrainStepOutput
 from miles.utils.workers.rpc.common.wire_types import Pickled
 
 from . import checkpoint

@@ -508,3 +508,39 @@ class TestMutableBox:
         first.value = 7
 
         assert second.value == 0
+
+
+class TestHoldPort:
+    """Defect 9: a probed-free port was taken before its user bound it (critic EADDRINUSE)."""
+
+    def test_a_held_block_refuses_other_binders_until_released(self) -> None:
+        start_port = get_free_port(start_port=23000, consecutive=2)
+        first_port = NodeProbeMixin._get_free_port_block(start_port=start_port, count=2, hold=True)
+        try:
+            for port in (first_port, first_port + 1):
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as intruder:
+                    with pytest.raises(OSError):
+                        intruder.bind(("", port))
+        finally:
+            assert misc.release_held_port(first_port) and misc.release_held_port(first_port + 1)
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as user:
+            user.bind(("", first_port))
+
+    def test_a_reuseaddr_listener_still_binds_a_held_port(self) -> None:
+        """torch's TCPStore listens with SO_REUSEADDR, so it binds even before the hold is released."""
+        port = NodeProbeMixin._get_free_port_block(start_port=get_free_port(start_port=23500), count=1, hold=True)
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                listener.bind(("", port))
+                listener.listen(1)
+        finally:
+            misc.release_held_port(port)
+
+    def test_releasing_a_port_that_is_not_held_is_a_no_op(self) -> None:
+        assert misc.release_held_port(1) is False
+
+    def test_without_hold_the_probe_keeps_nothing_bound(self) -> None:
+        port = NodeProbeMixin._get_free_port_block(start_port=get_free_port(start_port=24000), count=1)
+        assert port not in misc._HELD_PORTS

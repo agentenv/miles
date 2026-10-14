@@ -15,16 +15,20 @@ class PortAllocator:
     _next_port_of_ip: dict[str, int] = field(default_factory=dict)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
-    async def alloc(self, actor, *, node_ip: str, consecutive: int = 1) -> int:
+    async def alloc(self, actor, *, node_ip: str, consecutive: int = 1, hold: bool = False) -> int:
+        """Probe a free block on ``actor``'s node; ``hold`` keeps it bound in that actor until released."""
         async with self._lock:
             # use small ports to prevent ephemeral port between 32768 and 65536.
             # also, ray uses port 10002-19999, thus we avoid near-10002 to avoid racing condition
             start_port = self._next_port_of_ip.get(node_ip, self.dynamic_port_start)
             if start_port + consecutive - 1 > _MAX_PORT:
                 start_port = self.dynamic_port_start
+            # only pass ``hold`` when set: other actors' probes do not take it
+            hold_kwargs = {"hold": True} if hold else {}
             port: int = await actor._get_free_port_block.remote(
                 start_port=start_port,
                 count=consecutive,
+                **hold_kwargs,
             )
             self._next_port_of_ip[node_ip] = port + consecutive
             return port

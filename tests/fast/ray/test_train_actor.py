@@ -7,6 +7,7 @@ import pytest
 from miles.ray import placement_group, train_actor
 from miles.ray.train_actor import TrainRayActor
 from miles.utils.init_once import InitOnce
+from miles.utils.misc import NodeProbeMixin
 from miles.utils.workers.env_vars import CELL_INDEX_ENV_VAR, SUBPROCESS_INDEX_ENV_VAR
 
 
@@ -93,6 +94,17 @@ class TestConfigureMasterAddrAndPort:
 
         assert os.environ["MASTER_ADDR"] == "10.0.0.1"
         assert os.environ["MASTER_PORT"] == "20001"
+
+    def test_configuring_the_master_port_releases_its_hold(self, monkeypatch: pytest.MonkeyPatch):
+        """Rank 0 held the port since allocation; init_process_group must find it free."""
+        monkeypatch.delenv("MASTER_PORT", raising=False)
+        start_port = train_actor.get_free_port(start_port=24500)
+        port = NodeProbeMixin._get_free_port_block(start_port=start_port, count=1, hold=True)
+
+        self._make_actor().configure_master_addr_and_port(master_addr="127.0.0.1", master_port=port)
+
+        with socket.socket() as plain:
+            plain.bind(("", port))
 
     def test_a_stale_master_addr_and_port_are_overwritten(self, monkeypatch: pytest.MonkeyPatch):
         """A worker inheriting another run's env must end up on the addr/port the driver assigned."""

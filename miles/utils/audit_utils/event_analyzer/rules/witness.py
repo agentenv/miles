@@ -3,7 +3,6 @@ from collections import defaultdict
 from collections.abc import Callable, Hashable, Iterator, Sequence
 from typing import Protocol, TypeVar
 
-from miles.backends.megatron_utils.ft.types import TrainStepOutcome
 from miles.utils.audit_utils.event_logger.models import (
     Event,
     TrainAdvantageComputationEvent,
@@ -12,6 +11,7 @@ from miles.utils.audit_utils.event_logger.models import (
     WitnessSnapshotParamEvent,
 )
 from miles.utils.pydantic_utils import FrozenStrictBaseModel
+from miles.utils.train_step_types import TrainStepOutcome
 
 logger = logging.getLogger(__name__)
 
