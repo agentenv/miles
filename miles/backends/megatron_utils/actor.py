@@ -9,6 +9,7 @@ import torch.distributed as dist
 from megatron.training.async_utils import maybe_finalize_async_save
 from torch_memory_saver import torch_memory_saver
 
+import miles.backends.megatron_utils.runtime_patches  # noqa: F401  (DeepEP buffers stay out of torch_memory_saver)
 from miles.backends.megatron_utils.checkpoint_request import MegatronCkptLoadConfig
 from miles.backends.megatron_utils.hf_export import save_hf_model
 from miles.backends.megatron_utils.lora.bridge_adapter_slots import BridgeAdapterSlots
