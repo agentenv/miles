@@ -2,6 +2,7 @@ import dataclasses
 import inspect
 import itertools
 
+from miles.backends.megatron_utils import runtime_patches  # noqa: F401  (deep_ep, bridge plugins)
 from miles.backends.megatron_utils.update_weight.hf_weight_iterator import (
     MegatronHfWeightIteratorBase,
     _iter_mm_tower_units,

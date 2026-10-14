@@ -15,6 +15,7 @@ from megatron.core.tensor_parallel import ColumnParallelLinear
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.utils import get_attr_wrapped_model
 
+from miles.backends.megatron_utils import runtime_patches  # noqa: F401  (deep_ep, bridge plugins)
 from miles.backends.megatron_utils.lora.slots import create_multi_lora_instance
 from miles.backends.megatron_utils.lora.target_modules import resolve_megatron_lora_targets
 from miles.backends.megatron_utils.lora.utils import (

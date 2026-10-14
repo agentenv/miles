@@ -32,6 +32,27 @@ def test_light_actor_modules_do_not_import_the_training_stack():
     assert json.loads(out.strip().splitlines()[-1]) == []
 
 
+# RayWorkerManager unpickles PlacementGroupInfo and worker specs; their modules
+# import the light ``megatron_utils`` submodules (``megatron_config``,
+# ``checkpoint_tracker``), so the package ``__init__`` must stay light too.
+UNPICKLED_BY_LIGHT_ACTORS = (
+    "miles.ray.placement_group",
+    "miles.ray.specs.train",
+)
+HEAVY_PREFIXES = ("megatron.bridge", "modelopt", "miles_plugins.megatron_bridge", "deep_ep")
+
+
+def test_modules_unpickled_by_light_actors_do_not_import_bridge_or_patches():
+    code = (
+        "import importlib, json, sys\n"
+        f"for name in {UNPICKLED_BY_LIGHT_ACTORS!r}:\n"
+        "    importlib.import_module(name)\n"
+        f"print(json.dumps(sorted(m for m in sys.modules if m.startswith({HEAVY_PREFIXES!r}))))\n"
+    )
+    out = subprocess.run([sys.executable, "-c", code], check=True, capture_output=True, text=True).stdout
+    assert json.loads(out.strip().splitlines()[-1]) == []
+
+
 def test_old_train_step_types_path_still_works():
     from miles.backends.megatron_utils.ft import types as old
     from miles.utils import train_step_types as new

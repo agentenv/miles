@@ -10,6 +10,7 @@ import torch.distributed as dist
 from megatron.training.async_utils import maybe_finalize_async_save
 from torch_memory_saver import torch_memory_saver
 
+from miles.backends.megatron_utils import runtime_patches  # noqa: F401  (deep_ep, bridge plugins)
 from miles.backends.megatron_utils.ft.types import TrainStepOutput
 from miles.backends.megatron_utils.full_parameter_state import assert_full_parameter_boundary_clear
 from miles.backends.megatron_utils.hf_export import save_hf_model

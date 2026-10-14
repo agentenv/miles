@@ -8,6 +8,7 @@ from pathlib import Path
 import torch
 from megatron.core.distributed import DistributedDataParallel as DDP
 
+from miles.backends.megatron_utils import runtime_patches  # noqa: F401  (deep_ep, bridge plugins)
 from miles.backends.megatron_utils.lora.utils import is_lora_model
 from miles.backends.megatron_utils.named_weights import named_params_and_buffers
 from miles.backends.training_utils.checkpoint_io import write_checkpoint_dir

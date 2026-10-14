@@ -106,6 +106,8 @@ def normalize_lora_targets_to_hf(hf_checkpoint, target_modules, *, canonical, ex
     # Only legacy Megatron selectors need Bridge before trainer creation.
     from megatron.bridge import AutoBridge
 
+    from miles.backends.megatron_utils import runtime_patches  # noqa: F401  (registers miles bridges)
+
     bridge = AutoBridge.from_hf_pretrained(hf_checkpoint, trust_remote_code=True)
     hf_mapping = HfWeightMapping.from_config(bridge.hf_pretrained.config)
     model_bridge = bridge._model_bridge
