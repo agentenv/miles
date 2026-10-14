@@ -16,6 +16,7 @@ from megatron.core.transformer.spec_utils import import_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import core_transformer_config_from_args
 
+import miles.backends.megatron_utils.runtime_patches  # noqa: F401  (DeepEP buffers stay out of torch_memory_saver)
 from miles.backends.training_utils.model_companion import ModelCompanionInstallationUtils
 from miles.utils.args.custom_view import compute_custom_function_config
 from miles.utils.args.runtime import TrainerConfig
