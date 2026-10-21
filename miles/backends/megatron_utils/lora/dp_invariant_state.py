@@ -68,6 +68,9 @@ def list_named_training_state_files(checkpoint_dir: Path, *, tp_rank: int, pp_ra
 # * Megatron DistributedOptimizer: each DP rank owns a contiguous slice of every bucket, i.e. a sub-range of some
 #   parameters (``gbuf_ranges[..]["param_map"][model_param]["param"]``); main shard + state come from
 #   ``_get_main_param_and_optimizer_states``.
+# A DistributedOptimizer with --optimizer-cpu-offload (Megatron requires --use-precision-aware-optimizer with it) runs a
+# HybridDeviceOptimizer (HDO) whose fp32 masters ("master_param") and moments are standalone tensors, mostly on the
+# host; it is covered when every optimizer dtype is fp32 (nothing scaled), see ``_hybrid_offload``.
 # ChainedOptimizer is unwrapped into its members. Saving writes each rank's slots keyed by parameter name with their
 # ranges; loading merges every DP shard of one (tp, pp) coordinate into full flat tensors (gather) and slices out
 # the ranges the new rank owns (reshard). No collective is needed: the checkpoint directory is the gather point.
@@ -123,9 +126,53 @@ def _torch_slots(torch_optimizer: torch.optim.Optimizer, main_to_model: Mapping[
     return slots
 
 
+# HybridDeviceOptimizer construction settings Megatron passes as optimizer defaults; torch copies them into every
+# param group, but they are wiring (classes, flags), not hyperparameters of the update.
+_HDO_WIRING_KEYS = frozenset(
+    {
+        "offload_fraction",
+        "cpu_optimizer_cls",
+        "gpu_optimizer_cls",
+        "param_update_in_fp32",
+        "pin_cpu_grads",
+        "pin_cpu_params",
+        "overlap_cpu_optimizer_d2h_h2d",
+    }
+)
+
+
+def _hybrid_offload(leaf: Any) -> bool:
+    """True when ``leaf`` is a DistributedOptimizer over a HybridDeviceOptimizer (``--optimizer-cpu-offload``)."""
+    try:
+        from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
+    except ImportError:  # no Megatron: no HDO can exist
+        return False
+    return isinstance(getattr(leaf, "optimizer", None), HybridDeviceOptimizer)
+
+
+def _check_precision(leaf: Any) -> None:
+    """The precision-aware path is supported only as Megatron's CPU-offload carrier with fp32 state.
+
+    Under ``--optimizer-cpu-offload`` the HDO keeps standalone masters and moments, read and written unscaled by
+    ``_get/_set_main_param_and_optimizer_states``; on GPU the precision-aware path keeps scaled or low-precision state
+    (e.g. int16 master remainders inside TE FusedAdam), which this format does not represent.
+    """
+    config = getattr(leaf, "config", None)
+    if not getattr(config, "use_precision_aware_optimizer_no_fp8_or_ds_fp8", False):
+        return
+    if not _hybrid_offload(leaf):
+        raise NotImplementedError("DP-invariant LoRA state does not support the precision-aware optimizer on GPU")
+    dtypes = {
+        name: getattr(config, name, torch.float32) for name in ("main_params_dtype", "exp_avg_dtype", "exp_avg_sq_dtype")
+    }
+    low = sorted(name for name, dtype in dtypes.items() if dtype != torch.float32)
+    if low:
+        raise NotImplementedError(f"DP-invariant state with --optimizer-cpu-offload needs fp32 {low}")
+
+
 def _distributed_slots(leaf: Any, name_of) -> list[_Slot]:
-    if getattr(getattr(leaf, "config", None), "use_precision_aware_optimizer_no_fp8_or_ds_fp8", False):
-        raise NotImplementedError("DP-invariant LoRA state does not support the precision-aware optimizer")
+    _check_precision(leaf)
+    hybrid = _hybrid_offload(leaf)
     slots = []
     for gbuf_range_maps in leaf.gbuf_ranges:
         for per_bucket in gbuf_range_maps.values():
@@ -136,9 +183,12 @@ def _distributed_slots(leaf: Any, name_of) -> list[_Slot]:
                             f"distributed optimizer holds a parameter of shape {tuple(model_param.shape)} that is not "
                             f"a named model parameter"
                         )
-                    group_index, _ = leaf.model_param_group_index_map[model_param]
+                    group_index, group_order = leaf.model_param_group_index_map[model_param]
 
-                    def get(model_param=model_param):
+                    def get(model_param=model_param, group_index=group_index, group_order=group_order):
+                        if hybrid:
+                            sharded = leaf.optimizer.param_groups[group_index]["params"][group_order]
+                            return _hdo_stepped_state(leaf.optimizer, sharded)
                         return _read_distributed_state(leaf, model_param)
 
                     def set_(tensors, model_param=model_param):
@@ -235,7 +285,7 @@ def optimizer_slots(optimizer: Any, named_params: Iterable[tuple[str, torch.nn.P
 
 
 def _hyper(group: Mapping[str, Any]) -> dict[str, Any]:
-    return {k: copy.deepcopy(v) for k, v in group.items() if k != "params"}
+    return {k: copy.deepcopy(v) for k, v in group.items() if k != "params" and k not in _HDO_WIRING_KEYS}
 
 
 def export_named_optimizer_state(optimizer: Any, named_params) -> dict[str, Any]:
@@ -350,11 +400,12 @@ def load_named_optimizer_state(optimizer: Any, named_params, merged: Mapping[str
     named_params = list(named_params)
     check_named_optimizer_state(optimizer, named_params, merged)
     slots = optimizer_slots(optimizer, named_params)
-    for leaf in _optimizer_leaves(optimizer):
+    leaves = _optimizer_leaves(optimizer)
+    for leaf in leaves:
         # A freshly built DistOpt has no state tensors yet (Megatron's own loaders initialize them first). Decide per
         # parameter, not on the whole ``state``: an earlier read may have left empty entries that hide a missing init.
         if _is_distributed(leaf) and _distributed_needs_state_init(leaf, slots, merged):
-            leaf._init_optimizer_states_with_dummy_values()
+            _init_states_with_dummy_values(leaf)
     for slot in slots:
         full = merged[slot.name]
         tensors = {k: v[slot.start : slot.end] for k, v in full["tensors"].items()}
@@ -362,6 +413,98 @@ def load_named_optimizer_state(optimizer: Any, named_params, merged: Mapping[str
         slot.set(tensors)
     for group, names in _names_by_group(slots).values():
         group.update(copy.deepcopy(merged[names[0]]["hyper"]))
+    for leaf in leaves:
+        if _is_distributed(leaf) and _hybrid_offload(leaf):
+            _finish_hybrid_load(leaf, slots, merged)
+
+
+def _init_states_with_dummy_values(leaf: Any) -> None:
+    """Megatron's dummy step, without its side effect on the model under CPU offload.
+
+    The HDO steps its host copies and copies them back into the parameters it was built over -- under the
+    precision-aware path the bf16 model shards -- so a zero-grad AdamW step would decay model weights the caller may
+    already have restored. Those parameters are put back after the step; the masters and moments are overwritten by
+    the load that follows.
+    """
+    if not _hybrid_offload(leaf):
+        leaf._init_optimizer_states_with_dummy_values()
+        return
+    params = [p for group in leaf.optimizer.param_groups for p in group["params"]]
+    saved = [p.detach().clone() for p in params]
+    leaf._init_optimizer_states_with_dummy_values()
+    with torch.no_grad():
+        for param, value in zip(params, saved, strict=True):
+            param.copy_(value)
+
+
+def _finish_hybrid_load(leaf: Any, slots: Sequence[_Slot], merged: Mapping[str, Mapping[str, Any]]) -> None:
+    """Complete a load into a HybridDeviceOptimizer the way Megatron's own loaders do.
+
+    ``_set_main_param_and_optimizer_states`` skips the HDO "step" (Megatron restores it from param_groups in its
+    checkpoint path), so the saved per-parameter step is written here; ``_sync_hdo_state_to_sub_optimizers`` then
+    hands the state to the CPU/GPU sub-optimizers and copies every "master_param" into the fp32 tensor the
+    sub-optimizer actually steps.
+    """
+    name_of = {id(slot.model_param): slot.name for slot in slots}
+    hdo = leaf.optimizer
+    for model_param, (group_index, group_order) in leaf.model_param_group_index_map.items():
+        if id(model_param) not in name_of:
+            continue
+        sharded = hdo.param_groups[group_index]["params"][group_order]
+        step = merged[name_of[id(model_param)]]["scalars"].get("step")
+        if step is not None:
+            hdo.state[sharded]["step"] = step.clone()
+    hdo._sync_hdo_state_to_sub_optimizers()
+    _bind_masters_to_stepped_tensors(hdo)
+
+
+def _hdo_inner_param(hdo: Any, param: torch.Tensor) -> torch.Tensor:
+    """The tensor the HDO's sub-optimizer steps for ``param``: the fp32 copy of a low-precision parameter,
+    the host copy of an offloaded fp32 parameter, else the parameter itself."""
+    inner = getattr(hdo, "param_to_inner_param", None)
+    if inner is not None:
+        return inner.get(param, param)
+    return hdo.param_to_fp32_param.get(param, param)
+
+
+def _hdo_stepped_state(hdo: Any, param: torch.Tensor) -> dict[str, torch.Tensor]:
+    """The state the HDO's sub-optimizer actually steps for ``param``, keyed like
+    ``_get_main_param_and_optimizer_states`` ("param" plus the tensor state, e.g. "step", "exp_avg").
+
+    The export reads these tensors, not the HDO's ``state["master_param"]``: the two are the same tensor only while
+    the HDO is consistent, and a cut digest over the HDO copy cannot see a sub-optimizer that steps something else
+    (a restore that left it on its build-time host copy, GPU T-G3 2026-10-20). A fresh HDO has no state yet: only
+    "param".
+    """
+    inner = _hdo_inner_param(hdo, param)
+    for sub in hdo.sub_optimizers:
+        state = sub.state.get(inner)
+        if state:
+            tensors = {k: v for k, v in state.items() if isinstance(v, torch.Tensor) and k != "master_param"}
+            tensors["param"] = inner
+            return tensors
+    return {"param": inner}
+
+
+def _bind_masters_to_stepped_tensors(hdo: Any) -> None:
+    """Make every loaded "master_param" the tensor the sub-optimizer steps, holding the loaded value.
+
+    ``_set_main_param_and_optimizer_states`` replaces ``state["master_param"]`` with the loaded tensor, and
+    ``_update_fp32_params_by_new_state`` copies it only into the fp32 copies of low-precision parameters. A native
+    fp32 parameter (e.g. KDA ``A_log``/``dt_bias``, mHC ``alpha_*``/``bias``, kept in fp32) has no such copy: its
+    sub-optimizer steps the host copy the HDO took when it was built, so without this the first step after a
+    restore would continue from that stale snapshot and write it back into the model (GPU T-G3, 2026-10-20).
+    """
+    with torch.no_grad():
+        for param, state in hdo.state.items():
+            master = state.get("master_param")
+            if not isinstance(master, torch.Tensor):
+                continue
+            inner = _hdo_inner_param(hdo, param)
+            if inner is master:
+                continue
+            inner.copy_(master)
+            state["master_param"] = inner
 
 
 def _equal(a: Any, b: Any) -> bool:
