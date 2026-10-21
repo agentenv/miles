@@ -21,6 +21,7 @@ from miles.backends.training_utils.weight_update.hf_weight_iterator import (
 )
 from miles.backends.training_utils.weight_update.hf_weight_iterator.atomic_groups import get_hf_atomic_update_groups
 from miles.utils.lora.utils import is_lora_weight_name
+from miles.utils.rollout_checkpoint import rollout_hf_checkpoint
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +32,7 @@ class MegatronHfWeightIteratorBase(HfWeightIteratorBase):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.packed_weight_basenames = (
-            get_packed_weight_basenames(self.args.hf_checkpoint)
+            get_packed_weight_basenames(rollout_hf_checkpoint(self.args))
             if self.quantization_config is not None
             and self.quantization_config["quant_method"] == "compressed-tensors"
             else None

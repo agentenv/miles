@@ -651,6 +651,17 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--rollout-hf-checkpoint",
+                type=str,
+                default=None,
+                help=(
+                    "The huggingface checkpoint SGLang starts from, when it is not --hf-checkpoint "
+                    "(e.g. an FP8 copy of the BF16 trainer checkpoint). Its quantization_config, "
+                    "including ignored_layers / modules_to_not_convert, decides how the trainer "
+                    "quantizes the weights it sends to SGLang. Defaults to --hf-checkpoint."
+                ),
+            )
+            parser.add_argument(
                 "--model-name",
                 type=str,
                 default=None,

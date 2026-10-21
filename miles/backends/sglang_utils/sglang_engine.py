@@ -14,6 +14,7 @@ from miles.utils.lora.utils import (
     lora_base_cpu_backup_enabled,
     lora_rollout_enabled,
 )
+from miles.utils.rollout_checkpoint import rollout_hf_checkpoint
 from miles.utils.workers.argv_utils import _record_field_names
 
 logger = logging.getLogger(__name__)
@@ -95,7 +96,7 @@ def _compute_server_args(
     _gpus_per_engine = num_gpus_per_engine or args.rollout_num_gpus_per_engine
     nnodes = max(1, _gpus_per_engine // args.num_gpus_per_node)
     kwargs = {
-        "model_path": args.hf_checkpoint,
+        "model_path": rollout_hf_checkpoint(args),
         "trust_remote_code": True,
         "random_seed": random_seed,
         # memory

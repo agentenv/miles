@@ -28,6 +28,8 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
+from miles.utils.fp8_ignore import ignored_modules, is_ignored
+
 FP8_INFO = torch.finfo(torch.float8_e4m3fn)
 FP8_MAX, FP8_MIN = FP8_INFO.max, FP8_INFO.min
 
@@ -113,7 +115,7 @@ class ConversionResult:
             self.modules_to_not_convert.extend(module_names)
 
 
-def process_file(input_path, output_path, filename, strategy, block_size, result_collector):
+def process_file(input_path, output_path, filename, strategy, block_size, result_collector, ignored=()):
     if not filename.endswith(".safetensors"):
         return
 
@@ -143,6 +145,7 @@ def process_file(input_path, output_path, filename, strategy, block_size, result
             and "compressor." not in key
             and "vision_tower" not in key
             and "mm_projector" not in key
+            and not is_ignored(key, ignored)
         ):
             qw, s = quant_fp8(weights[key], strategy, block_size)
             q_weights[key] = qw
@@ -160,7 +163,9 @@ def process_file(input_path, output_path, filename, strategy, block_size, result
     result_collector.add_result(filename, q_weights, modules_to_not_convert)
 
 
-def convert_fp8(input_path, output_path, strategy, block_size=None, max_workers=4):
+def convert_fp8(input_path, output_path, strategy, block_size=None, max_workers=4, ignored_layers=()):
+    """``ignored_layers``: extra module names kept in BF16 (SGLang path match), e.g. attention."""
+    ignored = ignored_modules({"ignored_layers": list(ignored_layers)})
     input_path = os.path.abspath(input_path)
     os.makedirs(output_path, exist_ok=True)
 
@@ -176,7 +181,7 @@ def convert_fp8(input_path, output_path, strategy, block_size=None, max_workers=
         futures = []
         for filename in safetensors_files:
             future = executor.submit(
-                process_file, input_path, output_path, filename, strategy, block_size, result_collector
+                process_file, input_path, output_path, filename, strategy, block_size, result_collector, ignored
             )
             futures.append(future)
 
@@ -253,6 +258,12 @@ if __name__ == "__main__":
     parser.add_argument("--save-dir", type=str, help="Path to the directory to save the converted model.")
     parser.add_argument("--strategy", type=str, default="block", choices=["block", "channel", "tensor"])
     parser.add_argument("--block-size", type=int, nargs="*", default=None, help="eg. --block-size 32 32")
+    parser.add_argument(
+        "--ignored-layers-file",
+        type=str,
+        default=None,
+        help="JSON list of module names to keep in BF16 (written into modules_to_not_convert)",
+    )
     parser.add_argument("--max-workers", type=int, default=1, help="Number of worker threads for parallel processing")
     args = parser.parse_args()
 
@@ -262,4 +273,5 @@ if __name__ == "__main__":
     elif not os.path.isdir(args.save_dir):
         raise ValueError("The save_dir should be a directory.")
 
-    convert_fp8(args.model_dir, args.save_dir, args.strategy, args.block_size, args.max_workers)
+    ignored_layers = json.load(open(args.ignored_layers_file)) if args.ignored_layers_file else ()
+    convert_fp8(args.model_dir, args.save_dir, args.strategy, args.block_size, args.max_workers, ignored_layers)

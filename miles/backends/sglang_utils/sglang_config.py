@@ -11,6 +11,7 @@ from miles.backends.sglang_utils.arguments import collect_eval_sglang_overrides
 from miles.utils.file_arg_utils import resolve_file_arg
 from miles.utils.lora.utils import is_multi_lora_enabled
 from miles.utils.pydantic_utils import FrozenStrictBaseModel
+from miles.utils.rollout_checkpoint import rollout_hf_checkpoint
 
 logger = logging.getLogger(__name__)
 
@@ -203,7 +204,7 @@ class ModelConfig(FrozenStrictBaseModel):
     @classmethod
     def resolve(cls, raw: _RawModelConfig, args, offset_cursor: "_OffsetCursor") -> "ModelConfig":
         """Resolve per-group defaults from model-level then args-level values."""
-        default_model_path = p if (p := raw.model_path) is not None else args.hf_checkpoint
+        default_model_path = p if (p := raw.model_path) is not None else rollout_hf_checkpoint(args)
         default_gpus_per_engine = n if (n := raw.num_gpus_per_engine) is not None else args.rollout_num_gpus_per_engine
         server_groups = [
             ServerGroupConfig.resolve(
@@ -229,10 +230,10 @@ class ModelConfig(FrozenStrictBaseModel):
         update_weights = raw.update_weights
         if is_multi_lora_enabled(args):
             assert update_weights is not True, "Tinker loads a frozen base; update_weights must be false"
-            assert effective_model_path == args.hf_checkpoint, "Tinker engines must load the trainer's base checkpoint"
+            assert effective_model_path == rollout_hf_checkpoint(args), "Tinker engines must load the trainer's base checkpoint"
             update_weights = False
         elif update_weights is None:
-            if effective_model_path != args.hf_checkpoint:
+            if effective_model_path != rollout_hf_checkpoint(args):
                 logger.warning(
                     f"Model '{raw.name}' uses model_path='{effective_model_path}' which differs "
                     f"from hf_checkpoint='{args.hf_checkpoint}'. Defaulting update_weights to False. "

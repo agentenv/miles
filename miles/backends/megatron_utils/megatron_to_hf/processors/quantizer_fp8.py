@@ -3,6 +3,7 @@ import re
 
 import torch
 
+from miles.utils.fp8_ignore import ignored_modules, is_ignored
 from miles.utils.fp8_kernel import blockwise_cast_to_fp8_triton
 
 from ...sglang import (
@@ -19,6 +20,7 @@ def quantize_params_fp8(args, megatron_name, converted_named_params, quantizatio
     assert fmt == "e4m3", f"Unsupported FP8 format: {fmt}"
     assert quantization_config["activation_scheme"] == "dynamic"
     weight_block_size = quantization_config.get("weight_block_size", None)
+    ignored = ignored_modules(quantization_config)
 
     decoder_layers_pattern = r"module\.module\.decoder\.layers\.(\d+)\.(.+)"
     match = re.match(decoder_layers_pattern, megatron_name)
@@ -49,7 +51,9 @@ def quantize_params_fp8(args, megatron_name, converted_named_params, quantizatio
                 # TODO: find a clearer way.
                 if converted_name.endswith("_scale"):
                     continue
-                quantize_named_params.extend(_quantize_param(args, converted_name, param, weight_block_size))
+                quantize_named_params.extend(
+                    _quantize_unless_ignored(args, converted_name, param, weight_block_size, ignored)
+                )
 
             return quantize_named_params
 
@@ -64,7 +68,9 @@ def quantize_params_fp8(args, megatron_name, converted_named_params, quantizatio
         ]:
             quantize_named_params = []
             for converted_name, param in converted_named_params:
-                quantize_named_params.extend(_quantize_param(args, converted_name, param, weight_block_size))
+                quantize_named_params.extend(
+                    _quantize_unless_ignored(args, converted_name, param, weight_block_size, ignored)
+                )
 
             return quantize_named_params
 
@@ -101,12 +107,20 @@ def quantize_params_fp8(args, megatron_name, converted_named_params, quantizatio
     if rest in fp8_param_names:
         quantize_named_params = []
         for converted_name, param in converted_named_params:
-            quantize_named_params.extend(_quantize_param(args, converted_name, param, weight_block_size))
+            quantize_named_params.extend(
+                _quantize_unless_ignored(args, converted_name, param, weight_block_size, ignored)
+            )
 
         return quantize_named_params
 
     # for other parameters, we just return the original converted_named_params
     return converted_named_params
+
+
+def _quantize_unless_ignored(args, name, weight, weight_block_size, ignored):
+    if is_ignored(name, ignored):
+        return [(name, weight)]
+    return _quantize_param(args, name, weight, weight_block_size)
 
 
 def _quantize_param(args, name, weight, weight_block_size):

@@ -39,6 +39,7 @@ from miles.utils.object_store import StoreObjectRef, ValueSpec
 from miles.utils.processing_utils import load_tokenizer
 from miles.utils.reloadable_process_group import destroy_process_groups, monkey_patch_torch_dist, reload_process_groups
 from miles.utils.replay_base import all_replay_managers, routing_replay_manager
+from miles.utils.rollout_checkpoint import rollout_hf_checkpoint
 from miles.utils.test_utils.ft_test_actions import FTTestActionActorExecutor
 from miles.utils.timer import Timer, inverse_timer, timer
 from miles.utils.workers.worker_handle import ExternalFailureError
@@ -281,7 +282,12 @@ class MegatronTrainRayActor(TrainRayActor):
     def _init_weight_updater_and_publisher(self, *, update_weights: bool, publish_snapshots: bool) -> None:
         args = self.args
         model_name = type(self.hf_config).__name__.lower() if args.model_name is None else args.model_name
-        quantization_config = getattr(self.hf_config, "quantization_config", None)
+        # What SGLang loaded decides the wire format (an FP8 rollout checkpoint next to a BF16 trainer one).
+        rollout_checkpoint = rollout_hf_checkpoint(args)
+        rollout_hf_config = (
+            self.hf_config if rollout_checkpoint == args.hf_checkpoint else load_hf_config(rollout_checkpoint)
+        )
+        quantization_config = getattr(rollout_hf_config, "quantization_config", None)
         self.weight_updater = None
         self.snapshot_publisher = None
 
