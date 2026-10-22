@@ -1034,6 +1034,19 @@ def _require_full_parameter_fragment_plan(
     return plan, manifest
 
 
+# HybridDeviceOptimizer (param_update_in_fp32) mirrors each inner FP32 copy
+# into its per-parameter state as ``master_param``: that is the master a
+# policy apply overwrites by design (and _validate_model_matches_masters
+# checks), not Adam state, so the proof leaves it out.
+_HYBRID_MASTER_STATE_KEY = "master_param"
+
+
+def _adam_state(state: object) -> object:
+    if isinstance(state, Mapping) and _HYBRID_MASTER_STATE_KEY in state:
+        return {key: value for key, value in state.items() if key != _HYBRID_MASTER_STATE_KEY}
+    return state
+
+
 def _optimizer_state_sha256(state: Mapping[str, object]) -> str:
     digest = hashlib.sha256(b"miles-full-parameter-optimizer-state-v1\0")
     if not state:
@@ -1119,6 +1132,7 @@ def full_parameter_optimizer_state(
         if not isinstance(states, Mapping):
             raise RuntimeError("full-parameter optimizer state is unavailable")
         for parameter, state in states.items():
+            state = _adam_state(state)
             if not state:
                 continue
             spec = spec_by_master.get(id(parameter))

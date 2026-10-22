@@ -1119,6 +1119,10 @@ def _distopt_actor(monkeypatch, *, mode: str):
         tensor: {"exp_avg": torch.ones(tensor.numel()), "exp_avg_sq": torch.full((tensor.numel(),), 2.0)}
         for tensor in owned
     }
+    if mode == "precision-aware":
+        # HybridDeviceOptimizer._sync_sub_optimizers_state_to_hdo (param_update_in_fp32).
+        for view in bf16_views:
+            state[view]["master_param"] = inner[view]
     base = SimpleNamespace(param_groups=[{"params": owned}], state=state)
     if inner:
         base.param_to_inner_param = inner
@@ -1174,6 +1178,8 @@ def test_distributed_optimizer_dp1_masters_round_trip(monkeypatch, mode):
     by_name = {name.rsplit("::", 1)[-1]: value for name, value in exported.tensors.items()}
     assert torch.equal(by_name[_PROJ], torch.arange(6, dtype=torch.float32).reshape(2, 3))
     moments = {id(tensor): {key: value.clone() for key, value in values.items()} for tensor, values in state.items()}
+    actor.opt_param_scheduler.num_steps = 1
+    proof_before = full_parameter_optimizer_state(actor)
 
     incoming = replace(
         exported,
@@ -1192,8 +1198,11 @@ def test_distributed_optimizer_dp1_masters_round_trip(monkeypatch, mode):
     _assert_inner_copies_agree(inner)
     # Adam moments keep their objects and values.
     for tensor, values in state.items():
-        assert all(torch.equal(values[key], moments[id(tensor)][key]) for key in values)
+        assert all(torch.equal(values[key], moments[id(tensor)][key]) for key in values if key != "master_param")
     proof = full_parameter_optimizer_state(actor)
+    # The apply proof sees Adam state only, not the hybrid master mirror.
+    assert proof.selected_state_sha256 == proof_before.selected_state_sha256
+    assert proof.optimizer_state_tensor_count == proof_before.optimizer_state_tensor_count == 6
     assert proof.populated_parameter_count == 3
     assert proof.model_master_parameter_count == 3
 
