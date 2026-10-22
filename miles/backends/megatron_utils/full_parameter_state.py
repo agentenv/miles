@@ -210,11 +210,18 @@ class FullParameterShardManifest:
 
 @dataclass(frozen=True, order=True)
 class FullParameterFragmentPlan:
-    """Canonical wire-name order for one topology-owned logical fragment."""
+    """Canonical wire-name order for one topology-owned logical fragment.
+
+    ``flat_ranges`` is empty when every member is a whole parameter.  A
+    parameter larger than the fragment byte bound is split into several
+    fragments; then ``flat_ranges`` holds one ``(start, stop)`` flat element
+    range per wire name, and a whole member uses ``(0, numel)``.
+    """
 
     fragment_id: int
     wire_names: tuple[str, ...]
     numel: int
+    flat_ranges: tuple[tuple[int, int], ...] = ()
 
     def __post_init__(self) -> None:
         if isinstance(self.fragment_id, bool) or not isinstance(self.fragment_id, int) or self.fragment_id < 0:
@@ -223,6 +230,32 @@ class FullParameterFragmentPlan:
             raise ValueError("full-parameter fragment wire names are malformed")
         if isinstance(self.numel, bool) or not isinstance(self.numel, int) or self.numel < 1:
             raise ValueError("full-parameter fragment must contain scalars")
+        if self.flat_ranges:
+            if len(self.flat_ranges) != len(self.wire_names) or any(
+                not isinstance(item, tuple)
+                or len(item) != 2
+                or any(isinstance(bound, bool) or not isinstance(bound, int) for bound in item)
+                or not 0 <= item[0] < item[1]
+                for item in self.flat_ranges
+            ):
+                raise ValueError("full-parameter fragment flat ranges are malformed")
+            if sum(stop - start for start, stop in self.flat_ranges) != self.numel:
+                raise ValueError("full-parameter fragment flat ranges do not match its scalar count")
+
+    def members(self, numel_by_name: Mapping[str, int]) -> tuple[tuple[str, int, int], ...]:
+        """``(wire_name, start, stop)`` flat element range of every member."""
+
+        if self.flat_ranges:
+            return tuple((name, start, stop) for name, (start, stop) in zip(self.wire_names, self.flat_ranges, strict=True))
+        return tuple((name, 0, numel_by_name[name]) for name in self.wire_names)
+
+    def identity(self) -> dict[str, object]:
+        """Hash payload; a plan without split parameters keeps its old bytes."""
+
+        payload: dict[str, object] = {"fragment_id": self.fragment_id, "wire_names": list(self.wire_names), "numel": self.numel}
+        if self.flat_ranges:
+            payload["flat_ranges"] = [list(item) for item in self.flat_ranges]
+        return payload
 
 
 @dataclass(frozen=True)
@@ -241,8 +274,11 @@ class FullParameterOwnerFragmentPlan:
         fragment_ids = [fragment.fragment_id for fragment in self.fragments]
         if len(set(fragment_ids)) != len(fragment_ids):
             raise ValueError("full-parameter owner plan has duplicate fragment IDs")
+        # A split parameter repeats its wire name only across consecutive
+        # members; the manifest check proves the ranges tile the parameter.
         names = [name for fragment in self.fragments for name in fragment.wire_names]
-        if len(set(names)) != len(names):
+        runs = [name for index, name in enumerate(names) if index == 0 or names[index - 1] != name]
+        if len(set(runs)) != len(runs):
             raise ValueError("full-parameter owner plan has duplicate parameters")
 
     @property
@@ -251,7 +287,7 @@ class FullParameterOwnerFragmentPlan:
             "schema": 1,
             "topology": asdict(self.topology),
             "parameter_layout_hash": self.parameter_layout_hash,
-            "fragments": [asdict(fragment) for fragment in self.fragments],
+            "fragments": [fragment.identity() for fragment in self.fragments],
         }
         return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
@@ -981,21 +1017,25 @@ def _validate_fragment_plan_against_manifest(
     if plan.topology != manifest.topology:
         raise RuntimeError("full-parameter owner plan topology changed")
     canonical_names = tuple(spec.wire_name for spec in manifest.specs)
-    canonical_index = {name: index for index, name in enumerate(canonical_names)}
-    planned_names = []
-    specs_by_name = {spec.wire_name: spec for spec in manifest.specs}
+    numel_by_name = {spec.wire_name: spec.numel for spec in manifest.specs}
+    planned_names: list[str] = []
+    cursor = {}
     for fragment in plan.fragments:
-        unknown = [name for name in fragment.wire_names if name not in specs_by_name]
+        unknown = [name for name in fragment.wire_names if name not in numel_by_name]
         if unknown:
             raise RuntimeError(f"full-parameter owner plan contains unknown parameter {unknown[0]!r}")
-        indices = [canonical_index[name] for name in fragment.wire_names]
-        if indices != sorted(indices):
-            raise RuntimeError("full-parameter fragment does not preserve canonical spec order")
-        actual_numel = sum(specs_by_name[name].numel for name in fragment.wire_names)
-        if actual_numel != fragment.numel:
+        members = fragment.members(numel_by_name)
+        if sum(stop - start for _name, start, stop in members) != fragment.numel:
             raise RuntimeError("full-parameter fragment scalar count changed")
-        planned_names.extend(fragment.wire_names)
-    if len(planned_names) != len(canonical_names) or set(planned_names) != set(canonical_names):
+        for name, start, stop in members:
+            # Each parameter is covered by consecutive ranges that start at
+            # zero and end at its scalar count, in canonical order.
+            if start != cursor.get(name, 0) or stop > numel_by_name[name]:
+                raise RuntimeError("full-parameter fragment ranges do not tile the parameter")
+            if start == 0:
+                planned_names.append(name)
+            cursor[name] = stop
+    if any(cursor.get(name) != numel for name, numel in numel_by_name.items()):
         raise RuntimeError("full-parameter owner plan does not exactly cover the local shard")
     if tuple(planned_names) != canonical_names:
         raise RuntimeError("full-parameter owner plan does not preserve canonical spec order")
@@ -1519,7 +1559,7 @@ def _export_fragment_chunks(
     plan_hash: str,
     ray_module,
 ) -> tuple[FullParameterFragmentDescriptor, list[object | None]]:
-    sources = [masters[name].detach().reshape(-1) for name in fragment.wire_names]
+    sources = [masters[name].detach().reshape(-1)[start:stop] for name, start, stop in fragment.members({name: masters[name].numel() for name in fragment.wire_names})]
     source_index = 0
     source_offset = 0
     flat_offset = 0
@@ -1764,7 +1804,10 @@ def _copy_fragment_chunks_to_masters(
     master_index = 0
     master_offset = 0
     copied_parameters = 0
-    flattened = [masters[name].detach().reshape(-1) for name in fragment.wire_names]
+    members = fragment.members({name: masters[name].numel() for name in fragment.wire_names})
+    flattened = [masters[name].detach().reshape(-1)[start:stop] for name, start, stop in members]
+    # A split parameter counts once: in the fragment holding its last range.
+    completes = [stop == masters[name].numel() for name, _start, stop in members]
     for chunk_descriptor, reference in zip(
         descriptor.chunks,
         references,
@@ -1794,7 +1837,7 @@ def _copy_fragment_chunks_to_masters(
             source_offset += count
             master_offset += count
             if master_offset == master.numel():
-                copied_parameters += 1
+                copied_parameters += completes[master_index]
                 master_index += 1
                 master_offset = 0
         del value

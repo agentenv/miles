@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import replace
+import hashlib
+import json
+from dataclasses import asdict, replace
 from types import SimpleNamespace
 
 import pytest
@@ -1254,3 +1256,73 @@ def test_distributed_optimizer_partial_or_missing_master_is_refused():
             topology=topology(),
             named_parameters=(("module.w", parameter),),
         )
+
+
+def _split_plan(manifest, *, halves=((0, 3), (3, 6))):
+    """One fragment per member; the 6-scalar matrix spans two fragments."""
+
+    members = []
+    for spec in manifest.specs:
+        ranges = halves if spec.numel == 6 else ((0, spec.numel),)
+        members.extend((spec.wire_name, start, stop) for start, stop in ranges)
+    return FullParameterOwnerFragmentPlan(
+        topology=manifest.topology,
+        parameter_layout_hash="7" * 64,
+        fragments=tuple(
+            FullParameterFragmentPlan(index, (name,), stop - start, ((start, stop),))
+            for index, (name, start, stop) in enumerate(members)
+        ),
+    )
+
+
+def test_plan_hash_of_whole_parameter_plans_is_unchanged():
+    plan = FullParameterOwnerFragmentPlan(
+        topology=topology(),
+        parameter_layout_hash="9" * 64,
+        fragments=(FullParameterFragmentPlan(0, ("actor::s::a", "actor::s::b"), 5),),
+    )
+    legacy = {
+        "schema": 1,
+        "topology": asdict(plan.topology),
+        "parameter_layout_hash": plan.parameter_layout_hash,
+        "fragments": [asdict(fragment) for fragment in plan.fragments],
+    }
+    del legacy["fragments"][0]["flat_ranges"]
+    assert plan.plan_hash == hashlib.sha256(json.dumps(legacy, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def test_split_parameter_round_trips_through_chunked_commit(monkeypatch):
+    actor, named, _optimizer_state, manifest, _plan = _chunked_actor(monkeypatch)
+    delattr(actor, "_external_full_parameter_fragment_plan")
+    plan = _split_plan(manifest)
+    assert install_full_parameter_fragment_plan(actor, plan) == 3
+    fake_ray = _FakeRay()
+    expected = torch.cat([parameter.main_param.detach().reshape(-1).clone() for spec in manifest.specs for name, parameter in named if name == spec.name])
+    exported = export_full_parameter_chunked_shard(actor, policy_version=0, max_chunk_bytes=8, ray_module=fake_ray)
+    assert [fragment.numel for fragment in exported.fragments] == [fragment.numel for fragment in plan.fragments]
+    flat = torch.cat([fake_ray.get(reference) for references in exported.chunk_refs for reference in references])
+    assert torch.equal(flat, expected)
+    for _name, parameter in named:
+        parameter.main_param.zero_()
+        parameter.data.zero_()
+    target = replace(exported, policy_version=1, local_step_generation=0, chunk_refs=_copy_chunk_refs(exported))
+    prepare_full_parameter_chunked_shard(actor, target, commit_token="split", ray_module=fake_ray)
+    # The split parameter counts once.
+    assert commit_prepared_full_parameter_shard(actor, commit_token="split", ray_module=fake_ray) == len(named)
+    actual = torch.cat([parameter.main_param.detach().reshape(-1) for spec in manifest.specs for name, parameter in named if name == spec.name])
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("halves", [((0, 3), (4, 6)), ((0, 3), (3, 5)), ((3, 6), (0, 3))])
+def test_split_parameter_ranges_must_tile_in_order(monkeypatch, halves):
+    actor, _named, _optimizer_state, manifest, _plan = _chunked_actor(monkeypatch)
+    delattr(actor, "_external_full_parameter_fragment_plan")
+    with pytest.raises(RuntimeError, match="tile|exactly cover|canonical"):
+        install_full_parameter_fragment_plan(actor, _split_plan(manifest, halves=halves))
+
+
+def test_flat_ranges_must_match_wire_names():
+    with pytest.raises(ValueError, match="flat ranges"):
+        FullParameterFragmentPlan(0, ("actor::s::a",), 3, ((0, 2),))
+    with pytest.raises(ValueError, match="flat ranges"):
+        FullParameterFragmentPlan(0, ("actor::s::a",), 3, ((0, 2), (2, 3)))
