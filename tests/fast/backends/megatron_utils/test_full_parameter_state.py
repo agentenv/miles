@@ -28,6 +28,7 @@ from miles.backends.megatron_utils.full_parameter_state import (
     install_full_parameter_fragment_plan,
     make_full_parameter_shard_state,
     prepare_full_parameter_chunked_shard,
+    rebase_full_parameter_scheduler_anchor,
     record_full_parameter_local_step,
     validate_full_parameter_shard_values,
 )
@@ -1326,3 +1327,53 @@ def test_flat_ranges_must_match_wire_names():
         FullParameterFragmentPlan(0, ("actor::s::a",), 3, ((0, 2),))
     with pytest.raises(ValueError, match="flat ranges"):
         FullParameterFragmentPlan(0, ("actor::s::a",), 3, ((0, 2), (2, 3)))
+
+
+def _restore_donor_scheduler(actor, num_steps):
+    # A peer snapshot restore loads the donor's LR scheduler progress.
+    actor.opt_param_scheduler.num_steps = num_steps
+
+
+def _chunked_target(actor, fake_ray, policy_version):
+    exported = export_full_parameter_chunked_shard(actor, policy_version=0, max_chunk_bytes=16, ray_module=fake_ray)
+    return replace(exported, policy_version=policy_version, local_step_generation=0, chunk_refs=_copy_chunk_refs(exported))
+
+
+def test_restored_scheduler_progress_without_rebase_has_no_receipt(monkeypatch):
+    actor, _named, _state, _manifest, _plan = _chunked_actor(monkeypatch)
+    fake_ray = _FakeRay()
+    target = _chunked_target(actor, fake_ray, 1)
+    _restore_donor_scheduler(actor, 7)
+    with pytest.raises(RuntimeError, match="no local-step receipt"):
+        prepare_full_parameter_chunked_shard(actor, target, commit_token="commit-1", ray_module=fake_ray)
+
+
+def test_rebase_after_restore_lets_first_apply_through(monkeypatch):
+    actor, named, _state, _manifest, _plan = _chunked_actor(monkeypatch)
+    fake_ray = _FakeRay()
+    target = _chunked_target(actor, fake_ray, 1)
+    _restore_donor_scheduler(actor, 7)
+    assert rebase_full_parameter_scheduler_anchor(actor, reason="peer snapshot restore") == 7
+    assert prepare_full_parameter_chunked_shard(actor, target, commit_token="commit-1", ray_module=fake_ray) == len(named)
+    assert commit_prepared_full_parameter_shard(actor, commit_token="commit-1", ray_module=fake_ray) == len(named)
+    assert finalize_full_parameter_commit(actor, commit_token="commit-1") == len(named)
+    assert actor._external_full_scheduler_anchor_steps == 7
+    # Later progress still needs a receipt.
+    actor.opt_param_scheduler.num_steps = 8
+    with pytest.raises(RuntimeError, match="no local-step receipt"):
+        export_full_parameter_chunked_shard(actor, policy_version=1, max_chunk_bytes=16, ray_module=fake_ray)
+
+
+def test_rebase_refuses_pending_local_progress_or_commit(monkeypatch):
+    actor, _named, _state, _manifest, _plan = _chunked_actor(monkeypatch)
+    fake_ray = _FakeRay()
+    with pytest.raises(ValueError, match="explicit reason"):
+        rebase_full_parameter_scheduler_anchor(actor, reason=" ")
+    target = _chunked_target(actor, fake_ray, 1)
+    prepare_full_parameter_chunked_shard(actor, target, commit_token="commit-1", ray_module=fake_ray)
+    with pytest.raises(RuntimeError, match="prepared full-parameter cut"):
+        rebase_full_parameter_scheduler_anchor(actor, reason="peer snapshot restore")
+    abort_prepared_full_parameter_shard(actor, commit_token="commit-1")
+    actor._external_full_local_step_generation = 1
+    with pytest.raises(RuntimeError, match="discard local-step progress"):
+        rebase_full_parameter_scheduler_anchor(actor, reason="peer snapshot restore")

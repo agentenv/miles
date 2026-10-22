@@ -1307,6 +1307,31 @@ def initialize_full_parameter_tracking(actor, policy_version: int) -> None:
         raise RuntimeError("full-parameter policy tracking is already initialized")
 
 
+def rebase_full_parameter_scheduler_anchor(actor, *, reason: str) -> int:
+    """Re-anchor scheduler tracking after an external whole-state restore.
+
+    A peer snapshot restore loads the donor's LR scheduler progress into a
+    trainer that has taken no local step since tracking began, so the old
+    anchor no longer describes it. The restore itself is the proof of the new
+    progress (the caller checks it against the donor's digest); this only
+    moves the anchor, and only when no local step or policy commit is pending.
+    The normal path keeps requiring a local-step receipt for any progress.
+    """
+
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("full-parameter scheduler rebase needs an explicit reason")
+    assert_full_parameter_boundary_clear(actor)
+    _installed, generation, exported, _anchor = _require_full_parameter_tracking(actor)
+    if generation != 0 or exported != 0:
+        raise RuntimeError("full-parameter scheduler rebase would discard local-step progress")
+    if getattr(actor, "_external_full_last_local_step_receipt", None) is not None:
+        raise RuntimeError("full-parameter scheduler rebase would discard a local-step receipt")
+    anchor = _scheduler_num_steps(actor)
+    actor._external_full_scheduler_anchor_steps = anchor
+    actor._external_full_scheduler_rebase_reason = reason
+    return anchor
+
+
 def _require_full_parameter_tracking(actor) -> tuple[int, int, int, int]:
     """Return initialized tracking state without silently creating it."""
 
