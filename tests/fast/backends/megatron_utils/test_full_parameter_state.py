@@ -1072,3 +1072,176 @@ def test_lora_hybrid_keeps_complete_fp32_masters(monkeypatch, hybrid, distribute
     args = _megatron_default_args(full_parameter_lora_hybrid=hybrid)
     set_default_megatron_args(args)
     assert args.use_distributed_optimizer is distributed
+
+
+# Megatron distributed optimizer at DP=1 (+ HybridDeviceOptimizer CPU offload).
+# The stubs mirror the attributes Megatron sets (distrib_optimizer.py,
+# cpu_offloading/hybrid_optimizer.py): ``main_param`` is the flat FP32 range the
+# base optimizer steps and ``main_param_sharded`` is True; native-FP32
+# parameters are stepped through ``shard_fp32_groups`` views; under the
+# precision-aware optimizer ``main_param`` is None and the base optimizer owns
+# the BF16 ``shard_float16_groups`` view while the hybrid optimizer steps an FP32
+# inner copy (``param_to_inner_param``).
+
+_PROJ = "module.decoder.layers.0.proj.weight"
+_NORM = "module.decoder.final_norm.weight"
+_A_LOG = "module.decoder.layers.0.A_log"
+
+
+def _distopt_actor(monkeypatch, *, mode: str):
+    """``mode``: "main" (FP32 main_param ranges), "main-offload" (+ host copies),
+    "precision-aware" (BF16 owned views, FP32 inner copies on the host)."""
+
+    first = torch.nn.Parameter(torch.zeros(2, 3, dtype=torch.bfloat16))
+    second = torch.nn.Parameter(torch.zeros(2, dtype=torch.bfloat16))
+    native = torch.nn.Parameter(torch.tensor([0.25, 0.5], dtype=torch.float32))
+    initial = {id(first): torch.arange(6, dtype=torch.float32), id(second): torch.tensor([7.0, 8.0])}
+    named = ((_PROJ, first), (_NORM, second), (_A_LOG, native))
+    native_shard = native.detach().view(-1)
+    bf16_views = []
+    inner = {}
+    for parameter in (first, second):
+        parameter.data.copy_(initial[id(parameter)].view(parameter.shape).to(torch.bfloat16))
+        parameter.main_param_sharded = True
+        if mode == "precision-aware":
+            parameter.main_param = None
+            view = parameter.detach().view(-1)
+            bf16_views.append(view)
+            inner[view] = initial[id(parameter)].clone()
+        else:
+            parameter.main_param = initial[id(parameter)].clone()
+            if mode == "main-offload":
+                inner[parameter.main_param] = parameter.main_param.clone()
+    if mode != "main":
+        inner[native_shard] = native_shard.clone()
+    owned = [native_shard, *(bf16_views or [first.main_param, second.main_param])]
+    state = {
+        tensor: {"exp_avg": torch.ones(tensor.numel()), "exp_avg_sq": torch.full((tensor.numel(),), 2.0)}
+        for tensor in owned
+    }
+    base = SimpleNamespace(param_groups=[{"params": owned}], state=state)
+    if inner:
+        base.param_to_inner_param = inner
+    wrapper = SimpleNamespace(
+        optimizer=base,
+        model_fp32_groups=[[native]],
+        shard_fp32_groups=[[native_shard]],
+        model_float16_groups=[[first, second]],
+        shard_float16_groups=[bf16_views or [first.detach().view(-1), second.detach().view(-1)]],
+    )
+    actor = SimpleNamespace(
+        args=SimpleNamespace(lora_rank=0, lora_adapter_path=None, num_steps_per_rollout=1, global_batch_size=1),
+        optimizer=wrapper,
+        opt_param_scheduler=SimpleNamespace(num_steps=0),
+        weights_backuper=SimpleNamespace(backup=lambda role: None),
+        _last_rollout_id=0,
+    )
+    monkeypatch.setattr(
+        "miles.backends.megatron_utils.full_parameter_state._named_actor_parameters",
+        lambda _actor: named,
+    )
+    monkeypatch.setattr("miles.backends.megatron_utils.full_parameter_state.full_parameter_topology", topology)
+
+    def copy_masters_to_model(_actor):
+        # Megatron: the distributed optimizer copies main ranges into the param
+        # buffer; under the precision-aware optimizer it returns early.
+        if mode != "precision-aware":
+            for parameter in (first, second):
+                parameter.data.copy_(parameter.main_param.view(parameter.shape).to(torch.bfloat16))
+
+    monkeypatch.setattr(
+        "miles.backends.megatron_utils.full_parameter_state._copy_masters_to_model",
+        copy_masters_to_model,
+    )
+    initialize_full_parameter_tracking(actor, 0)
+    return actor, named, inner, state
+
+
+def _assert_inner_copies_agree(inner):
+    for owned, copy in inner.items():
+        assert torch.equal(owned.to(torch.float32), copy.to(owned.dtype).to(torch.float32))
+
+
+_MODES = ["main", "main-offload", "precision-aware"]
+
+
+@pytest.mark.parametrize("mode", _MODES)
+def test_distributed_optimizer_dp1_masters_round_trip(monkeypatch, mode):
+    actor, named, inner, state = _distopt_actor(monkeypatch, mode=mode)
+    manifest = full_parameter_shard_manifest(actor)
+    assert {spec.name: spec.shape for spec in manifest.specs} == {_PROJ: (2, 3), _NORM: (2,), _A_LOG: (2,)}
+    exported = export_full_parameter_shard(actor, policy_version=0)
+    by_name = {name.rsplit("::", 1)[-1]: value for name, value in exported.tensors.items()}
+    assert torch.equal(by_name[_PROJ], torch.arange(6, dtype=torch.float32).reshape(2, 3))
+    moments = {id(tensor): {key: value.clone() for key, value in values.items()} for tensor, values in state.items()}
+
+    incoming = replace(
+        exported,
+        policy_version=1,
+        tensors={name: value + 0.5 for name, value in exported.tensors.items()},
+    )
+    assert apply_full_parameter_shard(actor, incoming) == 3
+
+    first, _second, native = (parameter for _name, parameter in named)
+    expected = (torch.arange(6, dtype=torch.float32) + 0.5).reshape(2, 3)
+    assert torch.equal(first, expected.to(torch.bfloat16))
+    assert torch.equal(native, torch.tensor([0.75, 1.0]))
+    exported_after = export_full_parameter_shard(actor, policy_version=1)
+    assert torch.equal({n.rsplit("::", 1)[-1]: v for n, v in exported_after.tensors.items()}[_PROJ], expected)
+    # The FP32 copy the hybrid optimizer steps follows the overwrite.
+    _assert_inner_copies_agree(inner)
+    # Adam moments keep their objects and values.
+    for tensor, values in state.items():
+        assert all(torch.equal(values[key], moments[id(tensor)][key]) for key in values)
+    proof = full_parameter_optimizer_state(actor)
+    assert proof.populated_parameter_count == 3
+    assert proof.model_master_parameter_count == 3
+
+
+@pytest.mark.parametrize("mode", _MODES)
+def test_distributed_optimizer_chunked_commit_writes_the_stepped_copies(monkeypatch, mode):
+    actor, named, inner, _state = _distopt_actor(monkeypatch, mode=mode)
+    manifest = full_parameter_shard_manifest(actor)
+    names = tuple(spec.wire_name for spec in manifest.specs)
+    plan = FullParameterOwnerFragmentPlan(
+        topology=manifest.topology,
+        parameter_layout_hash="9" * 64,
+        fragments=(FullParameterFragmentPlan(fragment_id=0, wire_names=names, numel=sum(spec.numel for spec in manifest.specs)),),
+    )
+    install_full_parameter_fragment_plan(actor, plan)
+    fake_ray = _FakeRay()
+    exported = export_full_parameter_chunked_shard(actor, policy_version=0, max_chunk_bytes=16, ray_module=fake_ray)
+    # Drift both sides of every pair so the commit must restore them.
+    for _name, parameter in named:
+        parameter.data.zero_()
+        if getattr(parameter, "main_param", None) is not None:
+            parameter.main_param.zero_()
+    for copy in inner.values():
+        copy.fill_(-1.0)
+    target = replace(exported, policy_version=1, local_step_generation=0, chunk_refs=_copy_chunk_refs(exported))
+    prepare_full_parameter_chunked_shard(actor, target, commit_token="c", ray_module=fake_ray)
+    assert commit_prepared_full_parameter_shard(actor, commit_token="c", ray_module=fake_ray) == 3
+    assert torch.equal(named[0][1], torch.arange(6, dtype=torch.float32).reshape(2, 3).to(torch.bfloat16))
+    assert torch.equal(named[2][1], torch.tensor([0.25, 0.5]))
+    _assert_inner_copies_agree(inner)
+
+
+def test_distributed_optimizer_partial_or_missing_master_is_refused():
+    parameter = torch.nn.Parameter(torch.zeros(2, 3, dtype=torch.bfloat16))
+    parameter.main_param = torch.zeros(3, dtype=torch.float32)  # DP=2: half the range
+    parameter.main_param_sharded = True
+    with pytest.raises(RuntimeError, match="partial DP shard"):
+        make_full_parameter_shard_state(
+            policy_version=0,
+            role="actor",
+            topology=topology(),
+            named_parameters=(("module.w", parameter),),
+        )
+    parameter.main_param = None  # a rank owning none of it, or precision-aware without offload
+    with pytest.raises(RuntimeError, match="DP=1"):
+        make_full_parameter_shard_state(
+            policy_version=0,
+            role="actor",
+            topology=topology(),
+            named_parameters=(("module.w", parameter),),
+        )

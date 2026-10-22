@@ -368,27 +368,90 @@ class FullParameterCommitStatus:
             raise ValueError("full-parameter commit state identity is malformed")
 
 
+class _OptimizerOwnedParameters(frozenset):
+    """Identities of the tensors the base optimizers step, plus distributed-optimizer masters.
+
+    ``distributed_masters`` maps ``id(model_param)`` to ``(owned, fp32)`` for
+    Megatron's distributed optimizer when the parameter has no
+    ``main_param`` tensor to read:
+
+    * a native-FP32 parameter is stepped through a flat view
+      (``shard_fp32_groups``); ``owned`` and ``fp32`` are that view;
+    * under the precision-aware optimizer with ``--optimizer-cpu-offload``
+      the base optimizer owns the BF16 model view (``shard_float16_groups``)
+      and the HybridDeviceOptimizer steps an FP32 copy of it (host-pinned
+      when offloaded); ``fp32`` is that copy.
+
+    Empty for the non-distributed optimizer.
+    """
+
+    distributed_masters: Mapping[int, tuple[torch.Tensor, torch.Tensor]]
+
+    def __new__(cls, identities, distributed_masters: Mapping[int, tuple[torch.Tensor, torch.Tensor]] | None = None):
+        owned = super().__new__(cls, identities)
+        owned.distributed_masters = dict(distributed_masters or {})
+        return owned
+
+
+def _resolve_master(
+    parameter: torch.nn.Parameter,
+    name: str,
+    *,
+    optimizer_owned_parameter_ids: frozenset[int] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return ``(owned, master)``: the tensor the base optimizer owns and the FP32 master view.
+
+    The non-distributed optimizer keeps a whole FP32 master per parameter;
+    both tensors are the same object. Megatron's distributed optimizer keeps a
+    flat FP32 range per parameter (``main_param_sharded``); at DP=1 that range
+    is the whole parameter, so ``master`` is a parameter-shaped view of it and
+    writes through the view land in the tensor that is stepped. A partial
+    range (DP>1, or a rank owning none of the parameter) is refused.
+    """
+
+    sharded = bool(getattr(parameter, "main_param_sharded", False))
+    owned = getattr(parameter, "main_param", None)
+    fp32 = owned
+    if owned is None:
+        distributed = getattr(optimizer_owned_parameter_ids, "distributed_masters", {})
+        if id(parameter) in distributed:
+            owned, fp32 = distributed[id(parameter)]
+            sharded = True
+        elif parameter.dtype == torch.float32 and optimizer_owned_parameter_ids is not None and id(parameter) in optimizer_owned_parameter_ids:
+            # Megatron keeps parameters such as Qwen3.5 ``A_log`` natively in
+            # FP32 and places that same object directly in the base optimizer.
+            owned = fp32 = parameter
+        elif sharded:
+            raise RuntimeError(
+                f"{name!r} has no local FP32 master (DP-sharded optimizer, or precision-aware without "
+                "CPU offload); the initial DiLoCo profile requires DP=1 and FP32 masters"
+            )
+        else:
+            raise RuntimeError(f"{name!r} has no FP32 optimizer master")
+    if not isinstance(fp32, torch.Tensor) or fp32.dtype != torch.float32 or fp32.numel() != parameter.numel():
+        if sharded:
+            raise RuntimeError(f"{name!r} optimizer master is a partial DP shard; the initial DiLoCo profile requires DP=1")
+        raise RuntimeError(f"{name!r} has an incomplete FP32 optimizer master")
+    if sharded:
+        if fp32.dim() != 1 or not fp32.is_contiguous():
+            raise RuntimeError(f"{name!r} distributed-optimizer master is not a flat contiguous range")
+        master = fp32.view(parameter.shape)
+    else:
+        if tuple(fp32.shape) != tuple(parameter.shape):
+            raise RuntimeError(f"{name!r} has an incomplete FP32 optimizer master")
+        master = fp32
+    if optimizer_owned_parameter_ids is not None and id(owned) not in optimizer_owned_parameter_ids:
+        raise RuntimeError(f"{name!r} FP32 master is not owned by the optimizer")
+    return owned, master
+
+
 def _master_parameter(
     parameter: torch.nn.Parameter,
     name: str,
     *,
     optimizer_owned_parameter_ids: frozenset[int] | None = None,
 ) -> torch.Tensor:
-    master = getattr(parameter, "main_param", None)
-    if master is None:
-        if getattr(parameter, "main_param_sharded", False):
-            raise RuntimeError(f"{name!r} has a DP-sharded optimizer master; the initial DiLoCo profile requires DP=1")
-        if parameter.dtype == torch.float32 and optimizer_owned_parameter_ids is not None and id(parameter) in optimizer_owned_parameter_ids:
-            # Megatron keeps parameters such as Qwen3.5 ``A_log`` natively in
-            # FP32 and places that same object directly in the base optimizer.
-            master = parameter
-        else:
-            raise RuntimeError(f"{name!r} has no FP32 optimizer master")
-    if not isinstance(master, torch.Tensor) or master.dtype != torch.float32 or master.numel() != parameter.numel() or tuple(master.shape) != tuple(parameter.shape):
-        raise RuntimeError(f"{name!r} has an incomplete FP32 optimizer master")
-    if optimizer_owned_parameter_ids is not None and id(master) not in optimizer_owned_parameter_ids:
-        raise RuntimeError(f"{name!r} FP32 master is not owned by the optimizer")
-    return master
+    return _resolve_master(parameter, name, optimizer_owned_parameter_ids=optimizer_owned_parameter_ids)[1]
 
 
 def _specs_and_masters(
@@ -792,15 +855,86 @@ def _optimizer_owned_parameter_ids(optimizer) -> frozenset[int]:
                 owned.add(identity)
     if not owned:
         raise RuntimeError("full-parameter optimizer owns no parameters")
-    return frozenset(owned)
+    return _OptimizerOwnedParameters(owned, _distributed_masters(optimizer))
+
+
+def _optimizer_wrappers(optimizer) -> tuple[object, ...]:
+    wrappers = getattr(optimizer, "chained_optimizers", None)
+    return tuple((optimizer,) if wrappers is None else wrappers)
+
+
+def _paired_groups(wrapper, model_attribute: str, shard_attribute: str):
+    model_groups = getattr(wrapper, model_attribute, None)
+    shard_groups = getattr(wrapper, shard_attribute, None)
+    if model_groups is None and shard_groups is None:
+        return
+    if model_groups is None or shard_groups is None:
+        raise RuntimeError("distributed optimizer parameter groups are malformed")
+    for model_group, shard_group in zip(model_groups, shard_groups, strict=True):
+        yield from zip(model_group, shard_group, strict=True)
+
+
+def _distributed_masters(optimizer) -> dict[int, tuple[torch.Tensor, torch.Tensor]]:
+    """Index the masters of distributed-optimizer parameters that have no ``main_param``."""
+
+    masters: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+
+    def add(model_param, value):
+        if id(model_param) in masters:
+            raise RuntimeError("distributed optimizer lists a parameter twice")
+        masters[id(model_param)] = value
+
+    for wrapper in _optimizer_wrappers(optimizer):
+        for model_param, shard in _paired_groups(wrapper, "model_fp32_groups", "shard_fp32_groups"):
+            add(model_param, (shard, shard))
+        inner = getattr(getattr(wrapper, "optimizer", None), "param_to_inner_param", None)
+        for model_param, shard in _paired_groups(wrapper, "model_float16_groups", "shard_float16_groups"):
+            if getattr(model_param, "main_param", None) is not None:
+                continue  # read through main_param
+            fp32 = None if inner is None or shard is None else inner.get(shard)
+            if fp32 is not None and fp32.dtype == torch.float32:
+                add(model_param, (shard, fp32))
+    return masters
+
+
+@torch.no_grad()
+def _propagate_master_writes(actor) -> int:
+    """Make the tensors Megatron's HybridDeviceOptimizer steps agree with written masters.
+
+    Under ``--optimizer-cpu-offload`` each base-optimizer parameter may have an
+    inner FP32 copy (``param_to_inner_param``) that the sub-optimizer steps
+    and copies back after every step; a write to only one side is undone by
+    the next step. The FP32 side is the master the sync wrote, so:
+
+    * an FP32 owned tensor (device master, or native-FP32 view) is copied
+      into its inner copy;
+    * a BF16 owned tensor (precision-aware: the model's own view) receives
+      its FP32 inner copy, which is the master.
+
+    Adam moments are left as they are (the non-distributed path keeps them too).
+    """
+
+    pairs = 0
+    for base in _optimizer_bases(actor.optimizer):
+        inner = getattr(base, "param_to_inner_param", None)
+        if inner is None:
+            continue
+        for owned, copy in inner.items():
+            if copy is owned:
+                continue
+            if copy.numel() != owned.numel():
+                raise RuntimeError("hybrid optimizer inner copy has a different size")
+            if owned.dtype == torch.float32:
+                copy.copy_(owned.view(copy.shape), non_blocking=False)
+            else:
+                owned.copy_(copy.view(owned.shape), non_blocking=False)
+            pairs += 1
+    return pairs
 
 
 def _optimizer_bases(optimizer) -> tuple[object, ...]:
-    wrappers = getattr(optimizer, "chained_optimizers", None)
-    if wrappers is None:
-        wrappers = (optimizer,)
     bases = []
-    for wrapper in wrappers:
+    for wrapper in _optimizer_wrappers(optimizer):
         base = getattr(wrapper, "optimizer", wrapper)
         if any(base is existing for existing in bases):
             raise RuntimeError("full-parameter optimizer base is duplicated")
@@ -972,7 +1106,11 @@ def full_parameter_optimizer_state(
         named_parameters,
         optimizer_owned_parameter_ids=optimizer_owned,
     )
-    spec_by_master = {id(masters[spec.wire_name]): spec for spec in specs}
+    spec_by_name = {spec.name: spec for spec in specs}
+    spec_by_master = {
+        id(_resolve_master(parameter, name, optimizer_owned_parameter_ids=optimizer_owned)[0]): spec_by_name[name]
+        for name, parameter in named_parameters
+    }
     populated: dict[str, tuple[FullParameterShardSpec, Mapping[str, object]]] = {}
     tensor_count = 0
     scalar_count = 0
@@ -1303,6 +1441,7 @@ def apply_full_parameter_shard(
         named_parameters=named_parameters,
         optimizer_owned_parameter_ids=optimizer_owned,
     )
+    _propagate_master_writes(actor)
     _copy_masters_to_model(actor)
     model_count = _validate_model_matches_masters(
         named_parameters,
@@ -1721,6 +1860,7 @@ def commit_prepared_full_parameter_shard(
         )
     if count != prepared.parameter_tensor_count or count != len(specs):
         raise RuntimeError("full-parameter chunked apply is incomplete")
+    _propagate_master_writes(actor)
     _copy_masters_to_model(actor)
     model_count = _validate_model_matches_masters(
         named_parameters,
