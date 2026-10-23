@@ -643,8 +643,43 @@ def _fragment_hasher(
     return digest
 
 
+def _all_finite(value: torch.Tensor) -> bool:
+    """``torch.isfinite(value).all()`` without the full-size bool tensor.
+
+    ``amax``/``amin`` propagate NaN, +inf is the maximum and -inf the minimum,
+    so both extremes are finite exactly when every value is.  Two vectorized
+    reductions instead of an elementwise pass plus an allocation (about 40x
+    faster on 256 MiB of f32 with one thread)."""
+
+    if not value.is_floating_point():
+        return True
+    if value.numel() == 0:
+        return True
+    return bool(torch.isfinite(value.amax()).item() and torch.isfinite(value.amin()).item())
+
+
 def _tensor_bytes(value: torch.Tensor) -> memoryview:
     return memoryview(value.numpy()).cast("B")
+
+
+def _chunk_hasher(
+    fragment_id: int,
+    chunk_index: int,
+    flat_offset: int,
+    *,
+    parameter_layout_hash: str,
+    plan_hash: str,
+):
+    """The chunk hash before its value bytes (feed them in any split)."""
+
+    digest = hashlib.sha256()
+    digest.update(_CHUNK_HASH_DOMAIN)
+    digest.update(parameter_layout_hash.encode("ascii"))
+    digest.update(plan_hash.encode("ascii"))
+    digest.update(fragment_id.to_bytes(8, "little"))
+    digest.update(chunk_index.to_bytes(8, "little"))
+    digest.update(flat_offset.to_bytes(8, "little"))
+    return digest
 
 
 def _chunk_hash(
@@ -656,13 +691,13 @@ def _chunk_hash(
     parameter_layout_hash: str,
     plan_hash: str,
 ) -> str:
-    digest = hashlib.sha256()
-    digest.update(_CHUNK_HASH_DOMAIN)
-    digest.update(parameter_layout_hash.encode("ascii"))
-    digest.update(plan_hash.encode("ascii"))
-    digest.update(fragment_id.to_bytes(8, "little"))
-    digest.update(chunk_index.to_bytes(8, "little"))
-    digest.update(flat_offset.to_bytes(8, "little"))
+    digest = _chunk_hasher(
+        fragment_id,
+        chunk_index,
+        flat_offset,
+        parameter_layout_hash=parameter_layout_hash,
+        plan_hash=plan_hash,
+    )
     digest.update(_tensor_bytes(value))
     return digest.hexdigest()
 
@@ -679,6 +714,82 @@ def _hash_pool() -> ThreadPoolExecutor:
         if _HASH_POOL is None:
             _HASH_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="miles-fp-hash")
         return _HASH_POOL
+
+
+_SCAN_THREADS_ENV = "MILES_FULL_PARAMETER_HASH_THREADS"
+_SCAN_POOL: ThreadPoolExecutor | None = None
+_SCAN_POOL_THREADS = 0
+# The finite check and both hashes of a deferred export read the masters in
+# blocks of this many floats (8 MiB): one pass, cache-resident, no copy.
+_SCAN_BLOCK_NUMEL = 1 << 21
+
+
+def _scan_threads() -> int:
+    raw = os.environ.get(_SCAN_THREADS_ENV, "8")
+    try:
+        threads = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{_SCAN_THREADS_ENV} must be an integer, got {raw!r}") from exc
+    if not 1 <= threads <= 64:
+        raise RuntimeError(f"{_SCAN_THREADS_ENV} must be within 1..64, got {threads}")
+    return threads
+
+
+def _scan_pool() -> ThreadPoolExecutor:
+    """Fragment-parallel workers for deferred exports, materialization and
+    prepare verification (``MILES_FULL_PARAMETER_HASH_THREADS``, default 8).
+
+    Fragments are independent hash streams, so the result does not depend on
+    the number of workers; hashlib and torch release the GIL on large buffers."""
+
+    global _SCAN_POOL, _SCAN_POOL_THREADS
+    threads = _scan_threads()
+    with _HASH_POOL_LOCK:
+        if _SCAN_POOL is None or _SCAN_POOL_THREADS != threads:
+            if _SCAN_POOL is not None:
+                _SCAN_POOL.shutdown(wait=False)
+            _SCAN_POOL = ThreadPoolExecutor(max_workers=threads, thread_name_prefix="miles-fp-scan")
+            _SCAN_POOL_THREADS = threads
+        return _SCAN_POOL
+
+
+class _DeferredFullParameterChunk:
+    """The ref of a chunk a deferred export hashed but did not store in Ray.
+
+    A deferred export (``defer_payload=True``) describes every fragment from
+    the masters (finite check, chunk hashes, fragment digest) but puts no
+    bytes into the object store.  Its chunk refs are this marker.  The bytes
+    stay readable only while the masters hold them, which the resident record
+    proves: ``materialize_full_parameter_fragments`` then stores a fragment on
+    demand, and a skip-resident apply never reads a resident one.  Reading a
+    marker anywhere else is an error (``ray.get`` refuses a non-ObjectRef)."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "DEFERRED_FULL_PARAMETER_CHUNK"
+
+    def __reduce__(self):
+        return (_deferred_full_parameter_chunk, ())
+
+
+DEFERRED_FULL_PARAMETER_CHUNK = _DeferredFullParameterChunk()
+
+
+def _deferred_full_parameter_chunk() -> _DeferredFullParameterChunk:
+    return DEFERRED_FULL_PARAMETER_CHUNK
+
+
+def is_deferred_full_parameter_chunk(reference: object) -> bool:
+    return isinstance(reference, _DeferredFullParameterChunk)
+
+
+def _deferred_fragment_ids(state: FullParameterChunkedShardState) -> frozenset[int]:
+    return frozenset(
+        fragment.fragment_id
+        for fragment, references in zip(state.fragments, state.chunk_refs, strict=True)
+        if any(is_deferred_full_parameter_chunk(reference) for reference in references)
+    )
 
 
 _RESIDENT_SKIP_ENV = "MILES_FULL_PARAMETER_SKIP_RESIDENT"
@@ -716,11 +827,19 @@ def _record_resident_fragments(
     )
 
 
-def _resident_fragment_ids(actor, state: FullParameterChunkedShardState) -> tuple[frozenset[int], object | None]:
-    """Fragments of ``state`` whose bytes the masters provably hold now."""
+def _resident_fragment_ids(
+    actor,
+    state: FullParameterChunkedShardState,
+    *,
+    honor_kill_switch: bool = True,
+) -> tuple[frozenset[int], object | None]:
+    """Fragments of ``state`` whose bytes the masters provably hold now.
+
+    ``honor_kill_switch=False``: ignore ``MILES_FULL_PARAMETER_SKIP_RESIDENT``
+    (deferred fragments have no stored bytes; residency is their only source)."""
 
     record = getattr(actor, "_external_full_parameter_resident", None)
-    if not _resident_skip_enabled() or not isinstance(record, _ResidentFullParameterFragments):
+    if (honor_kill_switch and not _resident_skip_enabled()) or not isinstance(record, _ResidentFullParameterFragments):
         return frozenset(), None
     installed, generation, exported, _anchor = _require_full_parameter_tracking(actor)
     if (
@@ -792,7 +911,7 @@ def make_full_parameter_shard_state(
     tensors = {}
     for spec in specs:
         value = masters[spec.wire_name].detach().to(device="cpu", dtype=torch.float32).contiguous()
-        if not torch.isfinite(value).all().item():
+        if not _all_finite(value):
             raise ValueError(f"{spec.wire_name!r} contains NaN or Inf")
         tensors[spec.wire_name] = value.clone()
     return FullParameterShardState(
@@ -819,7 +938,7 @@ def validate_full_parameter_shard_state(
         raise ValueError("full-parameter state layout hash changed")
     for spec in state.specs:
         tensor = state.tensors[spec.wire_name]
-        if not isinstance(tensor, torch.Tensor) or tensor.device.type != "cpu" or tensor.dtype != torch.float32 or not tensor.is_contiguous() or tuple(tensor.shape) != spec.shape or not torch.isfinite(tensor).all().item():
+        if not isinstance(tensor, torch.Tensor) or tensor.device.type != "cpu" or tensor.dtype != torch.float32 or not tensor.is_contiguous() or tuple(tensor.shape) != spec.shape or not _all_finite(tensor):
             raise ValueError(f"malformed full-parameter tensor {spec.wire_name!r}")
     return state
 
@@ -1230,8 +1349,16 @@ def full_parameter_optimizer_state(
     actor,
     *,
     role: str = "actor",
+    check_model: bool = True,
 ) -> FullParameterOptimizerState:
-    """Return a bounded proof of real optimizer progress on one actor rank."""
+    """Return a bounded proof of real optimizer progress on one actor rank.
+
+    ``check_model=False`` skips the whole-model model/master comparison (a
+    host-to-device pass over every master).  A caller that brackets a chunked
+    apply with two proofs may skip it: the commit ends with the same
+    comparison, and it copies every master into the model first.  The
+    reported ``model_master_parameter_count`` is the number of compared
+    parameters either way."""
 
     require_full_parameter_actor(actor.args, "inspect")
     assert_full_parameter_boundary_clear(actor)
@@ -1260,10 +1387,15 @@ def full_parameter_optimizer_state(
         topology=topology,
         optimizer_owned_parameter_ids=optimizer_owned,
     )
-    model_count = _validate_model_matches_masters(
-        named_parameters,
-        optimizer_owned_parameter_ids=optimizer_owned,
-    )
+    if check_model:
+        model_count = _validate_model_matches_masters(
+            named_parameters,
+            optimizer_owned_parameter_ids=optimizer_owned,
+        )
+    else:
+        model_count = len(tuple(named_parameters))
+        if model_count < 1:
+            raise RuntimeError("full-parameter model/master check is empty")
     spec_by_name = {spec.name: spec for spec in specs}
     spec_by_master = {
         id(_resolve_master(parameter, name, optimizer_owned_parameter_ids=optimizer_owned)[0]): spec_by_name[name]
@@ -1672,7 +1804,7 @@ def _validate_cpu_chunk(
     if not isinstance(value, torch.Tensor) or value.device.type != "cpu" or value.dtype != torch.float32 or value.ndim != 1 or not value.is_contiguous() or value.numel() != descriptor.numel:
         raise ValueError("full-parameter Ray chunk is malformed")
     if verify_values:
-        if not torch.isfinite(value).all().item():
+        if not _all_finite(value):
             raise ValueError("full-parameter Ray chunk contains NaN or Inf")
         if descriptor.payload_hash != _chunk_hash(
             fragment_id,
@@ -1694,7 +1826,12 @@ def _export_fragment_chunks(
     parameter_layout_hash: str,
     plan_hash: str,
     ray_module,
+    overlap_checks: bool = True,
 ) -> tuple[FullParameterFragmentDescriptor, list[object | None]]:
+    """``overlap_checks=False``: run the finite check and the chunk hash in
+    this thread (callers that export several fragments on the scan pool)."""
+
+    submit = _hash_pool().submit if overlap_checks else _run_now
     sources = [masters[name].detach().reshape(-1)[start:stop] for name, start, stop in fragment.members({name: masters[name].numel() for name in fragment.wire_names})]
     source_index = 0
     source_offset = 0
@@ -1730,8 +1867,8 @@ def _export_fragment_chunks(
         chunk_index = len(chunk_descriptors)
         # The finite check, the chunk hash and the fragment digest read the
         # same immutable chunk; they run concurrently and give the same bytes.
-        finite = _hash_pool().submit(lambda value: torch.isfinite(value).all().item(), chunk)
-        chunk_hash = _hash_pool().submit(
+        finite = submit(_all_finite, chunk)
+        chunk_hash = submit(
             _chunk_hash,
             fragment.fragment_id,
             chunk_index,
@@ -1771,6 +1908,123 @@ def _export_fragment_chunks(
     )
 
 
+def _describe_fragment(
+    fragment: FullParameterFragmentPlan,
+    *,
+    masters: Mapping[str, torch.Tensor],
+    max_chunk_numel: int,
+    parameter_layout_hash: str,
+    plan_hash: str,
+) -> FullParameterFragmentDescriptor:
+    """The descriptor ``_export_fragment_chunks`` returns, hashed in place.
+
+    Same finite check, chunk hashes and fragment digest over the same bytes in
+    the same order, read straight from the masters in cache-sized blocks: no
+    chunk copy and no Ray object.  SHA-256 is a stream, so feeding a chunk in
+    blocks gives the digest of the whole chunk."""
+
+    sources = [masters[name].detach().reshape(-1)[start:stop] for name, start, stop in fragment.members({name: masters[name].numel() for name in fragment.wire_names})]
+    source_index = 0
+    source_offset = 0
+    flat_offset = 0
+    chunk_descriptors = []
+    fragment_digest = _fragment_hasher(
+        fragment.fragment_id,
+        parameter_layout_hash,
+        plan_hash,
+    )
+    while flat_offset < fragment.numel:
+        chunk_numel = min(max_chunk_numel, fragment.numel - flat_offset)
+        chunk_index = len(chunk_descriptors)
+        chunk_digest = _chunk_hasher(
+            fragment.fragment_id,
+            chunk_index,
+            flat_offset,
+            parameter_layout_hash=parameter_layout_hash,
+            plan_hash=plan_hash,
+        )
+        remaining = chunk_numel
+        while remaining:
+            if source_index >= len(sources):
+                raise RuntimeError("full-parameter fragment source ended early")
+            source = sources[source_index]
+            count = min(remaining, source.numel() - source_offset, _SCAN_BLOCK_NUMEL)
+            block = source[source_offset : source_offset + count]
+            if block.device.type != "cpu" or block.dtype != torch.float32 or not block.is_contiguous():
+                block = block.to(device="cpu", dtype=torch.float32).contiguous()
+            if not _all_finite(block):
+                raise ValueError("full-parameter optimizer master contains NaN or Inf")
+            raw = _tensor_bytes(block)
+            chunk_digest.update(raw)
+            fragment_digest.update(raw)
+            del raw, block
+            remaining -= count
+            source_offset += count
+            if source_offset == source.numel():
+                source_index += 1
+                source_offset = 0
+        chunk_descriptors.append(
+            FullParameterChunkDescriptor(
+                chunk_index=chunk_index,
+                flat_offset=flat_offset,
+                numel=chunk_numel,
+                payload_hash=chunk_digest.hexdigest(),
+            )
+        )
+        flat_offset += chunk_numel
+    if source_index != len(sources) or source_offset != 0:
+        raise RuntimeError("full-parameter fragment did not consume every source")
+    return FullParameterFragmentDescriptor(
+        fragment_id=fragment.fragment_id,
+        numel=fragment.numel,
+        payload_hash=fragment_digest.hexdigest(),
+        chunks=tuple(chunk_descriptors),
+    )
+
+
+class _Done:
+    """A finished future (``_hash_pool().submit`` without the pool)."""
+
+    __slots__ = ("_value", "_error")
+
+    def __init__(self, value=None, error: BaseException | None = None) -> None:
+        self._value = value
+        self._error = error
+
+    def result(self):
+        if self._error is not None:
+            raise self._error
+        return self._value
+
+
+def _run_now(function, *args, **kwargs) -> _Done:
+    try:
+        return _Done(function(*args, **kwargs))
+    except Exception as error:  # noqa: BLE001 - raised by result(), like a future
+        return _Done(error=error)
+
+
+def _parallel_map(function, items: Sequence) -> list:
+    """``[function(item) for item in items]`` on the scan pool, in order.
+
+    Every item is awaited before an error propagates, so no worker still
+    touches the masters (or the object store) when the caller moves on."""
+
+    if len(items) <= 1:
+        return [function(item) for item in items]
+    futures = [_scan_pool().submit(function, item) for item in items]
+    results, failure = [], None
+    for future in futures:
+        try:
+            results.append(future.result())
+        except BaseException as error:  # noqa: BLE001 - re-raised after every worker ended
+            if failure is None:
+                failure = error
+    if failure is not None:
+        raise failure
+    return results
+
+
 def export_full_parameter_chunked_shard(
     actor,
     *,
@@ -1779,8 +2033,15 @@ def export_full_parameter_chunked_shard(
     max_chunk_bytes: int = FULL_PARAMETER_DEFAULT_CHUNK_BYTES,
     role: str = "actor",
     ray_module=None,
+    defer_payload: bool = False,
 ) -> FullParameterChunkedShardState:
-    """Export bounded owner chunks without materializing a rank or global cut."""
+    """Export bounded owner chunks without materializing a rank or global cut.
+
+    ``defer_payload``: describe every fragment exactly as the full export
+    does (same descriptors, same hashes, same NaN/Inf refusal) but store no
+    bytes in Ray; every chunk ref is ``DEFERRED_FULL_PARAMETER_CHUNK``.
+    ``materialize_full_parameter_fragments`` stores the fragments a caller
+    needs while the masters still hold them."""
 
     require_full_parameter_actor(actor.args, "export")
     assert_full_parameter_boundary_clear(actor)
@@ -1810,7 +2071,19 @@ def export_full_parameter_chunked_shard(
         raise RuntimeError("full-parameter local specs changed after plan installation")
     fragment_descriptors = []
     chunk_refs = []
-    for fragment in plan.fragments:
+    if defer_payload:
+        fragment_descriptors = _parallel_map(
+            lambda fragment: _describe_fragment(
+                fragment,
+                masters=masters,
+                max_chunk_numel=max_chunk_numel,
+                parameter_layout_hash=plan.parameter_layout_hash,
+                plan_hash=plan.plan_hash,
+            ),
+            plan.fragments,
+        )
+        chunk_refs = [[DEFERRED_FULL_PARAMETER_CHUNK] * len(descriptor.chunks) for descriptor in fragment_descriptors]
+    for fragment in () if defer_payload else plan.fragments:
         descriptor, references = _export_fragment_chunks(
             fragment,
             masters=masters,
@@ -1839,8 +2112,92 @@ def export_full_parameter_chunked_shard(
         local_step_generation=local_step_generation,
         fragments=fragment_descriptors,
     )
-    _note_apply_stats(actor, "export", fragments=len(fragment_descriptors), seconds=time.monotonic() - started)
+    _note_apply_stats(
+        actor,
+        "export",
+        fragments=len(fragment_descriptors),
+        deferred=bool(defer_payload),
+        seconds=time.monotonic() - started,
+    )
     return state
+
+
+def materialize_full_parameter_fragments(
+    actor,
+    *,
+    state: FullParameterChunkedShardState,
+    fragment_ids: Sequence[int],
+    role: str = "actor",
+    ray_module=None,
+) -> tuple[tuple[int, list[object]], ...]:
+    """Store the bytes of deferred fragments of ``state`` while the masters hold them.
+
+    Each requested fragment must be resident: its payload hash equals the one
+    the live resident record holds (same tracking state: no local step,
+    restore or commit start since the export or commit that recorded it).
+    The fragment is exported again from the masters with the descriptor's
+    chunk geometry and its descriptor must come out identical, so the stored
+    bytes are exactly the bytes the deferred export hashed.  Returns
+    ``(fragment_id, chunk refs)`` in fragment order; the masters, the record
+    and the tracking state do not change."""
+
+    require_full_parameter_actor(actor.args, "materialize")
+    assert_full_parameter_boundary_clear(actor)
+    _validate_scheduler_tracking_congruence(actor, role=role)
+    requested = []
+    for fragment_id in fragment_ids:
+        if isinstance(fragment_id, bool) or not isinstance(fragment_id, int) or fragment_id < 0:
+            raise ValueError("full-parameter materialize fragment ID is malformed")
+        requested.append(fragment_id)
+    if len(set(requested)) != len(requested):
+        raise ValueError("full-parameter materialize repeats a fragment")
+    if not requested:
+        return ()
+    started = time.monotonic()
+    ray_module = _resolve_ray_module(ray_module)
+    plan, manifest = _require_full_parameter_fragment_plan(actor, role=role)
+    _validate_chunked_shard_against_plan(state, plan, manifest)
+    descriptors = {descriptor.fragment_id: descriptor for descriptor in state.fragments}
+    fragments = {fragment.fragment_id: fragment for fragment in plan.fragments}
+    if any(fragment_id not in descriptors for fragment_id in requested):
+        raise ValueError("full-parameter materialize names a fragment this rank does not own")
+    resident, _record = _resident_fragment_ids(actor, state, honor_kill_switch=False)
+    stale = sorted(fragment_id for fragment_id in requested if fragment_id not in resident)
+    if stale:
+        raise RuntimeError(f"full-parameter fragments {stale} are no longer held by the masters; a deferred export cannot be materialized after they changed")
+    named_parameters, optimizer_owned = _actor_parameter_context(actor)
+    specs, masters = _specs_and_masters(
+        named_parameters,
+        role=role,
+        topology=manifest.topology,
+        optimizer_owned_parameter_ids=optimizer_owned,
+    )
+    if specs != manifest.specs:
+        raise RuntimeError("full-parameter local specs changed after plan installation")
+
+    def store(fragment_id: int) -> tuple[int, list[object]]:
+        expected = descriptors[fragment_id]
+        descriptor, references = _export_fragment_chunks(
+            fragments[fragment_id],
+            masters=masters,
+            max_chunk_numel=expected.chunks[0].numel,
+            parameter_layout_hash=plan.parameter_layout_hash,
+            plan_hash=plan.plan_hash,
+            ray_module=ray_module,
+            overlap_checks=len(requested) <= 1,
+        )
+        if descriptor != expected:
+            raise RuntimeError(f"full-parameter fragment {fragment_id} bytes changed since its deferred export")
+        return fragment_id, references
+
+    stored = _parallel_map(store, sorted(requested))
+    _note_apply_stats(
+        actor,
+        "materialize",
+        fragments=len(stored),
+        seconds=time.monotonic() - started,
+    )
+    return tuple(stored)
 
 
 def _validate_chunked_shard_against_plan(
@@ -1914,17 +2271,31 @@ def prepare_full_parameter_chunked_shard(
     plan, manifest = _require_full_parameter_fragment_plan(actor, role=role)
     _validate_chunked_shard_against_plan(state, plan, manifest)
     started = time.monotonic()
+    deferred = _deferred_fragment_ids(state)
     resident, resident_record = (
         _resident_fragment_ids(actor, state) if skip_resident else (frozenset(), None)
     )
-    for fragment, references in zip(
-        state.fragments,
-        state.chunk_refs,
-        strict=True,
-    ):
-        if fragment.fragment_id in resident:
-            # The masters already hold these exact bytes; commit skips them.
-            continue
+    if deferred - resident:
+        # A deferred fragment has no stored bytes: only the masters hold them.
+        # Its residency does not depend on the skip switch.
+        forced, forced_record = _resident_fragment_ids(actor, state, honor_kill_switch=False)
+        missing = sorted(deferred - forced)
+        if missing:
+            raise RuntimeError(f"deferred full-parameter fragments {missing} are not held by the masters and have no stored bytes")
+        if resident_record is None:
+            resident_record = forced_record
+        resident = resident | deferred
+    rows = [
+        (fragment, references)
+        for fragment, references in zip(state.fragments, state.chunk_refs, strict=True)
+        if fragment.fragment_id not in resident
+    ]
+    # One fragment: its finite check and chunk hash overlap its digest on the
+    # hash pool.  Several: each scan worker verifies one fragment serially.
+    overlap_checks = len(rows) <= 1
+
+    def verify(row) -> None:
+        fragment, references = row
         fragment_digest = _fragment_hasher(
             fragment.fragment_id,
             state.parameter_layout_hash,
@@ -1932,7 +2303,7 @@ def prepare_full_parameter_chunked_shard(
         )
         for descriptor, reference in zip(fragment.chunks, references, strict=True):
             raw = ray_module.get(reference)
-            checked = _hash_pool().submit(
+            checked = (_hash_pool().submit if overlap_checks else _run_now)(
                 _validate_cpu_chunk,
                 raw,
                 descriptor,
@@ -1949,6 +2320,10 @@ def prepare_full_parameter_chunked_shard(
             del raw, checked
         if fragment_digest.hexdigest() != fragment.payload_hash:
             raise ValueError("full-parameter fragment hash changed")
+
+    # Resident fragments: the masters already hold these exact bytes; commit
+    # skips them.  The others are independent; verify them concurrently.
+    _parallel_map(verify, rows)
     _note_apply_stats(
         actor,
         "prepare",
@@ -1996,6 +2371,8 @@ def _copy_fragment_chunks_to_masters(
         references,
         strict=True,
     ):
+        if is_deferred_full_parameter_chunk(reference):
+            raise RuntimeError("a deferred full-parameter chunk has no stored bytes to copy")
         value = _validate_cpu_chunk(
             ray_module.get(reference),
             chunk_descriptor,

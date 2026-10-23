@@ -493,12 +493,28 @@ class TrainerController:
         return await full_parameter_transport.install_fragment_plans(self, plans)
 
     async def export_full_parameter_chunked_cut(
-        self, policy_version: int, local_step_generation: int = 0, *, max_chunk_bytes: int
+        self,
+        policy_version: int,
+        local_step_generation: int = 0,
+        *,
+        max_chunk_bytes: int,
+        defer_payload: bool = False,
     ):
-        """Export small descriptors and nested Ray ObjectRefs only."""
+        """Export small descriptors and nested Ray ObjectRefs only.
+
+        ``defer_payload``: descriptors only, no Ray objects; see
+        ``materialize_full_parameter_fragments``."""
         return await full_parameter_transport.export_chunked_cut(
-            self, policy_version, local_step_generation, max_chunk_bytes=max_chunk_bytes
+            self,
+            policy_version,
+            local_step_generation,
+            max_chunk_bytes=max_chunk_bytes,
+            defer_payload=defer_payload,
         )
+
+    async def materialize_full_parameter_fragments(self, cut, fragment_ids) -> dict:
+        """Store deferred fragments of ``cut`` while the masters hold them."""
+        return await full_parameter_transport.materialize_chunked_fragments(self, cut, tuple(fragment_ids))
 
     async def apply_full_parameter_chunked_cut(
         self,
@@ -523,9 +539,9 @@ class TrainerController:
             self, base_policy_version=base_policy_version, rollout_id=rollout_id
         )
 
-    async def full_parameter_optimizer_states(self) -> tuple:
+    async def full_parameter_optimizer_states(self, *, check_model: bool = True) -> tuple:
         """One bounded optimizer-progress proof from every rank."""
-        return await full_parameter_transport.optimizer_states(self)
+        return await full_parameter_transport.optimizer_states(self, check_model=check_model)
 
     async def get_cell_statuses(self) -> dict[str, CellStatus]:
         return {cell_id: cell.cell_status() for cell_id, cell in list(self._cells_by_id.items())}

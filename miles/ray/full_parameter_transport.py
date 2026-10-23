@@ -25,13 +25,24 @@ from miles.backends.megatron_utils.full_parameter_state import (
     _resolve_ray_module,
     _tensor_bytes,
     _validate_commit_token,
+    _all_finite,
+    _scan_pool,
     _validate_cpu_chunk,
+    is_deferred_full_parameter_chunk,
     full_parameter_chunked_shard_identity,
     validate_full_parameter_chunked_shard_state,
 )
 
 
 _CUT_CONTENT_IDENTITY_DOMAIN = b"miles-full-parameter-chunked-cut-content-v1\0"
+
+# What this transport offers beyond the original protocol; callers that reach
+# the group through a forwarding handle check this set in their own Miles.
+#   skip_resident: ``apply_chunked_cut(skip_resident_fragments=True)``
+#   deferred_export: ``export_chunked_cut(defer_payload=True)`` and
+#       ``materialize_chunked_fragments``
+#   optimizer_state_check_model: ``optimizer_states(check_model=False)``
+FULL_PARAMETER_TRANSPORT_FEATURES = frozenset({"skip_resident", "deferred_export", "optimizer_state_check_model"})
 
 
 @dataclass(frozen=True)
@@ -150,6 +161,11 @@ def _fragment_row(
     return matches[0]
 
 
+def _require_stored(references: Sequence[object | None], fragment_id: int) -> None:
+    if any(is_deferred_full_parameter_chunk(reference) for reference in references):
+        raise RuntimeError(f"full-parameter fragment {fragment_id} is deferred: materialize it before reading its bytes")
+
+
 def iter_full_parameter_fragment_parts(
     cut: FullParameterChunkedCut,
     fragment_id: int,
@@ -159,6 +175,7 @@ def iter_full_parameter_fragment_parts(
     """Yield one canonical FP32 fragment without driver-side reassembly."""
 
     shard, descriptor, references = _fragment_row(cut, fragment_id)
+    _require_stored(references, fragment_id)
     ray_module = _resolve_ray_module(ray_module)
     for chunk, reference in zip(descriptor.chunks, references, strict=True):
         value = _validate_cpu_chunk(
@@ -189,6 +206,8 @@ def iter_full_parameter_fragment_delta_parts(
         fragment_id,
     )
     local_shard, local_descriptor, local_refs = _fragment_row(local, fragment_id)
+    _require_stored(anchor_refs, fragment_id)
+    _require_stored(local_refs, fragment_id)
     if anchor_shard.topology != local_shard.topology or anchor_shard.plan_hash != local_shard.plan_hash or anchor_descriptor.fragment_id != local_descriptor.fragment_id or anchor_descriptor.numel != local_descriptor.numel or len(anchor_descriptor.chunks) != len(local_descriptor.chunks):
         raise ValueError("full-parameter delta fragment identity changed")
     ray_module = _resolve_ray_module(ray_module)
@@ -218,7 +237,7 @@ def iter_full_parameter_fragment_delta_parts(
             plan_hash=local_shard.plan_hash,
         )
         delta = local_value.sub(anchor_value)
-        if not torch.isfinite(delta).all().item():
+        if not _all_finite(delta):
             raise ValueError("full-parameter delta contains NaN or Inf")
         yield _tensor_bytes(delta)
         del anchor_value, local_value, delta
@@ -241,6 +260,7 @@ def iter_full_parameter_authoritative_fragment_delta_parts(
         local_cut,
         fragment_id,
     )
+    _require_stored(local_refs, fragment_id)
     if local_cut.local_step_generation < 1:
         raise ValueError("full-parameter local cut has no optimizer progress")
     if authoritative_parameter_layout_hash != local_cut.parameter_layout_hash:
@@ -284,11 +304,15 @@ def iter_full_parameter_authoritative_fragment_delta_parts(
     ):
         if local_chunk.chunk_index != authoritative_chunk.chunk_index or local_chunk.flat_offset != authoritative_chunk.flat_offset or local_chunk.numel != authoritative_chunk.numel:
             raise ValueError("full-parameter authoritative chunk identity changed")
+        # Shape checks first; then the two value checks (finite + chunk hash)
+        # and the two fragment digests run concurrently with the subtraction
+        # (four SHA-256 streams; hashlib releases the GIL).  Every check ends
+        # before the part is yielded, in the original order of the errors.
         local_value = _validate_cpu_chunk(
             ray_module.get(local_ref),
             local_chunk,
             fragment_id=fragment_id,
-            verify_values=True,
+            verify_values=False,
             parameter_layout_hash=local_shard.parameter_layout_hash,
             plan_hash=local_shard.plan_hash,
         )
@@ -296,14 +320,43 @@ def iter_full_parameter_authoritative_fragment_delta_parts(
             ray_module.get(authoritative_ref),
             authoritative_chunk,
             fragment_id=fragment_id,
-            verify_values=True,
+            verify_values=False,
             parameter_layout_hash=authoritative_parameter_layout_hash,
             plan_hash=authoritative_plan_hash,
         )
-        local_fragment_hash.update(_tensor_bytes(local_value))
-        authoritative_fragment_hash.update(_tensor_bytes(authoritative_value))
+        pool = _scan_pool()
+        checks = [
+            pool.submit(
+                _validate_cpu_chunk,
+                local_value,
+                local_chunk,
+                fragment_id=fragment_id,
+                verify_values=True,
+                parameter_layout_hash=local_shard.parameter_layout_hash,
+                plan_hash=local_shard.plan_hash,
+            ),
+            pool.submit(
+                _validate_cpu_chunk,
+                authoritative_value,
+                authoritative_chunk,
+                fragment_id=fragment_id,
+                verify_values=True,
+                parameter_layout_hash=authoritative_parameter_layout_hash,
+                plan_hash=authoritative_plan_hash,
+            ),
+            pool.submit(local_fragment_hash.update, _tensor_bytes(local_value)),
+            pool.submit(authoritative_fragment_hash.update, _tensor_bytes(authoritative_value)),
+        ]
         delta = local_value.sub(authoritative_value)
-        if not torch.isfinite(delta).all().item():
+        failure = None
+        for check in checks:
+            try:
+                check.result()
+            except BaseException as error:  # noqa: BLE001 - raised after every check ended
+                failure = failure or error
+        if failure is not None:
+            raise failure
+        if not _all_finite(delta):
             raise ValueError("full-parameter authoritative delta contains NaN or Inf")
         yield _tensor_bytes(delta)
         del local_value, authoritative_value, delta
@@ -345,7 +398,7 @@ def store_full_parameter_fragment_payload(
             view = raw[start:stop]
             value = torch.frombuffer(view, dtype=torch.float32).clone().contiguous()
             view.release()
-            if not torch.isfinite(value).all().item():
+            if not _all_finite(value):
                 raise ValueError("full-parameter fragment contains NaN or Inf")
             fragment_digest.update(_tensor_bytes(value))
             descriptor = FullParameterChunkDescriptor(
@@ -588,7 +641,10 @@ async def export_chunked_cut(
     local_step_generation: int = 0,
     *,
     max_chunk_bytes: int = FULL_PARAMETER_DEFAULT_CHUNK_BYTES,
+    defer_payload: bool = False,
 ) -> FullParameterChunkedCut:
+    """``defer_payload``: descriptors only; see ``materialize_chunked_fragments``."""
+
     ordered = tuple(
         await _rank_values(
             group,
@@ -598,6 +654,7 @@ async def export_chunked_cut(
             policy_version=policy_version,
             local_step_generation=local_step_generation,
             max_chunk_bytes=max_chunk_bytes,
+            **({"defer_payload": True} if defer_payload else {}),
         )
     )
     layout_hashes = {state.parameter_layout_hash for state in ordered}
@@ -609,6 +666,53 @@ async def export_chunked_cut(
         parameter_layout_hash=next(iter(layout_hashes)),
         shards=ordered,
     )
+
+
+async def materialize_chunked_fragments(
+    group,
+    cut: FullParameterChunkedCut,
+    fragment_ids: Sequence[int],
+) -> dict[int, list[object]]:
+    """Store deferred fragments of ``cut`` from the owner ranks' masters.
+
+    Returns ``{fragment_id: chunk refs}`` for exactly ``fragment_ids``.  Each
+    owner rank refuses a fragment its masters no longer hold, and checks the
+    stored bytes against the cut's descriptor (same hashes).  The caller puts
+    the refs into its cut rows; the cut identity does not change."""
+
+    _validate_chunked_cut(cut)
+    wanted = list(dict.fromkeys(fragment_ids))
+    if len(wanted) != len(fragment_ids) or any(isinstance(f, bool) or not isinstance(f, int) for f in wanted):
+        raise ValueError("full-parameter materialize fragment IDs are malformed")
+    if not wanted:
+        return {}
+    owners = {descriptor.fragment_id: state.topology for state in cut.shards for descriptor in state.fragments}
+    if any(fragment_id not in owners for fragment_id in wanted):
+        raise ValueError("full-parameter materialize names a fragment outside the cut")
+    by_topology = {
+        state.topology: {
+            "state": state,
+            "fragment_ids": tuple(sorted(f for f in wanted if owners[f] == state.topology)),
+        }
+        for state in cut.shards
+    }
+    topologies = await _group_topologies(group)
+    if set(topologies) != set(by_topology):
+        raise RuntimeError("full-parameter chunked cut does not match the actor group")
+    results = await _rank_call(group, "materialize_full_parameter_fragments", by_topology=by_topology)
+    stored: dict[int, list[object]] = {}
+    for topology, result in zip(topologies, results, strict=True):
+        if isinstance(result, BaseException):
+            raise RuntimeError("Megatron rank refused to materialize full-parameter fragments") from result
+        expected = by_topology[topology]["fragment_ids"]
+        if not isinstance(result, tuple) or tuple(fragment_id for fragment_id, _refs in result) != expected:
+            raise RuntimeError("Megatron materialized the wrong full-parameter fragments")
+        for fragment_id, references in result:
+            descriptor = next(d for state in cut.shards for d in state.fragments if d.fragment_id == fragment_id)
+            if not isinstance(references, list) or len(references) != len(descriptor.chunks) or any(reference is None for reference in references):
+                raise RuntimeError("Megatron materialized incomplete full-parameter chunk refs")
+            stored[fragment_id] = references
+    return stored
 
 
 async def abort_prepared_chunked_cut(group, commit_token: str) -> tuple[object, ...]:
@@ -766,14 +870,18 @@ async def record_local_step(
     return tuple(sorted(results, key=lambda receipt: receipt.topology))
 
 
-async def optimizer_states(group) -> tuple[FullParameterOptimizerState, ...]:
-    """One bounded optimizer-progress proof from every rank."""
+async def optimizer_states(group, *, check_model: bool = True) -> tuple[FullParameterOptimizerState, ...]:
+    """One bounded optimizer-progress proof from every rank.
+
+    ``check_model=False``: skip each rank's whole-model model/master
+    comparison (see ``full_parameter_optimizer_state``)."""
 
     results = await _rank_values(
         group,
         "full_parameter_optimizer_state",
         FullParameterOptimizerState,
         "Megatron returned incomplete optimizer-state proofs",
+        **({} if check_model else {"check_model": False}),
     )
     progress = {
         (state.installed_policy_version, state.last_rollout_id, state.scheduler_num_steps)

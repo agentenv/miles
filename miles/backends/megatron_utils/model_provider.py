@@ -75,6 +75,12 @@ def _apply_bridge_runtime_config(provider, args: argparse.Namespace) -> None:
     if hasattr(args, "cpu_offloading"):
         provider.cpu_offloading = args.cpu_offloading
 
+    # Mamba: the inter-chunk SSM state dtype of training (None = params dtype,
+    # bf16; SGLang keeps fp32 states).  Copied only when set, so the default
+    # provider is unchanged.
+    if getattr(args, "mamba_training_ssm_states_dtype", None) is not None:
+        provider.mamba_training_ssm_states_dtype = args.mamba_training_ssm_states_dtype
+
     # communication overlap
     provider.tp_comm_overlap = args.tp_comm_overlap
 

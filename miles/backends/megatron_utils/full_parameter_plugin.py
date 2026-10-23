@@ -19,6 +19,7 @@ _ROLE_OPERATIONS = {
     "full_parameter_shard_manifest": state.full_parameter_shard_manifest,
     "install_full_parameter_fragment_plan": state.install_full_parameter_fragment_plan,
     "export_full_parameter_chunked_shard": state.export_full_parameter_chunked_shard,
+    "materialize_full_parameter_fragments": state.materialize_full_parameter_fragments,
     "prepare_full_parameter_chunked_shard": state.prepare_full_parameter_chunked_shard,
     "commit_prepared_full_parameter_shard": state.commit_prepared_full_parameter_shard,
     "record_full_parameter_local_step": state.record_full_parameter_local_step,

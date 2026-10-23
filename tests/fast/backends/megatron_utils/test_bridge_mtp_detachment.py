@@ -82,3 +82,14 @@ def test_bridge_mtp_detachment(
 
     assert provider.mtp_detach_heads is expected_detach
     assert provider.mtp_num_layers == 1
+
+
+def test_bridge_mamba_training_ssm_state_dtype_is_copied_only_when_set(
+    apply_bridge_runtime_config: Callable, runtime_args: argparse.Namespace
+) -> None:
+    provider = SimpleNamespace(mtp_num_layers=0, mtp_detach_heads=False)
+    apply_bridge_runtime_config(provider, runtime_args)
+    assert not hasattr(provider, "mamba_training_ssm_states_dtype")  # default provider unchanged
+    runtime_args.mamba_training_ssm_states_dtype = "torch.float32"
+    apply_bridge_runtime_config(provider, runtime_args)
+    assert provider.mamba_training_ssm_states_dtype == "torch.float32"
