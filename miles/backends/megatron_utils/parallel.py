@@ -97,8 +97,22 @@ def get_packed_seq_params(batch: dict[str, torch.Tensor], args: Namespace) -> Pa
             max_seqlen_q=batch["max_seqlen"],
             max_seqlen_kv=batch["max_seqlen"],
             qkv_format="thd",
+            total_tokens=_packed_total_tokens(batch, args),
         )
         batch["packed_seq_params"] = packed_seq_params
         return packed_seq_params
     else:
         return None
+
+
+def _packed_total_tokens(batch: dict[str, torch.Tensor], args: Namespace) -> int | None:
+    """Token count of the packed THD stream, so ``PackedSeqParams.__post_init__`` derives
+    ``seq_idx``. Mamba (and GatedDeltaNet) layers read ``seq_idx`` to restart the conv and
+    SSM state at each packed sample; without it the state of one sample flows into the
+    next one, which the rollout engine (one request per sequence) never does.
+
+    Only without context parallelism: with CP the stream is a per-rank slice and
+    ``cu_seqlens`` describes the global stream."""
+    if getattr(args, "context_parallel_size", 1) != 1 or getattr(args, "allgather_cp", False):
+        return None
+    return int(batch["tokens"].size(-1))
