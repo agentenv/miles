@@ -26,6 +26,7 @@ from miles.backends.megatron_utils.full_parameter_state import (
     _tensor_bytes,
     _validate_commit_token,
     _all_finite,
+    _run_now,
     _scan_pool,
     _validate_cpu_chunk,
     is_deferred_full_parameter_chunk,
@@ -324,7 +325,9 @@ def iter_full_parameter_authoritative_fragment_delta_parts(
             parameter_layout_hash=authoritative_parameter_layout_hash,
             plan_hash=authoritative_plan_hash,
         )
-        pool = _scan_pool()
+        # Small chunks (tests, tiny fragments): a thread handoff costs more
+        # than the hashing it would overlap.
+        pool = _scan_pool() if local_value.numel() >= _PARALLEL_CHECK_MIN_NUMEL else _INLINE
         checks = [
             pool.submit(
                 _validate_cpu_chunk,
@@ -364,6 +367,20 @@ def iter_full_parameter_authoritative_fragment_delta_parts(
         raise ValueError("full-parameter local fragment hash changed")
     if authoritative_fragment_hash.hexdigest() != authoritative_descriptor.payload_hash:
         raise ValueError("full-parameter authoritative fragment hash changed")
+
+
+_PARALLEL_CHECK_MIN_NUMEL = 1 << 20  # 4 MiB of f32
+
+
+class _Inline:
+    """``submit`` that runs at once (same interface as the scan pool)."""
+
+    @staticmethod
+    def submit(function, *args, **kwargs):
+        return _run_now(function, *args, **kwargs)
+
+
+_INLINE = _Inline()
 
 
 def store_full_parameter_fragment_payload(
