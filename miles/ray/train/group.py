@@ -501,11 +501,20 @@ class TrainerController:
         )
 
     async def apply_full_parameter_chunked_cut(
-        self, cut, *, commit_token: str | None = None, max_commit_attempts: int = 3
+        self,
+        cut,
+        *,
+        commit_token: str | None = None,
+        max_commit_attempts: int = 3,
+        skip_resident_fragments: bool = False,
     ) -> int:
         """Prepare, idempotently converge, then finalize every rank."""
         return await full_parameter_transport.apply_chunked_cut(
-            self, cut, commit_token=commit_token, max_commit_attempts=max_commit_attempts
+            self,
+            cut,
+            commit_token=commit_token,
+            max_commit_attempts=max_commit_attempts,
+            skip_resident_fragments=skip_resident_fragments,
         )
 
     async def record_full_parameter_local_step(self, *, base_policy_version: int, rollout_id: int) -> tuple:

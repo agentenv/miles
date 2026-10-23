@@ -5,8 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
 import struct
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 
@@ -373,6 +377,28 @@ class _PreparedFullParameterChunkedShard:
     scheduler_num_steps: int
     state_identity_hash: str
     commit_started: bool
+    # Fragments whose target bytes the optimizer masters already hold (same
+    # fragment payload hash as the last export or commit): prepare does not
+    # read them and commit does not copy them.
+    resident_fragment_ids: frozenset[int] = frozenset()
+    resident_record: object | None = None
+
+
+@dataclass(frozen=True)
+class _ResidentFullParameterFragments:
+    """Which fragment bytes the optimizer masters hold, by fragment payload hash.
+
+    Written by a chunked export (the bytes it hashed are the masters) and by a
+    chunked commit (the masters now hold the target).  Valid only while the
+    tracking state it was taken at is unchanged: a local step, a restore, a
+    legacy apply or the start of a commit drops it."""
+
+    parameter_layout_hash: str
+    plan_hash: str
+    policy_version: int
+    local_step_generation: int
+    scheduler_num_steps: int
+    payload_hashes: Mapping[int, tuple[int, str]]
 
 
 @dataclass(frozen=True)
@@ -639,6 +665,85 @@ def _chunk_hash(
     digest.update(flat_offset.to_bytes(8, "little"))
     digest.update(_tensor_bytes(value))
     return digest.hexdigest()
+
+
+_HASH_POOL: ThreadPoolExecutor | None = None
+_HASH_POOL_LOCK = threading.Lock()
+
+
+def _hash_pool() -> ThreadPoolExecutor:
+    """Two hashing threads (hashlib and torch release the GIL on large buffers)."""
+
+    global _HASH_POOL
+    with _HASH_POOL_LOCK:
+        if _HASH_POOL is None:
+            _HASH_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="miles-fp-hash")
+        return _HASH_POOL
+
+
+_RESIDENT_SKIP_ENV = "MILES_FULL_PARAMETER_SKIP_RESIDENT"
+
+
+def _resident_skip_enabled() -> bool:
+    return os.environ.get(_RESIDENT_SKIP_ENV, "1") != "0"
+
+
+def forget_full_parameter_resident_fragments(actor) -> None:
+    """Drop the record of which fragment bytes the masters hold.
+
+    Call after anything writes optimizer masters outside the chunked
+    export/commit path (a checkpoint or peer snapshot restore)."""
+
+    actor._external_full_parameter_resident = None
+
+
+def _record_resident_fragments(
+    actor,
+    *,
+    parameter_layout_hash: str,
+    plan_hash: str,
+    policy_version: int,
+    local_step_generation: int,
+    fragments: Sequence[FullParameterFragmentDescriptor],
+) -> None:
+    actor._external_full_parameter_resident = _ResidentFullParameterFragments(
+        parameter_layout_hash=parameter_layout_hash,
+        plan_hash=plan_hash,
+        policy_version=policy_version,
+        local_step_generation=local_step_generation,
+        scheduler_num_steps=_scheduler_num_steps(actor),
+        payload_hashes={fragment.fragment_id: (fragment.numel, fragment.payload_hash) for fragment in fragments},
+    )
+
+
+def _resident_fragment_ids(actor, state: FullParameterChunkedShardState) -> tuple[frozenset[int], object | None]:
+    """Fragments of ``state`` whose bytes the masters provably hold now."""
+
+    record = getattr(actor, "_external_full_parameter_resident", None)
+    if not _resident_skip_enabled() or not isinstance(record, _ResidentFullParameterFragments):
+        return frozenset(), None
+    installed, generation, exported, _anchor = _require_full_parameter_tracking(actor)
+    if (
+        record.parameter_layout_hash != state.parameter_layout_hash
+        or record.plan_hash != state.plan_hash
+        or record.policy_version != installed
+        or record.local_step_generation != generation
+        or exported != generation
+        or record.scheduler_num_steps != _scheduler_num_steps(actor)
+    ):
+        return frozenset(), None
+    resident = frozenset(
+        fragment.fragment_id
+        for fragment in state.fragments
+        if record.payload_hashes.get(fragment.fragment_id) == (fragment.numel, fragment.payload_hash)
+    )
+    return resident, record
+
+
+def _note_apply_stats(actor, phase: str, **values) -> None:
+    stats = dict(getattr(actor, "_external_full_parameter_apply_stats", None) or {})
+    stats[phase] = values
+    actor._external_full_parameter_apply_stats = stats
 
 
 def full_parameter_chunked_shard_identity(
@@ -1301,6 +1406,7 @@ def initialize_full_parameter_tracking(actor, policy_version: int) -> None:
         actor._external_full_scheduler_anchor_steps = anchor
         actor._external_full_last_local_rollout_id = None
         actor._external_full_last_local_step_receipt = None
+        forget_full_parameter_resident_fragments(actor)
         return
     installed, _generation, _exported, _anchor = _require_full_parameter_tracking(actor)
     if installed != policy_version:
@@ -1329,6 +1435,8 @@ def rebase_full_parameter_scheduler_anchor(actor, *, reason: str) -> int:
     anchor = _scheduler_num_steps(actor)
     actor._external_full_scheduler_anchor_steps = anchor
     actor._external_full_scheduler_rebase_reason = reason
+    # The restore that needs this rebase wrote the masters.
+    forget_full_parameter_resident_fragments(actor)
     return anchor
 
 
@@ -1418,6 +1526,8 @@ def record_full_parameter_local_step(
         optimizer_owned_parameter_ids=optimizer_owned,
     )
     generation += 1
+    # The local step changed the masters.
+    forget_full_parameter_resident_fragments(actor)
     receipt = FullParameterLocalStepReceipt(
         topology=full_parameter_topology(),
         role=role,
@@ -1512,6 +1622,7 @@ def apply_full_parameter_shard(
         raise RuntimeError("full-parameter global apply has unexported local progress")
     if state.policy_version <= installed:
         raise RuntimeError("full-parameter policy version is stale")
+    forget_full_parameter_resident_fragments(actor)
     named_parameters, optimizer_owned = _actor_parameter_context(actor)
     count = apply_full_parameter_shard_values(
         state,
@@ -1616,23 +1727,29 @@ def _export_fragment_chunks(
             if source_offset == source.numel():
                 source_index += 1
                 source_offset = 0
-        if not torch.isfinite(chunk).all().item():
-            raise ValueError("full-parameter optimizer master contains NaN or Inf")
         chunk_index = len(chunk_descriptors)
+        # The finite check, the chunk hash and the fragment digest read the
+        # same immutable chunk; they run concurrently and give the same bytes.
+        finite = _hash_pool().submit(lambda value: torch.isfinite(value).all().item(), chunk)
+        chunk_hash = _hash_pool().submit(
+            _chunk_hash,
+            fragment.fragment_id,
+            chunk_index,
+            flat_offset,
+            chunk,
+            parameter_layout_hash=parameter_layout_hash,
+            plan_hash=plan_hash,
+        )
         raw = _tensor_bytes(chunk)
+        if not finite.result():
+            chunk_hash.result()
+            raise ValueError("full-parameter optimizer master contains NaN or Inf")
         fragment_digest.update(raw)
         descriptor = FullParameterChunkDescriptor(
             chunk_index=chunk_index,
             flat_offset=flat_offset,
             numel=chunk_numel,
-            payload_hash=_chunk_hash(
-                fragment.fragment_id,
-                chunk_index,
-                flat_offset,
-                chunk,
-                parameter_layout_hash=parameter_layout_hash,
-                plan_hash=plan_hash,
-            ),
+            payload_hash=chunk_hash.result(),
         )
         reference = ray_module.put(chunk)
         if reference is None:
@@ -1678,6 +1795,7 @@ def export_full_parameter_chunked_shard(
         raise RuntimeError("full-parameter export policy version is not installed")
     if local_step_generation != generation:
         raise RuntimeError("full-parameter export local-step generation is stale")
+    started = time.monotonic()
     max_chunk_numel = _validate_chunk_byte_limit(max_chunk_bytes)
     ray_module = _resolve_ray_module(ray_module)
     plan, manifest = _require_full_parameter_fragment_plan(actor, role=role)
@@ -1713,6 +1831,15 @@ def export_full_parameter_chunked_shard(
         chunk_refs=chunk_refs,
     )
     actor._external_full_exported_local_step_generation = local_step_generation
+    _record_resident_fragments(
+        actor,
+        parameter_layout_hash=plan.parameter_layout_hash,
+        plan_hash=plan.plan_hash,
+        policy_version=policy_version,
+        local_step_generation=local_step_generation,
+        fragments=fragment_descriptors,
+    )
+    _note_apply_stats(actor, "export", fragments=len(fragment_descriptors), seconds=time.monotonic() - started)
     return state
 
 
@@ -1740,8 +1867,16 @@ def prepare_full_parameter_chunked_shard(
     commit_token: str,
     role: str = "actor",
     ray_module=None,
+    skip_resident: bool = False,
 ) -> int:
-    """Validate every immutable chunk and stage only its refs for later commit."""
+    """Validate every immutable chunk and stage only its refs for later commit.
+
+    ``skip_resident``: the caller states that it built ``state`` from the cut
+    this actor last exported or committed, changing only some fragments.  A
+    fragment whose payload hash equals the one the actor recorded for its
+    masters at that export/commit is then neither read nor copied: the masters
+    already hold those bytes.  The record is dropped by every local step,
+    restore rebase and legacy apply, so the skip never applies across one."""
 
     require_full_parameter_actor(actor.args, "prepare")
     token = _validate_commit_token(commit_token)
@@ -1778,29 +1913,50 @@ def prepare_full_parameter_chunked_shard(
     ray_module = _resolve_ray_module(ray_module)
     plan, manifest = _require_full_parameter_fragment_plan(actor, role=role)
     _validate_chunked_shard_against_plan(state, plan, manifest)
+    started = time.monotonic()
+    resident, resident_record = (
+        _resident_fragment_ids(actor, state) if skip_resident else (frozenset(), None)
+    )
     for fragment, references in zip(
         state.fragments,
         state.chunk_refs,
         strict=True,
     ):
+        if fragment.fragment_id in resident:
+            # The masters already hold these exact bytes; commit skips them.
+            continue
         fragment_digest = _fragment_hasher(
             fragment.fragment_id,
             state.parameter_layout_hash,
             state.plan_hash,
         )
         for descriptor, reference in zip(fragment.chunks, references, strict=True):
-            value = _validate_cpu_chunk(
-                ray_module.get(reference),
+            raw = ray_module.get(reference)
+            checked = _hash_pool().submit(
+                _validate_cpu_chunk,
+                raw,
                 descriptor,
                 fragment_id=fragment.fragment_id,
                 verify_values=True,
                 parameter_layout_hash=state.parameter_layout_hash,
                 plan_hash=state.plan_hash,
             )
-            fragment_digest.update(_tensor_bytes(value))
-            del value
+            if isinstance(raw, torch.Tensor) and raw.device.type == "cpu" and raw.dtype == torch.float32 and raw.ndim == 1 and raw.is_contiguous():
+                fragment_digest.update(_tensor_bytes(raw))
+                checked.result()
+            else:
+                fragment_digest.update(_tensor_bytes(checked.result()))
+            del raw, checked
         if fragment_digest.hexdigest() != fragment.payload_hash:
             raise ValueError("full-parameter fragment hash changed")
+    _note_apply_stats(
+        actor,
+        "prepare",
+        fragments=len(state.fragments),
+        resident_fragments=len(resident),
+        read_fragments=len(state.fragments) - len(resident),
+        seconds=time.monotonic() - started,
+    )
     parameter_count = len(manifest.specs)
     actor._external_full_parameter_prepared_cut = _PreparedFullParameterChunkedShard(
         commit_token=token,
@@ -1812,6 +1968,8 @@ def prepare_full_parameter_chunked_shard(
         scheduler_num_steps=_scheduler_num_steps(actor),
         state_identity_hash=state_identity_hash,
         commit_started=False,
+        resident_fragment_ids=resident,
+        resident_record=resident_record,
     )
     return parameter_count
 
@@ -1871,6 +2029,16 @@ def _copy_fragment_chunks_to_masters(
     return copied_parameters
 
 
+def _fragment_completed_parameters(
+    fragment: FullParameterFragmentPlan,
+    masters: Mapping[str, torch.Tensor],
+) -> int:
+    """Parameters whose last flat range lies in ``fragment`` (as the copy counts them)."""
+
+    members = fragment.members({name: masters[name].numel() for name in fragment.wire_names})
+    return sum(stop == masters[name].numel() for name, _start, stop in members)
+
+
 @torch.no_grad()
 def commit_prepared_full_parameter_shard(
     actor,
@@ -1922,15 +2090,31 @@ def commit_prepared_full_parameter_shard(
     if specs != manifest.specs:
         raise RuntimeError("full-parameter local specs changed after prepare")
     if not prepared.commit_started:
+        # Resident fragments are skipped only while the masters provably hold
+        # them: the record taken at prepare must still be the live one.  A
+        # retried commit (commit_started) wrote only non-resident fragments,
+        # which never overlap a resident one, so the skip stays exact.
+        if prepared.resident_fragment_ids and (
+            getattr(actor, "_external_full_parameter_resident", None) is not prepared.resident_record
+        ):
+            raise RuntimeError("full-parameter resident fragments changed after prepare")
         prepared = replace(prepared, commit_started=True)
         actor._external_full_parameter_prepared_cut = prepared
+    # From here the masters may be partly written: no record describes them.
+    forget_full_parameter_resident_fragments(actor)
+    started = time.monotonic()
     count = 0
+    copied_fragments = 0
     for fragment, descriptor, references in zip(
         plan.fragments,
         state.fragments,
         state.chunk_refs,
         strict=True,
     ):
+        if fragment.fragment_id in prepared.resident_fragment_ids:
+            count += _fragment_completed_parameters(fragment, masters)
+            continue
+        copied_fragments += 1
         count += _copy_fragment_chunks_to_masters(
             fragment,
             descriptor,
@@ -1942,6 +2126,7 @@ def commit_prepared_full_parameter_shard(
         )
     if count != prepared.parameter_tensor_count or count != len(specs):
         raise RuntimeError("full-parameter chunked apply is incomplete")
+    copied_seconds = time.monotonic() - started
     _propagate_master_writes(actor)
     _copy_masters_to_model(actor)
     model_count = _validate_model_matches_masters(
@@ -1963,6 +2148,23 @@ def commit_prepared_full_parameter_shard(
         policy_version=state.policy_version,
         parameter_tensor_count=count,
         state_identity_hash=prepared.state_identity_hash,
+    )
+    _record_resident_fragments(
+        actor,
+        parameter_layout_hash=state.parameter_layout_hash,
+        plan_hash=state.plan_hash,
+        policy_version=state.policy_version,
+        local_step_generation=0,
+        fragments=state.fragments,
+    )
+    _note_apply_stats(
+        actor,
+        "commit",
+        fragments=len(state.fragments),
+        copied_fragments=copied_fragments,
+        resident_fragments=len(prepared.resident_fragment_ids),
+        copy_seconds=copied_seconds,
+        seconds=time.monotonic() - started,
     )
     del actor._external_full_parameter_prepared_cut
     return count

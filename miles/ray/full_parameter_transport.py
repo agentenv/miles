@@ -631,8 +631,15 @@ async def apply_chunked_cut(
     *,
     commit_token: str | None = None,
     max_commit_attempts: int = 3,
+    skip_resident_fragments: bool = False,
 ) -> int:
-    """Prepare, idempotently converge, then finalize every owner rank."""
+    """Prepare, idempotently converge, then finalize every owner rank.
+
+    ``skip_resident_fragments``: ``cut`` is the last exported or committed
+    cut with some fragments replaced; each rank reads and copies only the
+    fragments whose bytes its masters do not already hold (see
+    ``prepare_full_parameter_chunked_shard``).  The applied values are the
+    same either way."""
 
     _validate_chunked_cut(cut)
     if cut.local_step_generation != 0:
@@ -649,6 +656,7 @@ async def apply_chunked_cut(
         "prepare_full_parameter_chunked_shard",
         by_topology={topology: {"state": state} for topology, state in by_topology.items()},
         commit_token=token,
+        **({"skip_resident": True} if skip_resident_fragments else {}),
     )
     prepare_failure = _first_failure(prepare_results, expected_positive=True)
     if prepare_failure is not None:

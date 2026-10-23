@@ -806,3 +806,23 @@ async def test_group_plan_install_requires_complete_global_fragment_sweep():
     )
     with pytest.raises(ValueError, match="complete fragment sweep"):
         await install_fragment_plans(group, invalid)
+
+
+async def test_skip_resident_reaches_only_prepare_and_only_when_asked():
+    seen = []
+
+    class _Recording(_Group):
+        async def run_plugin(self, fn_path, kwargs):
+            seen.append((kwargs["operation"], dict(kwargs["kwargs"])))
+            return await super().run_plugin(fn_path, kwargs)
+
+    target = _cut(policy_version=1, local_step_generation=0)
+    events = []
+    assert await apply_chunked_cut(_Recording([_Actor(0, events), _Actor(1, events)]), target,
+                                   commit_token="plain") == 2
+    assert all("skip_resident" not in arguments for _operation, arguments in seen)
+    seen.clear()
+    assert await apply_chunked_cut(_Recording([_Actor(0, events), _Actor(1, events)]), target,
+                                   commit_token="skip", skip_resident_fragments=True) == 2
+    flagged = [operation for operation, arguments in seen if arguments.get("skip_resident") is True]
+    assert flagged == ["prepare_full_parameter_chunked_shard"]
