@@ -19,9 +19,7 @@ from miles.backends.megatron_utils import full_parameter_state as fps
 from miles.backends.megatron_utils.full_parameter_state import (
     FullParameterFragmentPlan,
     FullParameterOwnerFragmentPlan,
-    commit_prepared_full_parameter_shard,
     export_full_parameter_chunked_shard,
-    finalize_full_parameter_commit,
     full_parameter_shard_manifest,
     install_full_parameter_fragment_plan,
     is_deferred_full_parameter_chunk,
