@@ -499,22 +499,27 @@ class TrainerController:
         *,
         max_chunk_bytes: int,
         defer_payload: bool = False,
+        lazy: bool = False,
     ):
         """Export small descriptors and nested Ray ObjectRefs only.
 
         ``defer_payload``: descriptors only, no Ray objects; see
-        ``materialize_full_parameter_fragments``."""
+        ``materialize_full_parameter_fragments``.  ``lazy``: labels instead of
+        content hashes, no master read (``full_parameter_transport``)."""
         return await full_parameter_transport.export_chunked_cut(
             self,
             policy_version,
             local_step_generation,
             max_chunk_bytes=max_chunk_bytes,
             defer_payload=defer_payload,
+            lazy=lazy,
         )
 
-    async def materialize_full_parameter_fragments(self, cut, fragment_ids) -> dict:
+    async def materialize_full_parameter_fragments(self, cut, fragment_ids, *, return_descriptors: bool = False) -> dict:
         """Store deferred fragments of ``cut`` while the masters hold them."""
-        return await full_parameter_transport.materialize_chunked_fragments(self, cut, tuple(fragment_ids))
+        return await full_parameter_transport.materialize_chunked_fragments(
+            self, cut, tuple(fragment_ids), return_descriptors=return_descriptors
+        )
 
     async def apply_full_parameter_chunked_cut(
         self,
@@ -533,10 +538,12 @@ class TrainerController:
             skip_resident_fragments=skip_resident_fragments,
         )
 
-    async def record_full_parameter_local_step(self, *, base_policy_version: int, rollout_id: int) -> tuple:
+    async def record_full_parameter_local_step(
+        self, *, base_policy_version: int, rollout_id: int, check_model: bool = True
+    ) -> tuple:
         """Record exact successful scheduler progress on every rank."""
         return await full_parameter_transport.record_local_step(
-            self, base_policy_version=base_policy_version, rollout_id=rollout_id
+            self, base_policy_version=base_policy_version, rollout_id=rollout_id, check_model=check_model
         )
 
     async def full_parameter_optimizer_states(self, *, check_model: bool = True) -> tuple:

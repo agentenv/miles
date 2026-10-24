@@ -171,12 +171,12 @@ def test_retried_commit_after_a_partial_copy_keeps_the_skip_exact(monkeypatch):
     original = fps._propagate_master_writes
     calls = 0
 
-    def fail_once(target_actor):
+    def fail_once(target_actor, **kwargs):
         nonlocal calls
         calls += 1
         if calls == 1:
             raise RuntimeError("injected failure after the copy")
-        return original(target_actor)
+        return original(target_actor, **kwargs)
 
     monkeypatch.setattr(fps, "_propagate_master_writes", fail_once)
     with pytest.raises(RuntimeError, match="injected"):

@@ -29,6 +29,10 @@ _FP32_BYTES = 4
 
 _FRAGMENT_HASH_DOMAIN = b"miles-full-parameter-fragment-v1\0"
 _CHUNK_HASH_DOMAIN = b"miles-full-parameter-chunk-v1\0"
+# Labels of a lazy export (see ``_lazy_fragment_descriptor``).  Their own
+# domains keep a label from ever equalling a content hash.
+_LAZY_CHUNK_DOMAIN = b"miles-full-parameter-lazy-chunk-v1\0"
+_LAZY_FRAGMENT_DOMAIN = b"miles-full-parameter-lazy-fragment-v1\0"
 _SHARD_IDENTITY_DOMAIN = b"miles-full-parameter-chunked-shard-identity-v1\0"
 
 
@@ -383,6 +387,9 @@ class _PreparedFullParameterChunkedShard:
     # read them and commit does not copy them.
     resident_fragment_ids: frozenset[int] = frozenset()
     resident_record: object | None = None
+    # Resident fragments whose descriptor is a lazy-export label; the commit
+    # keeps them labelled in the record it writes.
+    lazy_fragment_ids: frozenset[int] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -392,7 +399,12 @@ class _ResidentFullParameterFragments:
     Written by a chunked export (the bytes it hashed are the masters) and by a
     chunked commit (the masters now hold the target).  Valid only while the
     tracking state it was taken at is unchanged: a local step, a restore, a
-    legacy apply or the start of a commit drops it."""
+    legacy apply or the start of a commit drops it.
+
+    ``lazy_fragment_ids``: fragments whose recorded payload hash is a label of
+    a lazy export, not a content hash.  The label is fresh for every lazy
+    export and only this record vouches for it, so a row carrying it is
+    either resident or unusable (its stored bytes cannot be checked)."""
 
     parameter_layout_hash: str
     plan_hash: str
@@ -400,6 +412,7 @@ class _ResidentFullParameterFragments:
     local_step_generation: int
     scheduler_num_steps: int
     payload_hashes: Mapping[int, tuple[int, str]]
+    lazy_fragment_ids: frozenset[int] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -817,6 +830,7 @@ def _record_resident_fragments(
     policy_version: int,
     local_step_generation: int,
     fragments: Sequence[FullParameterFragmentDescriptor],
+    lazy_fragment_ids: frozenset[int] = frozenset(),
 ) -> None:
     actor._external_full_parameter_resident = _ResidentFullParameterFragments(
         parameter_layout_hash=parameter_layout_hash,
@@ -825,6 +839,7 @@ def _record_resident_fragments(
         local_step_generation=local_step_generation,
         scheduler_num_steps=_scheduler_num_steps(actor),
         payload_hashes={fragment.fragment_id: (fragment.numel, fragment.payload_hash) for fragment in fragments},
+        lazy_fragment_ids=frozenset(lazy_fragment_ids),
     )
 
 
@@ -858,6 +873,23 @@ def _resident_fragment_ids(
         if record.payload_hashes.get(fragment.fragment_id) == (fragment.numel, fragment.payload_hash)
     )
     return resident, record
+
+
+def _lazy_fragment_ids(actor, state: FullParameterChunkedShardState) -> frozenset[int]:
+    """Fragments of ``state`` whose descriptor is a label the live record minted.
+
+    Only the label is compared here; whether the record still describes the
+    masters is :func:`_resident_fragment_ids`' check."""
+
+    record = getattr(actor, "_external_full_parameter_resident", None)
+    if not isinstance(record, _ResidentFullParameterFragments) or not record.lazy_fragment_ids:
+        return frozenset()
+    return frozenset(
+        fragment.fragment_id
+        for fragment in state.fragments
+        if fragment.fragment_id in record.lazy_fragment_ids
+        and record.payload_hashes.get(fragment.fragment_id) == (fragment.numel, fragment.payload_hash)
+    )
 
 
 def _note_apply_stats(actor, phase: str, **values) -> None:
@@ -1159,7 +1191,7 @@ def _distributed_masters(optimizer) -> dict[int, tuple[torch.Tensor, torch.Tenso
 
 
 @torch.no_grad()
-def _propagate_master_writes(actor) -> int:
+def _propagate_master_writes(actor, *, owned_ids: frozenset[int] | set[int] | None = None) -> int:
     """Make the tensors Megatron's HybridDeviceOptimizer steps agree with written masters.
 
     Under ``--optimizer-cpu-offload`` each base-optimizer parameter may have an
@@ -1173,6 +1205,9 @@ def _propagate_master_writes(actor) -> int:
       its FP32 inner copy, which is the master.
 
     Adam moments are left as they are (the non-distributed path keeps them too).
+
+    ``owned_ids``: only the pairs whose optimizer-owned tensor is one of these
+    (the masters a commit wrote); None propagates every pair.
     """
 
     pairs = 0
@@ -1181,7 +1216,7 @@ def _propagate_master_writes(actor) -> int:
         if inner is None:
             continue
         for owned, copy in inner.items():
-            if copy is owned:
+            if copy is owned or (owned_ids is not None and id(owned) not in owned_ids):
                 continue
             if copy.numel() != owned.numel():
                 raise RuntimeError("hybrid optimizer inner copy has a different size")
@@ -1620,8 +1655,14 @@ def record_full_parameter_local_step(
     base_policy_version: int,
     rollout_id: int,
     role: str = "actor",
+    check_model: bool = True,
 ) -> FullParameterLocalStepReceipt:
-    """Commit one local-step generation after exact scheduler progress."""
+    """Commit one local-step generation after exact scheduler progress.
+
+    ``check_model=False`` skips the whole-model model/master comparison.  A
+    caller does so only when its next export is lazy: that export reads no
+    master, and every fragment it later materializes compares its own
+    parameters with their masters."""
 
     require_full_parameter_actor(actor.args, "record")
     _reject_prepared_full_parameter_boundary_mutation(actor)
@@ -1653,11 +1694,12 @@ def record_full_parameter_local_step(
     end = _scheduler_num_steps(actor)
     if end != start + scheduler_increment:
         raise RuntimeError("full-parameter local step lacks exact optimizer progress")
-    named_parameters, optimizer_owned = _actor_parameter_context(actor)
-    _validate_model_matches_masters(
-        named_parameters,
-        optimizer_owned_parameter_ids=optimizer_owned,
-    )
+    if check_model:
+        named_parameters, optimizer_owned = _actor_parameter_context(actor)
+        _validate_model_matches_masters(
+            named_parameters,
+            optimizer_owned_parameter_ids=optimizer_owned,
+        )
     generation += 1
     # The local step changed the masters.
     forget_full_parameter_resident_fragments(actor)
@@ -2023,6 +2065,70 @@ def _describe_fragment(
     )
 
 
+def _lazy_fragment_descriptor(
+    fragment: FullParameterFragmentPlan,
+    *,
+    max_chunk_numel: int,
+    parameter_layout_hash: str,
+    plan_hash: str,
+    nonce: bytes,
+) -> FullParameterFragmentDescriptor:
+    """``fragment``'s chunk geometry with label hashes; no master is read.
+
+    Each chunk and the fragment get a SHA-256 over their own lazy domain, the
+    same identity fields as the content hash and ``nonce``, which is fresh for
+    every lazy export.  The label therefore names one export of the masters
+    and never equals a content hash; ``materialize_full_parameter_fragments``
+    computes the content descriptor when a fragment leaves the actor."""
+
+    chunks = []
+    flat_offset = 0
+    while flat_offset < fragment.numel:
+        chunk_numel = min(max_chunk_numel, fragment.numel - flat_offset)
+        digest = hashlib.sha256(_LAZY_CHUNK_DOMAIN)
+        digest.update(parameter_layout_hash.encode("ascii"))
+        digest.update(plan_hash.encode("ascii"))
+        digest.update(fragment.fragment_id.to_bytes(8, "little"))
+        digest.update(len(chunks).to_bytes(8, "little"))
+        digest.update(flat_offset.to_bytes(8, "little"))
+        digest.update(nonce)
+        chunks.append(
+            FullParameterChunkDescriptor(
+                chunk_index=len(chunks),
+                flat_offset=flat_offset,
+                numel=chunk_numel,
+                payload_hash=digest.hexdigest(),
+            )
+        )
+        flat_offset += chunk_numel
+    digest = hashlib.sha256(_LAZY_FRAGMENT_DOMAIN)
+    digest.update(parameter_layout_hash.encode("ascii"))
+    digest.update(plan_hash.encode("ascii"))
+    digest.update(fragment.fragment_id.to_bytes(8, "little"))
+    digest.update(nonce)
+    return FullParameterFragmentDescriptor(
+        fragment_id=fragment.fragment_id,
+        numel=fragment.numel,
+        payload_hash=digest.hexdigest(),
+        chunks=tuple(chunks),
+    )
+
+
+def _same_fragment_geometry(
+    first: FullParameterFragmentDescriptor,
+    second: FullParameterFragmentDescriptor,
+) -> bool:
+    return (
+        first.fragment_id == second.fragment_id
+        and first.numel == second.numel
+        and len(first.chunks) == len(second.chunks)
+        and all(
+            (a.chunk_index, a.flat_offset, a.numel) == (b.chunk_index, b.flat_offset, b.numel)
+            for a, b in zip(first.chunks, second.chunks, strict=True)
+        )
+    )
+
+
 class _Done:
     """A finished future (``_hash_pool().submit`` without the pool)."""
 
@@ -2075,6 +2181,7 @@ def export_full_parameter_chunked_shard(
     role: str = "actor",
     ray_module=None,
     defer_payload: bool = False,
+    lazy: bool = False,
 ) -> FullParameterChunkedShardState:
     """Export bounded owner chunks without materializing a rank or global cut.
 
@@ -2082,9 +2189,18 @@ def export_full_parameter_chunked_shard(
     does (same descriptors, same hashes, same NaN/Inf refusal) but store no
     bytes in Ray; every chunk ref is ``DEFERRED_FULL_PARAMETER_CHUNK``.
     ``materialize_full_parameter_fragments`` stores the fragments a caller
-    needs while the masters still hold them."""
+    needs while the masters still hold them.
+
+    ``lazy`` (with ``defer_payload``): read no master at all.  Every
+    descriptor carries the real chunk geometry and label hashes
+    (``_lazy_fragment_descriptor``), so the cut is a unique name for this
+    export, not a content proof, and no NaN/Inf check runs.  The content
+    descriptor, the NaN/Inf check and the model/master check of a fragment
+    run when ``materialize_full_parameter_fragments`` stores it."""
 
     require_full_parameter_actor(actor.args, "export")
+    if lazy and not defer_payload:
+        raise ValueError("a lazy full-parameter export must defer its payload")
     assert_full_parameter_boundary_clear(actor)
     _validate_scheduler_tracking_congruence(actor, role=role)
     _validate_non_negative_integer(policy_version, "policy version")
@@ -2112,7 +2228,22 @@ def export_full_parameter_chunked_shard(
         raise RuntimeError("full-parameter local specs changed after plan installation")
     fragment_descriptors = []
     chunk_refs = []
-    if defer_payload:
+    lazy_ids: frozenset[int] = frozenset()
+    if lazy:
+        nonce = os.urandom(32)
+        fragment_descriptors = [
+            _lazy_fragment_descriptor(
+                fragment,
+                max_chunk_numel=max_chunk_numel,
+                parameter_layout_hash=plan.parameter_layout_hash,
+                plan_hash=plan.plan_hash,
+                nonce=nonce,
+            )
+            for fragment in plan.fragments
+        ]
+        lazy_ids = frozenset(fragment.fragment_id for fragment in plan.fragments)
+        chunk_refs = [[DEFERRED_FULL_PARAMETER_CHUNK] * len(descriptor.chunks) for descriptor in fragment_descriptors]
+    elif defer_payload:
         fragment_descriptors = _parallel_map(
             lambda fragment: _describe_fragment(
                 fragment,
@@ -2152,12 +2283,14 @@ def export_full_parameter_chunked_shard(
         policy_version=policy_version,
         local_step_generation=local_step_generation,
         fragments=fragment_descriptors,
+        lazy_fragment_ids=lazy_ids,
     )
     _note_apply_stats(
         actor,
         "export",
         fragments=len(fragment_descriptors),
         deferred=bool(defer_payload),
+        lazy=bool(lazy),
         seconds=time.monotonic() - started,
     )
     return state
@@ -2170,7 +2303,8 @@ def materialize_full_parameter_fragments(
     fragment_ids: Sequence[int],
     role: str = "actor",
     ray_module=None,
-) -> tuple[tuple[int, list[object]], ...]:
+    return_descriptors: bool = False,
+) -> tuple[tuple, ...]:
     """Store the bytes of deferred fragments of ``state`` while the masters hold them.
 
     Each requested fragment must be resident: its payload hash equals the one
@@ -2180,7 +2314,15 @@ def materialize_full_parameter_fragments(
     chunk geometry and its descriptor must come out identical, so the stored
     bytes are exactly the bytes the deferred export hashed.  Returns
     ``(fragment_id, chunk refs)`` in fragment order; the masters, the record
-    and the tracking state do not change."""
+    and the tracking state do not change.
+
+    A fragment of a lazy export carries labels instead of content hashes:
+    the record proves the masters still hold the exported bytes, the export
+    here computes the content descriptor (with the NaN/Inf check) and its
+    model parameters are compared with their masters.  Its descriptor then
+    differs from the label, so the caller must ask for it
+    (``return_descriptors``: rows are ``(fragment_id, chunk refs,
+    descriptor)``) and read the stored chunks through it."""
 
     require_full_parameter_actor(actor.args, "materialize")
     assert_full_parameter_boundary_clear(actor)
@@ -2206,6 +2348,9 @@ def materialize_full_parameter_fragments(
     stale = sorted(fragment_id for fragment_id in requested if fragment_id not in resident)
     if stale:
         raise RuntimeError(f"full-parameter fragments {stale} are no longer held by the masters; a deferred export cannot be materialized after they changed")
+    lazy = _lazy_fragment_ids(actor, state) & frozenset(requested)
+    if lazy and not return_descriptors:
+        raise RuntimeError(f"full-parameter fragments {sorted(lazy)} come from a lazy export: materialize them with return_descriptors=True")
     named_parameters, optimizer_owned = _actor_parameter_context(actor)
     specs, masters = _specs_and_masters(
         named_parameters,
@@ -2216,7 +2361,7 @@ def materialize_full_parameter_fragments(
     if specs != manifest.specs:
         raise RuntimeError("full-parameter local specs changed after plan installation")
 
-    def store(fragment_id: int) -> tuple[int, list[object]]:
+    def store(fragment_id: int) -> tuple[int, list[object], FullParameterFragmentDescriptor]:
         expected = descriptors[fragment_id]
         descriptor, references = _export_fragment_chunks(
             fragments[fragment_id],
@@ -2227,18 +2372,48 @@ def materialize_full_parameter_fragments(
             ray_module=ray_module,
             overlap_checks=len(requested) <= 1,
         )
-        if descriptor != expected:
+        if fragment_id in lazy:
+            if not _same_fragment_geometry(descriptor, expected):
+                raise RuntimeError(f"full-parameter fragment {fragment_id} geometry changed since its lazy export")
+        elif descriptor != expected:
             raise RuntimeError(f"full-parameter fragment {fragment_id} bytes changed since its deferred export")
-        return fragment_id, references
+        return fragment_id, references, descriptor
 
     stored = _parallel_map(store, sorted(requested))
+    checked = 0
+    if lazy:
+        # A lazy export compared no model parameter with its master: the
+        # parameters of every fragment that leaves the actor are compared now.
+        by_wire_name = _parameters_by_wire_name(named_parameters, specs)
+        names = dict.fromkeys(name for fragment_id in sorted(lazy) for name in fragments[fragment_id].wire_names)
+        checked = _validate_model_matches_masters(
+            (by_wire_name[name] for name in names),
+            optimizer_owned_parameter_ids=optimizer_owned,
+        )
     _note_apply_stats(
         actor,
         "materialize",
         fragments=len(stored),
+        lazy_fragments=len(lazy),
+        model_checked_parameters=checked,
         seconds=time.monotonic() - started,
     )
-    return tuple(stored)
+    if return_descriptors:
+        return tuple(stored)
+    return tuple((fragment_id, references) for fragment_id, references, _descriptor in stored)
+
+
+def _parameters_by_wire_name(
+    named_parameters: Iterable[tuple[str, torch.nn.Parameter]],
+    specs: Sequence[FullParameterShardSpec],
+) -> dict[str, tuple[str, torch.nn.Parameter]]:
+    """``wire name -> (name, parameter)``; ``specs`` come from ``_specs_and_masters``,
+    which orders them by parameter name."""
+
+    ordered = sorted(named_parameters, key=lambda value: value[0])
+    if len(ordered) != len(specs) or any(spec.name != name for spec, (name, _p) in zip(specs, ordered, strict=True)):
+        raise RuntimeError("full-parameter specs do not match the named parameters")
+    return {spec.wire_name: row for spec, row in zip(specs, ordered, strict=True)}
 
 
 def _validate_chunked_shard_against_plan(
@@ -2312,20 +2487,22 @@ def prepare_full_parameter_chunked_shard(
     plan, manifest = _require_full_parameter_fragment_plan(actor, role=role)
     _validate_chunked_shard_against_plan(state, plan, manifest)
     started = time.monotonic()
+    # A deferred fragment has no stored bytes and a lazy one has no content
+    # hash to check stored bytes against: only the masters hold them, so
+    # their residency does not depend on the skip switch.
     deferred = _deferred_fragment_ids(state)
+    lazy = _lazy_fragment_ids(actor, state)
     resident, resident_record = (
         _resident_fragment_ids(actor, state) if skip_resident else (frozenset(), None)
     )
-    if deferred - resident:
-        # A deferred fragment has no stored bytes: only the masters hold them.
-        # Its residency does not depend on the skip switch.
+    if (deferred | lazy) - resident:
         forced, forced_record = _resident_fragment_ids(actor, state, honor_kill_switch=False)
-        missing = sorted(deferred - forced)
+        missing = sorted((deferred | lazy) - forced)
         if missing:
-            raise RuntimeError(f"deferred full-parameter fragments {missing} are not held by the masters and have no stored bytes")
+            raise RuntimeError(f"deferred or lazy full-parameter fragments {missing} are not held by the masters and have no checkable stored bytes")
         if resident_record is None:
             resident_record = forced_record
-        resident = resident | deferred
+        resident = resident | deferred | lazy
     rows = [
         (fragment, references)
         for fragment, references in zip(state.fragments, state.chunk_refs, strict=True)
@@ -2386,6 +2563,7 @@ def prepare_full_parameter_chunked_shard(
         commit_started=False,
         resident_fragment_ids=resident,
         resident_record=resident_record,
+        lazy_fragment_ids=lazy,
     )
     return parameter_count
 
@@ -2523,6 +2701,7 @@ def commit_prepared_full_parameter_shard(
     started = time.monotonic()
     count = 0
     copied_fragments = 0
+    written: dict[str, None] = {}
     for fragment, descriptor, references in zip(
         plan.fragments,
         state.fragments,
@@ -2533,6 +2712,7 @@ def commit_prepared_full_parameter_shard(
             count += _fragment_completed_parameters(fragment, masters)
             continue
         copied_fragments += 1
+        written.update(dict.fromkeys(fragment.wire_names))
         count += _copy_fragment_chunks_to_masters(
             fragment,
             descriptor,
@@ -2545,16 +2725,15 @@ def commit_prepared_full_parameter_shard(
     if count != prepared.parameter_tensor_count or count != len(specs):
         raise RuntimeError("full-parameter chunked apply is incomplete")
     copied_seconds = time.monotonic() - started
-    _propagate_master_writes(actor)
-    _copy_masters_to_model(actor)
-    model_count = _validate_model_matches_masters(
+    finish_stats = _finish_commit_writes(
+        actor,
         named_parameters,
-        optimizer_owned_parameter_ids=optimizer_owned,
+        specs,
+        optimizer_owned,
+        written=tuple(written),
+        expected_count=count,
+        role=role,
     )
-    if model_count != count:
-        raise RuntimeError("full-parameter model/master check is incomplete")
-    if role == "actor":
-        actor.weights_backuper.backup("actor")
     actor._external_full_policy_version = state.policy_version
     actor._external_full_local_step_generation = 0
     actor._external_full_exported_local_step_generation = 0
@@ -2574,6 +2753,9 @@ def commit_prepared_full_parameter_shard(
         policy_version=state.policy_version,
         local_step_generation=0,
         fragments=state.fragments,
+        # A lazy row was resident, so the commit did not write it: its label
+        # still names the masters' bytes.
+        lazy_fragment_ids=prepared.lazy_fragment_ids,
     )
     _note_apply_stats(
         actor,
@@ -2583,9 +2765,166 @@ def commit_prepared_full_parameter_shard(
         resident_fragments=len(prepared.resident_fragment_ids),
         copy_seconds=copied_seconds,
         seconds=time.monotonic() - started,
+        **finish_stats,
     )
     del actor._external_full_parameter_prepared_cut
     return count
+
+
+_PARTIAL_COMMIT_ENV = "MILES_FULL_PARAMETER_PARTIAL_COMMIT"
+_DENSE_MODEL_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
+
+
+def _partial_commit_refusal(
+    actor,
+    named_parameters: Sequence[tuple[str, torch.nn.Parameter]],
+    optimizer_owned: frozenset[int],
+    written: Sequence[str],
+    parameter_count: int,
+) -> str | None:
+    """Why a commit must finish over the whole model; None when it may finish
+    over the parameters it wrote only.
+
+    The per-parameter path copies a master into its model parameter with a
+    plain ``copy_`` (what Megatron's main-to-model copy does for a dense
+    parameter at DP=1) and propagates only the hybrid-optimizer copies of
+    the written masters, so it needs dense model tensors, no Megatron-FSDP or
+    quantized parameter gather, and every hybrid inner copy reachable from a
+    named parameter's master."""
+
+    if os.environ.get(_PARTIAL_COMMIT_ENV, "1") == "0":
+        return f"{_PARTIAL_COMMIT_ENV}=0"
+    if len(written) >= parameter_count:
+        return "every parameter written"
+    for _name, parameter in named_parameters:
+        if type(parameter.data) is not torch.Tensor or parameter.dtype not in _DENSE_MODEL_DTYPES:
+            return "a model parameter is not a dense tensor"
+    for child in getattr(actor.optimizer, "chained_optimizers", (actor.optimizer,)):
+        ddp_config = getattr(child, "ddp_config", None)
+        if getattr(ddp_config, "use_megatron_fsdp", False) or getattr(ddp_config, "fp4_param_gather", False):
+            return "Megatron-FSDP or a quantized parameter gather"
+        if getattr(child, "_layer_wise_non_distopt_child", False):
+            return "layer-wise FP8 optimizer"
+    owned = {
+        id(_resolve_master(parameter, name, optimizer_owned_parameter_ids=optimizer_owned)[0])
+        for name, parameter in named_parameters
+    }
+    for base in _optimizer_bases(actor.optimizer):
+        inner = getattr(base, "param_to_inner_param", None) or {}
+        if any(key is not copy and id(key) not in owned for key, copy in inner.items()):
+            return "a hybrid optimizer copy belongs to no named parameter"
+    return None
+
+
+@torch.no_grad()
+def _copy_masters_to_written_parameters(
+    rows: Sequence[tuple[str, torch.nn.Parameter]],
+    optimizer_owned: frozenset[int],
+) -> None:
+    """The main-to-model copy of Megatron for ``rows`` only (dense, DP=1).
+
+    A parameter whose optimizer owns its model view (precision-aware) got its
+    master from the hybrid copy in ``_propagate_master_writes``; a native-FP32
+    parameter is its own master."""
+
+    for name, parameter in rows:
+        owned, master = _resolve_master(parameter, name, optimizer_owned_parameter_ids=optimizer_owned)
+        if owned.dtype != torch.float32 or master.data_ptr() == parameter.data_ptr():
+            continue
+        parameter.data.copy_(master.view(parameter.shape), non_blocking=False)
+
+
+def _backup_written_actor_weights(actor, written: Sequence[torch.nn.Parameter] | None) -> str:
+    """Bring the actor's weight backup up to date after a commit.
+
+    Only when the actor keeps one (Miles backs up after a train step only when
+    ``_enable_weight_backup``).  ``written``: the parameters the commit
+    changed; a backuper that updates a subset in place takes only those, any
+    other backs up every weight.  Returns what was done (for the stats)."""
+
+    if getattr(actor, "_enable_weight_backup", True) is False:
+        return "off"
+    backuper = actor.weights_backuper
+    backup_tensors = getattr(backuper, "backup_tensors", None)
+    if written is not None and callable(backup_tensors):
+        expected = {id(parameter) for parameter in written}
+        if backup_tensors("actor", expected) == len(expected):
+            return "written"
+    backuper.backup("actor")
+    return "all"
+
+
+def _finish_commit_writes(
+    actor,
+    named_parameters: Sequence[tuple[str, torch.nn.Parameter]],
+    specs: Sequence[FullParameterShardSpec],
+    optimizer_owned: frozenset[int],
+    *,
+    written: Sequence[str],
+    expected_count: int,
+    role: str,
+) -> dict[str, object]:
+    """After the commit copied chunks into masters: make the hybrid optimizer
+    copies, the model and the weight backup agree with the masters, and check
+    model == master.
+
+    The parameters the commit did not write are untouched on both sides, so
+    only ``written`` (wire names) needs this when ``_partial_commit_refusal``
+    allows; otherwise the whole model, as before.  Returns timing stats."""
+
+    refusal = _partial_commit_refusal(actor, named_parameters, optimizer_owned, written, len(specs))
+    stats: dict[str, object] = {"partial": refusal is None, "written_parameters": len(written)}
+    if refusal is not None:
+        stats["partial_refusal"] = refusal
+    clock = time.monotonic()
+
+    def lap(name: str) -> None:
+        nonlocal clock
+        now = time.monotonic()
+        stats[name] = now - clock
+        clock = now
+
+    if refusal is None:
+        by_wire_name = _parameters_by_wire_name(named_parameters, specs)
+        rows = [by_wire_name[name] for name in written]
+        owned_ids = {
+            id(_resolve_master(parameter, name, optimizer_owned_parameter_ids=optimizer_owned)[0])
+            for name, parameter in rows
+        }
+        _propagate_master_writes(actor, owned_ids=owned_ids)
+        lap("propagate_seconds")
+        _assert_masters_resident(actor)
+        _copy_masters_to_written_parameters(rows, optimizer_owned)
+        lap("model_copy_seconds")
+        if rows:
+            _validate_model_matches_masters(rows, optimizer_owned_parameter_ids=optimizer_owned)
+        lap("check_seconds")
+        backup = _backup_written_actor_weights(actor, [parameter for _name, parameter in rows]) if role == "actor" and rows else "none"
+    else:
+        _propagate_master_writes(actor)
+        lap("propagate_seconds")
+        _copy_masters_to_model(actor)
+        lap("model_copy_seconds")
+        model_count = _validate_model_matches_masters(
+            named_parameters,
+            optimizer_owned_parameter_ids=optimizer_owned,
+        )
+        if model_count != expected_count:
+            raise RuntimeError("full-parameter model/master check is incomplete")
+        lap("check_seconds")
+        backup = _backup_written_actor_weights(actor, None) if role == "actor" else "none"
+    lap("backup_seconds")
+    stats["backup"] = backup
+    return stats
+
+
+def _assert_masters_resident(actor) -> None:
+    """Megatron's precondition of a main-to-model copy (no-op without an
+    optimizer-state offloader)."""
+
+    check = getattr(actor.optimizer, "assert_master_weights_resident", None)
+    if callable(check):
+        check("full-parameter partial commit")
 
 
 def finalize_full_parameter_commit(actor, *, commit_token: str) -> int:
