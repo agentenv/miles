@@ -30,6 +30,7 @@ from miles.backends.megatron_utils.full_parameter_state import (
     _scan_pool,
     _validate_cpu_chunk,
     is_deferred_full_parameter_chunk,
+    put_full_parameter_chunk,
     full_parameter_chunked_shard_identity,
     validate_full_parameter_chunked_shard_state,
 )
@@ -43,7 +44,11 @@ _CUT_CONTENT_IDENTITY_DOMAIN = b"miles-full-parameter-chunked-cut-content-v1\0"
 #   deferred_export: ``export_chunked_cut(defer_payload=True)`` and
 #       ``materialize_chunked_fragments``
 #   optimizer_state_check_model: ``optimizer_states(check_model=False)``
-FULL_PARAMETER_TRANSPORT_FEATURES = frozenset({"skip_resident", "deferred_export", "optimizer_state_check_model"})
+#   zero_copy_chunks: chunks are stored in Ray as numpy buffers
+#       (``put_full_parameter_chunk``); readers receive the same tensors
+FULL_PARAMETER_TRANSPORT_FEATURES = frozenset(
+    {"skip_resident", "deferred_export", "optimizer_state_check_model", "zero_copy_chunks"}
+)
 
 
 @dataclass(frozen=True)
@@ -431,7 +436,7 @@ def store_full_parameter_fragment_payload(
                     plan_hash=shard.plan_hash,
                 ),
             )
-            stored = ray_module.put(value)
+            stored = put_full_parameter_chunk(ray_module, value)
             if stored is None:
                 raise RuntimeError("Ray returned an empty fragment reference")
             descriptors.append(descriptor)

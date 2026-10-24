@@ -10,6 +10,7 @@ import re
 import struct
 import threading
 import time
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
@@ -1792,6 +1793,46 @@ def _resolve_ray_module(ray_module):
     return ray_module
 
 
+_ZERO_COPY_ENV = "MILES_FULL_PARAMETER_ZERO_COPY_CHUNKS"
+# A chunk read back through Ray's zero-copy path is a tensor over the object
+# store's read-only memory; every full-parameter reader only reads it.
+warnings.filterwarnings("ignore", message="The given NumPy array is not writable", category=UserWarning)
+
+
+class _ObjectStoreChunk:
+    """The ``ray.put`` form of one CPU chunk: pickled as a numpy array.
+
+    Ray pickles a torch tensor through an in-memory ``torch.save`` on put and
+    a ``torch.load`` on get (measured 0.30 and 0.58 GB/s per thread for 256
+    MiB of f32).  A numpy array travels as one pickle-5 out-of-band buffer:
+    the put is one copy into the object store and the get maps the stored
+    bytes, so a reader receives a tensor of the same dtype and shape over the
+    object store's memory.  Stored chunks are immutable and every reader only
+    reads them (checks, hashes, deltas, copies into the masters)."""
+
+    __slots__ = ("value",)
+
+    def __init__(self, value: torch.Tensor) -> None:
+        self.value = value
+
+    def __reduce__(self):
+        return (_chunk_from_object_store, (self.value.detach().contiguous().numpy(),))
+
+
+def _chunk_from_object_store(array) -> torch.Tensor:
+    return torch.from_numpy(array)
+
+
+def put_full_parameter_chunk(ray_module, value: torch.Tensor):
+    """``ray_module.put`` of one CPU chunk, in the zero-copy form for the
+    real Ray module (``MILES_FULL_PARAMETER_ZERO_COPY_CHUNKS=0`` keeps the
+    tensor pickling).  An in-process stand-in stores the tensor itself."""
+
+    if getattr(ray_module, "__name__", None) == "ray" and os.environ.get(_ZERO_COPY_ENV, "1") != "0":
+        return ray_module.put(_ObjectStoreChunk(value))
+    return ray_module.put(value)
+
+
 def _validate_cpu_chunk(
     value: object,
     descriptor: FullParameterChunkDescriptor,
@@ -1888,7 +1929,7 @@ def _export_fragment_chunks(
             numel=chunk_numel,
             payload_hash=chunk_hash.result(),
         )
-        reference = ray_module.put(chunk)
+        reference = put_full_parameter_chunk(ray_module, chunk)
         if reference is None:
             raise RuntimeError("Ray returned an empty full-parameter chunk reference")
         chunk_descriptors.append(descriptor)
