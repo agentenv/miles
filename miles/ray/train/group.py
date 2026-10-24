@@ -81,6 +81,10 @@ class TrainerController:
         self._health_checker_activeness = ActivenessTracker(active=True)
 
         self._cells_by_id: dict[str, TrainerCell] = {}
+        # Set by the full-parameter transport when it installs fragment plans:
+        # {replica rank topology: owner topologies} for the data-parallel
+        # replicas (``full_parameter_transport.REPLICA_OWNERS_ATTRIBUTE``).
+        self.full_parameter_replica_owners: dict = {}
 
     @property
     def pool_id(self) -> str:

@@ -46,9 +46,16 @@ _CUT_CONTENT_IDENTITY_DOMAIN = b"miles-full-parameter-chunked-cut-content-v1\0"
 #   optimizer_state_check_model: ``optimizer_states(check_model=False)``
 #   zero_copy_chunks: chunks are stored in Ray as numpy buffers
 #       (``put_full_parameter_chunk``); readers receive the same tensors
+#   dp_replicas: data-parallel replicas (DP>1, EP spanning DP): one rank owns
+#       each parameter, the other ranks of its replica group apply the
+#       owner's bytes (``full_parameter_replicas``)
 FULL_PARAMETER_TRANSPORT_FEATURES = frozenset(
-    {"skip_resident", "deferred_export", "optimizer_state_check_model", "zero_copy_chunks"}
+    {"skip_resident", "deferred_export", "optimizer_state_check_model", "zero_copy_chunks", "dp_replicas"}
 )
+
+# Set on the group by ``install_fragment_plans``: ``{replica rank topology:
+# owner topologies}`` for every rank that holds data-parallel replicas.
+REPLICA_OWNERS_ATTRIBUTE = "full_parameter_replica_owners"
 
 
 @dataclass(frozen=True)
@@ -608,7 +615,7 @@ async def _group_topologies(group) -> list[FullParameterTopology]:
 
 
 async def shard_manifests(group) -> tuple[FullParameterShardManifest, ...]:
-    return tuple(
+    manifests = tuple(
         await _rank_values(
             group,
             "full_parameter_shard_manifest",
@@ -616,6 +623,46 @@ async def shard_manifests(group) -> tuple[FullParameterShardManifest, ...]:
             "Megatron returned incomplete full-parameter manifests",
         )
     )
+    replica_owner_manifests(manifests)
+    return manifests
+
+
+def replica_owner_manifests(
+    manifests: Sequence[FullParameterShardManifest],
+) -> dict[FullParameterTopology, tuple[FullParameterShardManifest, ...]]:
+    """``{replica rank topology: owner manifests}``; checks every parameter has exactly one owner.
+
+    Each holding must name an owner rank of the group that holds the same
+    parameter (same shape and replica group) and owns it, and every rank of
+    that replica group must hold it with the same owner.  The owners' specs
+    then list every parameter of the group exactly once.  Empty when no rank
+    holds a data-parallel replica (DP=1)."""
+
+    if not any(manifest.replicated_holdings() for manifest in manifests):
+        return {}
+    by_rank = {manifest.global_rank: manifest for manifest in manifests}
+    if len(by_rank) != len(manifests):
+        raise RuntimeError("full-parameter manifests repeat a global rank")
+    holdings = {(manifest.global_rank, holding.name): holding for manifest in manifests for holding in manifest.holdings}
+    for manifest in manifests:
+        for holding in manifest.holdings:
+            if holdings.get((holding.owner_rank, holding.name)) != holding:
+                raise RuntimeError(f"full-parameter replica {holding.name!r} disagrees with its owner rank {holding.owner_rank}")
+            if holding.owner_rank == manifest.global_rank and any(
+                holdings.get((rank, holding.name)) != holding for rank in holding.replica_ranks
+            ):
+                raise RuntimeError(f"a replica rank of {holding.name!r} does not hold it with the same owner")
+    return {
+        manifest.topology: tuple(
+            sorted({by_rank[holding.owner_rank].topology: by_rank[holding.owner_rank] for holding in manifest.replicated_holdings()}.values(), key=lambda owner: owner.topology)
+        )
+        for manifest in manifests
+        if manifest.replicated_holdings()
+    }
+
+
+def _replica_owners(group) -> Mapping[FullParameterTopology, tuple[FullParameterTopology, ...]]:
+    return getattr(group, REPLICA_OWNERS_ATTRIBUTE, None) or {}
 
 
 def _validate_group_plans(
@@ -640,20 +687,28 @@ async def install_fragment_plans(
     plans: tuple[FullParameterOwnerFragmentPlan, ...],
 ) -> int:
     by_topology = _validate_group_plans(tuple(plans))
+    manifests = await shard_manifests(group)
     topologies = await _group_topologies(group)
-    if set(topologies) != set(by_topology):
+    if set(topologies) != set(by_topology) or {manifest.topology for manifest in manifests} != set(by_topology):
         raise RuntimeError("full-parameter owner plans do not match the actor group")
-    results = await _rank_call(
-        group,
-        "install_full_parameter_fragment_plan",
-        by_topology={topology: {"plan": plan} for topology, plan in by_topology.items()},
-    )
+    owner_manifests = replica_owner_manifests(manifests)
+    arguments = {topology: {"plan": plan} for topology, plan in by_topology.items()}
+    for topology, owners in owner_manifests.items():
+        arguments[topology]["replica_sources"] = tuple((owner, by_topology[owner.topology]) for owner in owners)
+    # Cleared first: a failed install leaves no routing to stale replica plans.
+    setattr(group, REPLICA_OWNERS_ATTRIBUTE, {})
+    results = await _rank_call(group, "install_full_parameter_fragment_plan", by_topology=arguments)
     expected = [len(by_topology[topology].fragments) for topology in topologies]
     if any(
         isinstance(result, bool) or not isinstance(result, int) or result != count
         for result, count in zip(results, expected, strict=True)
     ):
         raise RuntimeError("Megatron ranks rejected full-parameter owner plans")
+    setattr(
+        group,
+        REPLICA_OWNERS_ATTRIBUTE,
+        {topology: tuple(owner.topology for owner in owners) for topology, owners in owner_manifests.items()},
+    )
     return sum(results)
 
 
@@ -682,12 +737,33 @@ async def export_chunked_cut(
     layout_hashes = {state.parameter_layout_hash for state in ordered}
     if len(layout_hashes) != 1:
         raise RuntimeError("Megatron chunked shards mix global layouts")
+    await _note_replica_export(group, ordered)
     return FullParameterChunkedCut(
         policy_version=policy_version,
         local_step_generation=local_step_generation,
         parameter_layout_hash=next(iter(layout_hashes)),
         shards=ordered,
     )
+
+
+async def _note_replica_export(group, states: Sequence[FullParameterChunkedShardState]) -> None:
+    """Tell every replica rank what its owners exported (see ``note_full_parameter_replica_export``)."""
+
+    owners = _replica_owners(group)
+    if not owners:
+        return
+    by_topology = {state.topology: state for state in states}
+    results = await _rank_call(
+        group,
+        "note_full_parameter_replica_export",
+        by_topology={
+            topology: {"states": tuple(by_topology[owner] for owner in owners.get(topology, ()))}
+            for topology in by_topology
+        },
+    )
+    failure = _first_failure(results, expected_positive=False)
+    if failure is not None or any(isinstance(result, bool) or not isinstance(result, int) for result in results):
+        raise RuntimeError("Megatron replica ranks refused the full-parameter export note") from failure
 
 
 async def materialize_chunked_fragments(
@@ -777,10 +853,17 @@ async def apply_chunked_cut(
     if len(by_topology) != len(topologies) or set(topologies) != set(by_topology):
         raise RuntimeError("full-parameter chunked cut does not match the actor group")
 
+    owners = _replica_owners(group)
     prepare_results = await _rank_call(
         group,
         "prepare_full_parameter_chunked_shard",
-        by_topology={topology: {"state": state} for topology, state in by_topology.items()},
+        by_topology={
+            topology: {
+                "state": state,
+                **({"replica_states": tuple(by_topology[owner] for owner in owners[topology])} if topology in owners else {}),
+            }
+            for topology, state in by_topology.items()
+        },
         commit_token=token,
         **({"skip_resident": True} if skip_resident_fragments else {}),
     )

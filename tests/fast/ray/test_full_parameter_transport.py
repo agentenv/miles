@@ -12,7 +12,10 @@ from miles.backends.megatron_utils.full_parameter_state import (
     FullParameterFragmentDescriptor,
     FullParameterFragmentPlan,
     FullParameterOwnerFragmentPlan,
+    FullParameterShardManifest,
+    FullParameterShardSpec,
     FullParameterTopology,
+    _layout_hash,
 )
 from miles.backends.megatron_utils.full_parameter_plugin import PLUGIN_PATH
 from miles.ray.full_parameter_transport import (
@@ -239,12 +242,17 @@ class _Actor:
             self.events.append(("install", rank, plan.topology.tp_rank))
             return len(plan.fragments)
 
+        def manifest():
+            specs = (FullParameterShardSpec("actor", _topology(rank).shard_id, "model.weight", (4,), "float32", 4),)
+            return FullParameterShardManifest(_topology(rank), "actor", _layout_hash(_topology(rank), specs), specs)
+
         self.prepare_full_parameter_chunked_shard = _Remote(prepare)
         self.commit_prepared_full_parameter_shard = _Remote(commit)
         self.finalize_full_parameter_commit = _Remote(finalize)
         self.abort_prepared_full_parameter_shard = _Remote(abort)
         self.full_parameter_commit_status = _Remote(status)
         self.install_full_parameter_fragment_plan = _Remote(install)
+        self.full_parameter_shard_manifest = _Remote(manifest)
 
 
 # Argument order of each fake rank callback, by transport operation.
@@ -256,6 +264,7 @@ _ARGUMENTS = {
     "abort_prepared_full_parameter_shard": ("commit_token",),
     "full_parameter_commit_status": ("commit_token", "policy_version", "state_identity_hash"),
     "install_full_parameter_fragment_plan": ("plan",),
+    "full_parameter_shard_manifest": (),
 }
 
 
