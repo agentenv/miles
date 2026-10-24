@@ -48,8 +48,6 @@ if TYPE_CHECKING:
 # optimizer state a contribution is read at and may be used at.
 Tracking = tuple[int, int, int]
 
-# A pending parameter all-gather would overwrite the model values an apply writes.
-_UNSUPPORTED_ARGS = ("overlap_param_gather",)
 
 
 @dataclass(frozen=True, eq=False)
@@ -181,10 +179,22 @@ def _shares_storage(first: torch.Tensor, second: torch.Tensor) -> bool:
 
 
 def refuse_unsupported_args(args) -> None:
-    enabled = [name for name in _UNSUPPORTED_ARGS if getattr(args, name, False)]
-    if enabled:
+    """Refuse the Megatron options sharded masters cannot serve.
+
+    * ``overlap_param_gather``: a parameter all-gather still pending at an
+      apply would overwrite the model values the apply wrote;
+    * ``num_distributed_optimizer_instances`` > 1: each instance keeps its own
+      copy of the ranges, so two ranks of a replica group would hold one
+      FP32 element."""
+
+    unsupported = []
+    if getattr(args, "overlap_param_gather", False):
+        unsupported.append("overlap_param_gather")
+    if int(getattr(args, "num_distributed_optimizer_instances", 1) or 1) > 1:
+        unsupported.append("num_distributed_optimizer_instances > 1")
+    if unsupported:
         raise RuntimeError(
-            f"full-parameter sync at DP>1 with the distributed optimizer does not support {', '.join(enabled)}"
+            f"full-parameter sync at DP>1 with the distributed optimizer does not support {', '.join(unsupported)}"
         )
 
 

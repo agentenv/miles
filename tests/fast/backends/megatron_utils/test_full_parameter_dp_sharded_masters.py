@@ -591,7 +591,9 @@ def test_offload_precision_aware_and_param_gather_are_refused(monkeypatch):
 
     with pytest.raises(RuntimeError, match="overlap_param_gather"):
         sharded.refuse_unsupported_args(SimpleNamespace(overlap_param_gather=True))
-    sharded.refuse_unsupported_args(SimpleNamespace(overlap_param_gather=False))
+    with pytest.raises(RuntimeError, match="num_distributed_optimizer_instances"):
+        sharded.refuse_unsupported_args(SimpleNamespace(num_distributed_optimizer_instances=2))
+    sharded.refuse_unsupported_args(SimpleNamespace(overlap_param_gather=False, num_distributed_optimizer_instances=1))
 
 
 async def test_a_group_mixing_whole_and_sharded_masters_is_refused(cluster):
