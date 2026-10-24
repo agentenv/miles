@@ -45,6 +45,14 @@ class TensorBackuper(ABC):
     def copy(self, *, src_tag: str, dst_tag: str):
         raise NotImplementedError
 
+    def backup_tensors(self, tag: str, tensor_ids: set[int]) -> int:
+        """Refresh only the source tensors whose ``id`` is in ``tensor_ids``
+        in an existing backup of ``tag``; returns how many it refreshed.
+
+        0 means the caller must take a full ``backup(tag)`` (no complete
+        backup of ``tag`` yet, or a backuper that keeps none)."""
+        return 0
+
     @abstractmethod
     def restore(self, tag: str):
         raise NotImplementedError
@@ -71,6 +79,23 @@ class _TensorBackuperNormal(TensorBackuper):
                 backup_dict[name] = torch.empty_like(param, device=torch.device("cpu"), pin_memory=True)
             backup_dict[name].copy_(param.detach(), non_blocking=True)
         torch.cuda.synchronize()
+
+    @torch.no_grad()
+    def backup_tensors(self, tag: str, tensor_ids: set[int]) -> int:
+        backup_dict = self._backups.get(tag)
+        if not backup_dict:
+            return 0
+        sources = list(self._source_getter())
+        if any(name not in backup_dict for name, _param in sources):
+            return 0
+        refreshed = 0
+        for name, param in sources:
+            if id(param) in tensor_ids:
+                backup_dict[name].copy_(param.detach(), non_blocking=True)
+                refreshed += 1
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        return refreshed
 
     @torch.no_grad()
     def copy(self, *, src_tag: str, dst_tag: str):

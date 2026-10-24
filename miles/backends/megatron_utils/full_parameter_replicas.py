@@ -19,7 +19,8 @@ the group holds a replica.  This module gives a replica rank:
 On every apply each replica copies the same hash-checked bytes its owner
 copies, so all replicas of a parameter hold the same values afterwards.
 ``MILES_FULL_PARAMETER_VERIFY_REPLICAS=1`` also hashes the replicas at every
-export note and refuses to continue when one differs from its owner.
+export note of a content export (not after a lazy export, whose descriptors are
+labels) and refuses to continue when one differs from its owner.
 
 ``full_parameter_state`` imports this module inside its functions (this module
 imports ``full_parameter_state`` at the top; a top-level import both ways
@@ -361,19 +362,22 @@ def note_replica_export(
     states: Sequence[FullParameterChunkedShardState],
     *,
     replica_masters: Mapping[str, torch.Tensor],
+    lazy: bool = False,
 ) -> dict[str, int]:
     """Record that the replicas hold what their owners just exported.
 
     ``states`` are the owners' exported shards at this rank's tracking state.
     With ``MILES_FULL_PARAMETER_VERIFY_REPLICAS=1`` every owner chunk that lies
-    wholly inside this rank's replicas is hashed from the replicas first."""
+    wholly inside this rank's replicas is hashed from the replicas first;
+    except after a ``lazy`` export, whose descriptors are labels, not content
+    hashes (the replicas are then checked at the next non-lazy export)."""
 
     installed, generation, exported, _anchor = _require_full_parameter_tracking(actor)
     if exported != generation:
         raise RuntimeError("full-parameter replica export note has unexported local progress")
     ordered = match_replica_states(replica_plan, states, policy_version=installed, local_step_generation=generation)
     verified = 0
-    if replica_plan is not None and os.environ.get(VERIFY_REPLICAS_ENV, "0") == "1":
+    if replica_plan is not None and not lazy and os.environ.get(VERIFY_REPLICAS_ENV, "0") == "1":
         verified = sum(
             _parallel_map(
                 lambda item: _verify_replica_fragment(
@@ -384,7 +388,7 @@ def note_replica_export(
         )
     record_replica_resident(actor, replica_plan, ordered)
     fragments = 0 if replica_plan is None else sum(len(source.fragments) for source in replica_plan.sources)
-    return {"fragments": fragments, "verified_chunks": verified}
+    return {"fragments": fragments, "verified_chunks": verified, "lazy": int(lazy)}
 
 
 def _verify_replica_fragment(
@@ -508,6 +512,23 @@ def verify_replica_chunks(
 
 
 @torch.no_grad()
+def replica_names_to_copy(
+    replica_plan: ReplicaPlan | None,
+    states: Sequence[FullParameterChunkedShardState],
+    *,
+    skip: frozenset[ReplicaFragmentKey],
+) -> tuple[str, ...]:
+    """Local parameter names :func:`copy_replica_chunks` writes for these
+    arguments (every member of a non-resident replica fragment), in order."""
+
+    if replica_plan is None:
+        return ()
+    names: dict[str, None] = {}
+    for _source, _state, fragment, _descriptor, _refs in _rows_to_read(replica_plan, states, skip):
+        names.update(dict.fromkeys(copy.name for copy in fragment.copies))
+    return tuple(names)
+
+
 def copy_replica_chunks(
     replica_plan: ReplicaPlan | None,
     states: Sequence[FullParameterChunkedShardState],

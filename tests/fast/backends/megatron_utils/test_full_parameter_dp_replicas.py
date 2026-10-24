@@ -481,3 +481,53 @@ async def test_apply_without_replica_states_is_refused_on_replica_ranks(cluster)
     setattr(group, transport.REPLICA_OWNERS_ATTRIBUTE, {})
     with pytest.raises(RuntimeError, match="rejected full-parameter prepare"):
         await apply_chunked_cut(group, _target(exported, ray, 1, _merged), commit_token="no-routing")
+
+
+async def test_lazy_boundary_with_replicas_writes_only_changed_parameters(cluster, monkeypatch):
+    """The per-fragment boundary (lazy export, partial commit) on DP replicas."""
+
+    group, ranks, ray = cluster(4, 2)
+    _manifests, plans = await _install(group)
+    first = await export_chunked_cut(group, 0, 0, max_chunk_bytes=16)
+    await apply_chunked_cut(group, _target(first, ray, 1, _merged), commit_token="dp-lazy-1")
+    for rank in ranks:
+        rank.local_step(rollout_id=1, delta=0.25)
+    await record_local_step(group, base_policy_version=1, rollout_id=1, check_model=False)
+
+    # A lazy export carries labels: replicas record it but cannot hash against it.
+    monkeypatch.setenv(VERIFY_REPLICAS_ENV, "1")
+    lazy = await export_chunked_cut(group, 1, 1, max_chunk_bytes=16, defer_payload=True, lazy=True)
+    for rank in ranks:
+        note = rank._external_full_parameter_apply_stats["replica_export"]
+        assert (note["lazy"], note["verified_chunks"]) == (1, 0)
+    # An owner materializes a lazy fragment through its content descriptor.
+    (content, refs) = (await materialize_chunked_fragments(group, lazy, [1], return_descriptors=True))[1]
+    label = next(d for shard in lazy.shards for d in shard.fragments if d.fragment_id == 1)
+    assert content.payload_hash != label.payload_hash and len(refs) == len(label.chunks)
+    before = _assert_replicas_identical(ranks)
+
+    # Only fragment 0 changed; every other row keeps its label and stays resident.
+    changed = 0
+    target = _target(lazy, ray, 2, lambda d: _merged(d) * 3 if d.fragment_id == changed else None)
+    await apply_chunked_cut(group, target, commit_token="dp-lazy-2", skip_resident_fragments=True)
+
+    after = _assert_replicas_identical(ranks)
+    owner_plan = next(plan for plan in plans if any(f.fragment_id == changed for f in plan.fragments))
+    changed_names = {
+        wire.split("::")[2] for f in owner_plan.fragments if f.fragment_id == changed for wire in f.wire_names
+    }
+    for name in before:
+        assert torch.equal(after[name], before[name]) == (name not in changed_names), name
+    for rank in ranks:
+        commit = rank._external_full_parameter_apply_stats["commit"]
+        holds_changed = any(name in changed_names for name, _parameter in rank.named)
+        # The commit finished over the parameters it wrote: owned and replica ones.
+        assert commit["partial"] is True
+        assert commit["written_parameters"] == (len(changed_names) if holds_changed else 0)
+
+    # The next content export checks the replicas again, and they agree with their owners.
+    for rank in ranks:
+        rank.local_step(rollout_id=2, delta=0.5)
+    await record_local_step(group, base_policy_version=2, rollout_id=2)
+    await export_chunked_cut(group, 2, 1, max_chunk_bytes=16, defer_payload=True)
+    assert all(rank._external_full_parameter_apply_stats["replica_export"]["verified_chunks"] > 0 for rank in ranks)

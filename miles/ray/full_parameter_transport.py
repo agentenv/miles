@@ -28,6 +28,7 @@ from miles.backends.megatron_utils.full_parameter_state import (
     _all_finite,
     _run_now,
     _scan_pool,
+    _same_fragment_geometry,
     _validate_cpu_chunk,
     is_deferred_full_parameter_chunk,
     put_full_parameter_chunk,
@@ -44,13 +45,27 @@ _CUT_CONTENT_IDENTITY_DOMAIN = b"miles-full-parameter-chunked-cut-content-v1\0"
 #   deferred_export: ``export_chunked_cut(defer_payload=True)`` and
 #       ``materialize_chunked_fragments``
 #   optimizer_state_check_model: ``optimizer_states(check_model=False)``
+#   lazy_export: ``export_chunked_cut(lazy=True)``,
+#       ``materialize_chunked_fragments(return_descriptors=True)``,
+#       ``iter_full_parameter_authoritative_fragment_delta_parts(local_descriptor=...)``
+#       and ``record_local_step(check_model=False)``
 #   zero_copy_chunks: chunks are stored in Ray as numpy buffers
 #       (``put_full_parameter_chunk``); readers receive the same tensors
 #   dp_replicas: data-parallel replicas (DP>1, EP spanning DP): one rank owns
 #       each parameter, the other ranks of its replica group apply the
 #       owner's bytes (``full_parameter_replicas``)
 FULL_PARAMETER_TRANSPORT_FEATURES = frozenset(
-    {"skip_resident", "deferred_export", "optimizer_state_check_model", "zero_copy_chunks", "dp_replicas"}
+    {
+        "skip_resident",
+        "deferred_export",
+        "optimizer_state_check_model",
+        "zero_copy_chunks",
+        "dp_replicas",
+        # Lazy export (labels, no master read), materialize returning the
+        # content descriptors, delta reads through such a descriptor, and a
+        # local-step receipt without the whole-model model/master check.
+        "lazy_export",
+    }
 )
 
 # Set on the group by ``install_fragment_plans``: ``{replica rank topology:
@@ -266,14 +281,23 @@ def iter_full_parameter_authoritative_fragment_delta_parts(
     authoritative_descriptor: FullParameterFragmentDescriptor,
     authoritative_refs: Sequence[object | None],
     ray_module=None,
+    local_descriptor: FullParameterFragmentDescriptor | None = None,
 ):
-    """Yield bounded FP32 ``local - authoritative`` parts for any local round."""
+    """Yield bounded FP32 ``local - authoritative`` parts for any local round.
 
-    local_shard, local_descriptor, local_refs = _fragment_row(
+    ``local_descriptor``: the content descriptor that materializing the
+    local row returned, when the row itself carries labels (lazy cut).  It
+    must have the row's geometry; the local chunks are checked against it."""
+
+    local_shard, row_descriptor, local_refs = _fragment_row(
         local_cut,
         fragment_id,
     )
     _require_stored(local_refs, fragment_id)
+    if local_descriptor is None:
+        local_descriptor = row_descriptor
+    elif not isinstance(local_descriptor, FullParameterFragmentDescriptor) or not _same_fragment_geometry(local_descriptor, row_descriptor):
+        raise ValueError("full-parameter local content descriptor does not match its row")
     if local_cut.local_step_generation < 1:
         raise ValueError("full-parameter local cut has no optimizer progress")
     if authoritative_parameter_layout_hash != local_cut.parameter_layout_hash:
@@ -719,8 +743,12 @@ async def export_chunked_cut(
     *,
     max_chunk_bytes: int = FULL_PARAMETER_DEFAULT_CHUNK_BYTES,
     defer_payload: bool = False,
+    lazy: bool = False,
 ) -> FullParameterChunkedCut:
-    """``defer_payload``: descriptors only; see ``materialize_chunked_fragments``."""
+    """``defer_payload``: descriptors only; see ``materialize_chunked_fragments``.
+
+    ``lazy`` (with ``defer_payload``): no rank reads its masters; descriptors
+    carry labels (``export_full_parameter_chunked_shard``)."""
 
     ordered = tuple(
         await _rank_values(
@@ -732,12 +760,13 @@ async def export_chunked_cut(
             local_step_generation=local_step_generation,
             max_chunk_bytes=max_chunk_bytes,
             **({"defer_payload": True} if defer_payload else {}),
+            **({"lazy": True} if lazy else {}),
         )
     )
     layout_hashes = {state.parameter_layout_hash for state in ordered}
     if len(layout_hashes) != 1:
         raise RuntimeError("Megatron chunked shards mix global layouts")
-    await _note_replica_export(group, ordered)
+    await _note_replica_export(group, ordered, lazy=lazy)
     return FullParameterChunkedCut(
         policy_version=policy_version,
         local_step_generation=local_step_generation,
@@ -746,8 +775,10 @@ async def export_chunked_cut(
     )
 
 
-async def _note_replica_export(group, states: Sequence[FullParameterChunkedShardState]) -> None:
-    """Tell every replica rank what its owners exported (see ``note_full_parameter_replica_export``)."""
+async def _note_replica_export(group, states: Sequence[FullParameterChunkedShardState], *, lazy: bool = False) -> None:
+    """Tell every replica rank what its owners exported (see ``note_full_parameter_replica_export``).
+
+    ``lazy``: the export carried labels, so the replicas are not hashed against it."""
 
     owners = _replica_owners(group)
     if not owners:
@@ -760,6 +791,7 @@ async def _note_replica_export(group, states: Sequence[FullParameterChunkedShard
             topology: {"states": tuple(by_topology[owner] for owner in owners.get(topology, ()))}
             for topology in by_topology
         },
+        **({"lazy": True} if lazy else {}),
     )
     failure = _first_failure(results, expected_positive=False)
     if failure is not None or any(isinstance(result, bool) or not isinstance(result, int) for result in results):
@@ -770,13 +802,19 @@ async def materialize_chunked_fragments(
     group,
     cut: FullParameterChunkedCut,
     fragment_ids: Sequence[int],
-) -> dict[int, list[object]]:
+    *,
+    return_descriptors: bool = False,
+) -> dict[int, object]:
     """Store deferred fragments of ``cut`` from the owner ranks' masters.
 
     Returns ``{fragment_id: chunk refs}`` for exactly ``fragment_ids``.  Each
     owner rank refuses a fragment its masters no longer hold, and checks the
     stored bytes against the cut's descriptor (same hashes).  The caller puts
-    the refs into its cut rows; the cut identity does not change."""
+    the refs into its cut rows; the cut identity does not change.
+
+    ``return_descriptors``: ``{fragment_id: (content descriptor, chunk
+    refs)}``.  Required for a lazy cut, whose rows carry labels: the caller
+    reads the stored chunks through the returned descriptor."""
 
     _validate_chunked_cut(cut)
     wanted = list(dict.fromkeys(fragment_ids))
@@ -784,32 +822,44 @@ async def materialize_chunked_fragments(
         raise ValueError("full-parameter materialize fragment IDs are malformed")
     if not wanted:
         return {}
-    owners = {descriptor.fragment_id: state.topology for state in cut.shards for descriptor in state.fragments}
-    if any(fragment_id not in owners for fragment_id in wanted):
+    rows = {descriptor.fragment_id: (state.topology, descriptor) for state in cut.shards for descriptor in state.fragments}
+    if any(fragment_id not in rows for fragment_id in wanted):
         raise ValueError("full-parameter materialize names a fragment outside the cut")
     by_topology = {
         state.topology: {
             "state": state,
-            "fragment_ids": tuple(sorted(f for f in wanted if owners[f] == state.topology)),
+            "fragment_ids": tuple(sorted(f for f in wanted if rows[f][0] == state.topology)),
         }
         for state in cut.shards
     }
     topologies = await _group_topologies(group)
     if set(topologies) != set(by_topology):
         raise RuntimeError("full-parameter chunked cut does not match the actor group")
-    results = await _rank_call(group, "materialize_full_parameter_fragments", by_topology=by_topology)
-    stored: dict[int, list[object]] = {}
+    results = await _rank_call(
+        group,
+        "materialize_full_parameter_fragments",
+        by_topology=by_topology,
+        **({"return_descriptors": True} if return_descriptors else {}),
+    )
+    stored: dict[int, object] = {}
     for topology, result in zip(topologies, results, strict=True):
         if isinstance(result, BaseException):
             raise RuntimeError("Megatron rank refused to materialize full-parameter fragments") from result
         expected = by_topology[topology]["fragment_ids"]
-        if not isinstance(result, tuple) or tuple(fragment_id for fragment_id, _refs in result) != expected:
+        if not isinstance(result, tuple) or tuple(row[0] for row in result) != expected:
             raise RuntimeError("Megatron materialized the wrong full-parameter fragments")
-        for fragment_id, references in result:
-            descriptor = next(d for state in cut.shards for d in state.fragments if d.fragment_id == fragment_id)
+        for row in result:
+            fragment_id, references = row[0], row[1]
+            descriptor = rows[fragment_id][1]
             if not isinstance(references, list) or len(references) != len(descriptor.chunks) or any(reference is None for reference in references):
                 raise RuntimeError("Megatron materialized incomplete full-parameter chunk refs")
-            stored[fragment_id] = references
+            if not return_descriptors:
+                stored[fragment_id] = references
+                continue
+            content = row[2] if len(row) == 3 else None
+            if not isinstance(content, FullParameterFragmentDescriptor) or not _same_fragment_geometry(content, descriptor):
+                raise RuntimeError("Megatron returned a full-parameter fragment descriptor of another geometry")
+            stored[fragment_id] = (content, references)
     return stored
 
 
@@ -941,8 +991,12 @@ async def record_local_step(
     base_policy_version: int,
     rollout_id: int,
     max_receipt_attempts: int = 3,
+    check_model: bool = True,
 ) -> tuple[FullParameterLocalStepReceipt, ...]:
-    """Record exact successful scheduler progress on every rank."""
+    """Record exact successful scheduler progress on every rank.
+
+    ``check_model=False``: skip each rank's whole-model model/master check
+    (only before a lazy export; see ``record_full_parameter_local_step``)."""
 
     _validate_attempts(max_receipt_attempts, "receipt")
     for _attempt in range(max_receipt_attempts):
@@ -951,6 +1005,7 @@ async def record_local_step(
             "record_full_parameter_local_step",
             base_policy_version=base_policy_version,
             rollout_id=rollout_id,
+            **({} if check_model else {"check_model": False}),
         )
         if all(isinstance(receipt, FullParameterLocalStepReceipt) for receipt in results):
             break
