@@ -20,6 +20,7 @@ from megatron.training.arguments import core_transformer_config_from_args
 from miles.backends.megatron_utils import runtime_patches  # noqa: F401  (deep_ep, bridge plugins)
 from miles.utils.audit_utils.witness.module import install_witness
 from miles.utils.function_registry import load_function
+from miles.utils.megatron_bridge_utils import describe_bridge_moe_runtime_config
 from miles.utils.replay_base import routing_replay_manager
 from miles.backends.training_utils.critic_freeze import freeze_attention_parameters
 from miles.backends.megatron_utils.critic_head import critic_head_owner
@@ -107,8 +108,10 @@ def _apply_bridge_runtime_config(provider, args: argparse.Namespace) -> None:
         provider.moe_aux_loss_coeff = args.moe_aux_loss_coeff
 
     # Imported here: test_bridge_mtp_detachment.py exec()s this function's AST in a bare namespace (no module names).
-    from miles.utils.megatron_bridge_utils import apply_dsa_backend_args
+    from miles.utils.megatron_bridge_utils import apply_bridge_moe_runtime_args, apply_dsa_backend_args
 
+    # MoE dispatcher / fusion / overlap flags: copied only when set, else the provider's value stays
+    apply_bridge_moe_runtime_args(provider, args)
     apply_dsa_backend_args(provider, args)
 
 
@@ -199,6 +202,7 @@ def get_model_provider_func(
         if role == "critic":
             provider.share_embeddings_and_output_weights = False
         provider.finalize()
+        logger.info("bridge MoE runtime config: %s", describe_bridge_moe_runtime_config(provider, args))
 
         def wrapped_bridge_provider(
             pre_process: bool = True,

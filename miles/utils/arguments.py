@@ -40,6 +40,7 @@ from miles.utils.object_store_config import (
     compute_mooncake_init_kwargs_from_env,
     compute_mooncake_init_kwargs_vanilla,
 )
+from miles.utils.replay_base import reject_router_fusion_with_routing_replay
 from miles.utils.run_uuid import RUN_UUID_LENGTH, generate_run_uuid, validate_run_uuid
 from miles.utils.tracking_utils.ci_history import RECORD_DIR_ENV
 from miles.utils.workers.argv_utils import with_relax_parser_required_args, with_suppressed_parser_help
@@ -4083,6 +4084,8 @@ def miles_validate_args(args):
 
     if args.use_rollout_routing_replay:
         args.use_routing_replay = True
+    # moe_router_fusion is a Megatron flag (absent on the FSDP backend); the bridge path checks the provider again
+    reject_router_fusion_with_routing_replay(router_fusion=getattr(args, "moe_router_fusion", False), args=args)
 
     args.rollout_external = _compute_rollout_external(args)
     args.custom_inference_engine_provider_path = _compute_custom_inference_engine_provider_path(args)

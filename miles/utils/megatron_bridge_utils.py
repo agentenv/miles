@@ -1,4 +1,8 @@
+import json
 from contextlib import contextmanager
+from types import MappingProxyType
+
+from miles.utils.replay_base import reject_router_fusion_with_routing_replay
 
 try:
     from megatron.core.utils import unwrap_model
@@ -37,3 +41,78 @@ def apply_dsa_backend_args(provider, args) -> None:
     elif hasattr(provider, "dsa_kernel_backend"):
         explicit = getattr(args, "dsa_kernel_backend", None)
         provider.dsa_kernel_backend = explicit or {"tilelang": "tilelang", "megatron": "none"}[backend]
+
+
+# MoE runtime flags that the bridge path copies onto the provider only when they are set
+# (model_provider._apply_bridge_runtime_config). Megatron's parser builds each flag from the
+# TransformerConfig field of the same name, with the field default as the CLI default; a test checks
+# this table against the parser. A bridge provider may hold its own value on purpose
+# (Nemotron-H sets moe_permute_fusion and moe_shared_expert_overlap to True), and args hold the CLI
+# default when a flag is absent, so a field is copied only when args differ from the CLI default.
+# A store-true flag can therefore turn a provider setting on, never off.
+BRIDGE_MOE_RUNTIME_ARG_DEFAULTS = MappingProxyType(
+    {
+        "moe_flex_dispatcher_backend": "deepep",
+        "moe_flex_dispatcher_num_sms": None,
+        "moe_deepep_num_sms": None,  # deprecated alias; TransformerConfig.__post_init__ routes it
+        "moe_hybridep_num_sms": None,  # deprecated alias; same
+        "moe_enable_deepep": False,  # deprecated; TransformerConfig.__post_init__ maps it to the deepep backend
+        "moe_permute_fusion": False,
+        "moe_router_fusion": False,
+        "moe_shared_expert_overlap": False,
+        "overlap_moe_expert_parallel_comm": False,
+        "delay_wgrad_compute": False,
+    }
+)
+
+
+def bridge_moe_runtime_overrides(args) -> dict:
+    """The BRIDGE_MOE_RUNTIME_ARG_DEFAULTS fields that args set to a value other than the CLI default."""
+    return {
+        name: getattr(args, name)
+        for name, default in BRIDGE_MOE_RUNTIME_ARG_DEFAULTS.items()
+        if getattr(args, name, default) != default
+    }
+
+
+def apply_bridge_moe_runtime_args(provider, args) -> None:
+    """Copy the MoE runtime flags set in args onto a bridge-built provider, before ``finalize()``.
+
+    Raises instead of dropping a setting: for a set flag that the provider has no field for, for
+    ``--cuda-graph-impl``, and for router fusion together with routing replay.
+    """
+    _reject_bridge_cuda_graphs(cuda_graph_impl=getattr(args, "cuda_graph_impl", "none"))
+    for name, value in bridge_moe_runtime_overrides(args).items():
+        if not hasattr(provider, name):
+            raise AttributeError(
+                f"--{name.replace('_', '-')} is set, but the bridge provider {type(provider).__name__} "
+                f"has no field {name!r}"
+            )
+        setattr(provider, name, value)
+    router_fusion = bool(getattr(provider, "moe_router_fusion", False))
+    reject_router_fusion_with_routing_replay(router_fusion=router_fusion, args=args)
+
+
+def describe_bridge_moe_runtime_config(provider, args) -> str:
+    """A JSON line: the MoE runtime fields of a bridge provider and the ones that args set."""
+    names = ("moe_token_dispatcher_type", *BRIDGE_MOE_RUNTIME_ARG_DEFAULTS, "cuda_graph_impl")
+    return json.dumps(
+        {
+            "effective": {name: getattr(provider, name, "<absent>") for name in names},
+            "from_args": sorted(bridge_moe_runtime_overrides(args)),
+        },
+        default=str,
+        sort_keys=True,
+    )
+
+
+def _reject_bridge_cuda_graphs(*, cuda_graph_impl) -> None:
+    # The bridge copy does not carry the CUDA graph settings (modules, warmup, RNG tracker, ...), and
+    # copying the impl alone would capture graphs with the provider's defaults for the rest. Fail
+    # instead of training without graphs while args claim otherwise.
+    if cuda_graph_impl not in (None, "none"):
+        raise ValueError(
+            f"--cuda-graph-impl {cuda_graph_impl} is not supported with --megatron-to-hf-mode bridge: the "
+            "bridge provider does not receive the CUDA graph settings, so the flag would have no effect. "
+            "Remove it, or build the model with --custom-model-provider-path."
+        )

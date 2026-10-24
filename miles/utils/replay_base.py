@@ -239,3 +239,21 @@ class IndexerReplayManager(BaseReplayManager):
 routing_replay_manager = RoutingReplayManager()
 indexer_replay_manager = IndexerReplayManager()
 all_replay_managers = [routing_replay_manager, indexer_replay_manager]
+
+
+def reject_router_fusion_with_routing_replay(*, router_fusion: bool, args) -> None:
+    """Raise if the MoE router is fused while routing replay is on.
+
+    Megatron's fused top-k (``topk_routing_with_score_function(fused=True)``, from
+    ``moe_router_fusion``) returns before ``routing_replay_manager``'s top-k hook. A replayed run
+    (``--use-routing-replay``, or R3 ``--use-rollout-routing-replay``) would then route by the
+    training logits and not replay anything, without an error.
+    """
+    replay = getattr(args, "use_routing_replay", False) or getattr(args, "use_rollout_routing_replay", False)
+    if router_fusion and replay:
+        raise ValueError(
+            "--moe-router-fusion cannot be used with routing replay (--use-routing-replay / "
+            "--use-rollout-routing-replay): Megatron's fused router top-k returns before the replay hook, "
+            "so the replayed routes would be skipped silently. Remove --moe-router-fusion or turn routing "
+            "replay off."
+        )
