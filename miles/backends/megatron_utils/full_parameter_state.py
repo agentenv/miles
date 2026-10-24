@@ -12,10 +12,12 @@ import threading
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 
 import torch
+
+from miles.backends.megatron_utils import full_parameter_sharded_masters as sharded
 
 
 _ROLE = re.compile(r"[a-z][a-z0-9_-]{0,31}\Z")
@@ -267,7 +269,11 @@ class FullParameterShardManifest:
     ``specs`` are the parameters this rank owns (exports).  ``holdings``
     lists every local parameter, owned or replicated, with its owner; it is
     metadata for the group transport and is not part of the layout hash, so a
-    rank without data-parallel replicas keeps its pre-replica identity."""
+    rank without data-parallel replicas keeps its pre-replica identity.
+    ``sharded_masters`` (also outside the hash): the rank keeps only a range
+    of each FP32 master (Megatron's distributed optimizer at DP>1), so its
+    owners export with the ranges the other replicas contribute
+    (``full_parameter_sharded_masters``)."""
 
     topology: FullParameterTopology
     role: str
@@ -275,6 +281,7 @@ class FullParameterShardManifest:
     specs: tuple[FullParameterShardSpec, ...]
     global_rank: int = 0
     holdings: tuple[FullParameterHolding, ...] = ()
+    sharded_masters: bool = False
 
     def __post_init__(self) -> None:
         if not _ROLE.fullmatch(self.role):
@@ -291,6 +298,10 @@ class FullParameterShardManifest:
         if self.layout_hash != _layout_hash(self.topology, self.specs):
             raise ValueError("full-parameter manifest layout hash changed")
         _validate_non_negative_integer(self.global_rank, "global rank")
+        if not isinstance(self.sharded_masters, bool):
+            raise ValueError("full-parameter manifest sharded-masters flag is malformed")
+        if self.sharded_masters and not self.replicated_holdings():
+            raise ValueError("full-parameter manifest has sharded masters but no data-parallel replica")
         if self.holdings:
             if self.holdings != tuple(sorted(self.holdings)) or len({holding.name for holding in self.holdings}) != len(self.holdings):
                 raise ValueError("full-parameter manifest holdings are not canonical")
@@ -554,13 +565,32 @@ class _OptimizerOwnedParameters(frozenset):
       when offloaded); ``fp32`` is that copy.
 
     Empty for the non-distributed optimizer.
+
+    ``distributed_views`` maps ``id(model_param)`` to ``(view, owned, fp32)``
+    for every parameter the distributed optimizer steps a range of on this
+    rank: ``view`` is Megatron's ``shard_*_groups`` view of the model parameter
+    at that range (None for a quantized parameter), ``fp32`` its FP32 values
+    (None under the precision-aware optimizer without CPU offload).  Read only
+    when masters are sharded (``full_parameter_sharded_masters``).
+    ``hybrid_copies``: a base optimizer keeps HybridDeviceOptimizer copies.
     """
 
     distributed_masters: Mapping[int, tuple[torch.Tensor, torch.Tensor]]
+    distributed_views: Mapping[int, tuple[torch.Tensor | None, torch.Tensor, torch.Tensor | None]]
+    hybrid_copies: bool
 
-    def __new__(cls, identities, distributed_masters: Mapping[int, tuple[torch.Tensor, torch.Tensor]] | None = None):
+    def __new__(
+        cls,
+        identities,
+        distributed_masters: Mapping[int, tuple[torch.Tensor, torch.Tensor]] | None = None,
+        *,
+        distributed_views: Mapping[int, tuple[torch.Tensor | None, torch.Tensor, torch.Tensor | None]] | None = None,
+        hybrid_copies: bool = False,
+    ):
         owned = super().__new__(cls, identities)
         owned.distributed_masters = dict(distributed_masters or {})
+        owned.distributed_views = dict(distributed_views or {})
+        owned.hybrid_copies = bool(hybrid_copies)
         return owned
 
 
@@ -577,8 +607,9 @@ def _resolve_master(
     flat FP32 range per parameter (``main_param_sharded``); at DP=1 that range
     is the whole parameter, so ``master`` is a parameter-shaped view of it and
     writes through the view land in the tensor that is stepped. A partial
-    range (DP>1, or a rank owning none of the parameter) is refused: at DP>1
-    every data-parallel replica keeps a whole master (``_local_layout``).
+    range (DP>1, or a rank owning none of the parameter) is refused here: at
+    DP>1 ``_local_layout`` reads the distributed optimizer's ranges through
+    ``full_parameter_sharded_masters`` instead.
     """
 
     sharded = bool(getattr(parameter, "main_param_sharded", False))
@@ -596,16 +627,16 @@ def _resolve_master(
         elif sharded:
             raise RuntimeError(
                 f"{name!r} has no local FP32 master (DP-sharded optimizer, or precision-aware without "
-                "CPU offload); full-parameter sync needs a whole FP32 master of every parameter on "
-                "every rank (at DP>1: the non-distributed optimizer without CPU offload)"
+                "CPU offload); full-parameter sync needs a whole FP32 master of every parameter at DP=1, "
+                "and FP32 main params without CPU offload at DP>1"
             )
         else:
             raise RuntimeError(f"{name!r} has no FP32 optimizer master")
     if not isinstance(fp32, torch.Tensor) or fp32.dtype != torch.float32 or fp32.numel() != parameter.numel():
         if sharded:
             raise RuntimeError(
-                f"{name!r} optimizer master is a partial DP shard; full-parameter sync at DP>1 needs "
-                "the non-distributed optimizer without CPU offload (whole FP32 masters on every rank)"
+                f"{name!r} optimizer master is a partial DP shard outside a data-parallel replica group; "
+                "full-parameter sync reads partial ranges only at DP>1"
             )
         raise RuntimeError(f"{name!r} has an incomplete FP32 optimizer master")
     if sharded:
@@ -720,12 +751,21 @@ def _replica_owners(
 
 @dataclass(frozen=True)
 class _LocalLayout:
-    """This rank's parameters split into the ones it owns and the replicas it holds."""
+    """This rank's parameters split into the ones it owns and the replicas it holds.
+
+    Whole masters fill ``masters`` and ``replica_masters``.  Sharded masters
+    (Megatron's distributed optimizer at DP>1) leave both empty and fill
+    ``ranges``: this rank's FP32 range of every local parameter, by name
+    (``full_parameter_sharded_masters``)."""
 
     specs: tuple[FullParameterShardSpec, ...]
     masters: dict[str, torch.Tensor]  # wire name -> FP32 master of an owned parameter
     holdings: tuple[FullParameterHolding, ...]
     replica_masters: dict[str, torch.Tensor]  # parameter name -> FP32 master of a replica
+    ranges: Mapping[str, sharded.MasterRange] | None = None  # by parameter name
+
+    def ranges_by_wire_name(self) -> dict[str, sharded.MasterRange]:
+        return {spec.wire_name: self.ranges[spec.name] for spec in self.specs}
 
 
 def _local_layout(
@@ -737,26 +777,35 @@ def _local_layout(
     optimizer_owned_parameter_ids: frozenset[int] | None = None,
 ) -> _LocalLayout:
     ordered = tuple(sorted(named_parameters, key=lambda value: value[0]))
-    owners = _replica_owners(ordered, replication)
-    specs, masters, holdings, replica_masters = [], {}, [], {}
     for name, parameter in ordered:
         if not isinstance(parameter, torch.nn.Parameter):
             raise TypeError(f"{name!r} is not a trainable parameter")
-        master = _master_parameter(parameter, name, optimizer_owned_parameter_ids=optimizer_owned_parameter_ids)
-        shape = tuple(int(dimension) for dimension in master.shape)
+    owners = _replica_owners(ordered, replication)
+    ranges = sharded.master_ranges(ordered, replication, optimizer_owned_parameter_ids)
+    specs, masters, holdings, replica_masters = [], {}, [], {}
+    for name, parameter in ordered:
+        # A sharded master has the parameter's shape (it is a range of it).
+        master = None if ranges is not None else _master_parameter(
+            parameter, name, optimizer_owned_parameter_ids=optimizer_owned_parameter_ids
+        )
+        shape = tuple(int(dimension) for dimension in (parameter if master is None else master).shape)
         owner, ranks = owners[name]
         holdings.append(FullParameterHolding(name=name, shape=shape, owner_rank=owner, replica_ranks=ranks))
         if owner != replication.global_rank:
-            replica_masters[name] = master
+            if master is not None:
+                replica_masters[name] = master
             continue
-        spec = FullParameterShardSpec(role, topology.shard_id, name, shape, "float32", master.numel())
+        spec = FullParameterShardSpec(role, topology.shard_id, name, shape, "float32", math.prod(shape))
         specs.append(spec)
-        masters[spec.wire_name] = master
+        if master is not None:
+            masters[spec.wire_name] = master
     if not specs:
         raise RuntimeError(
             "this rank owns no full-parameter tensor: its data-parallel group has more ranks than parameters"
         )
-    return _LocalLayout(specs=tuple(specs), masters=masters, holdings=tuple(holdings), replica_masters=replica_masters)
+    return _LocalLayout(
+        specs=tuple(specs), masters=masters, holdings=tuple(holdings), replica_masters=replica_masters, ranges=ranges
+    )
 
 
 def _actor_local_layout(actor, *, role: str, topology: FullParameterTopology) -> tuple[
@@ -1357,7 +1406,12 @@ def _optimizer_owned_parameter_ids(optimizer) -> frozenset[int]:
                 owned.add(identity)
     if not owned:
         raise RuntimeError("full-parameter optimizer owns no parameters")
-    return _OptimizerOwnedParameters(owned, _distributed_masters(optimizer))
+    return _OptimizerOwnedParameters(
+        owned,
+        _distributed_masters(optimizer),
+        distributed_views=_distributed_views(optimizer),
+        hybrid_copies=any(getattr(base, "param_to_inner_param", None) for base in bases),
+    )
 
 
 def _optimizer_wrappers(optimizer) -> tuple[object, ...]:
@@ -1397,6 +1451,29 @@ def _distributed_masters(optimizer) -> dict[int, tuple[torch.Tensor, torch.Tenso
             if fp32 is not None and fp32.dtype == torch.float32:
                 add(model_param, (shard, fp32))
     return masters
+
+
+def _distributed_views(optimizer) -> dict[int, tuple[torch.Tensor | None, torch.Tensor, torch.Tensor | None]]:
+    """``id(model_param) -> (view, owned, fp32)`` of every distributed-optimizer range on this rank.
+
+    Megatron pairs each model parameter with ``param.view(-1)[start:end]``
+    (``shard_float16_groups`` / ``shard_fp32_groups``).  The base optimizer
+    steps ``main_param`` (an FP32 clone of a BF16 range), the view itself (a
+    native-FP32 parameter), or under the precision-aware optimizer the BF16
+    view, whose FP32 values are a HybridDeviceOptimizer copy when offloaded."""
+
+    views: dict[int, tuple[torch.Tensor | None, torch.Tensor, torch.Tensor | None]] = {}
+    for wrapper in _optimizer_wrappers(optimizer):
+        inner = getattr(getattr(wrapper, "optimizer", None), "param_to_inner_param", None) or {}
+        for model_param, view in _paired_groups(wrapper, "model_fp32_groups", "shard_fp32_groups"):
+            views[id(model_param)] = (view, view, view)
+        for model_param, view in _paired_groups(wrapper, "model_float16_groups", "shard_float16_groups"):
+            main = getattr(model_param, "main_param", None)
+            if main is not None:
+                views[id(model_param)] = (view, main, main)
+            else:
+                views[id(model_param)] = (view, view, None if view is None else inner.get(view))
+    return views
 
 
 @torch.no_grad()
@@ -1471,6 +1548,8 @@ def full_parameter_shard_manifest(
         replication=replication,
         optimizer_owned_parameter_ids=optimizer_owned,
     )
+    if layout.ranges is not None:
+        sharded.refuse_unsupported_args(actor.args)
     return _manifest_from_layout(layout, topology=topology, role=role, global_rank=replication.global_rank)
 
 
@@ -1488,6 +1567,7 @@ def _manifest_from_layout(
         specs=layout.specs,
         global_rank=global_rank,
         holdings=layout.holdings,
+        sharded_masters=layout.ranges is not None,
     )
 
 
@@ -1666,6 +1746,7 @@ def full_parameter_optimizer_state(
         model_count = _validate_model_matches_masters(
             named_parameters,
             optimizer_owned_parameter_ids=optimizer_owned,
+            ranges=layout.ranges,
         )
     else:
         model_count = len(tuple(named_parameters))
@@ -1674,10 +1755,7 @@ def full_parameter_optimizer_state(
     # A data-parallel replica has no spec on this rank (its owner exports it);
     # its state counts, but the fingerprint is taken from an owned parameter.
     spec_by_name = {spec.name: spec for spec in layout.specs}
-    name_by_master = {
-        id(_resolve_master(parameter, name, optimizer_owned_parameter_ids=optimizer_owned)[0]): name
-        for name, parameter in named_parameters
-    }
+    name_by_master = _optimizer_owned_names(named_parameters, optimizer_owned, layout)
     populated: dict[str, Mapping[str, object]] = {}
     tensor_count = 0
     scalar_count = 0
@@ -1700,6 +1778,13 @@ def full_parameter_optimizer_state(
                     tensor_count += 1
                     scalar_count += value.numel()
     owned = [(spec_by_name[name], state) for name, state in populated.items() if name in spec_by_name]
+    if not owned and layout.ranges is not None:
+        # Sharded masters: the Adam state of the parameters this rank exports
+        # may all live on other ranks; fingerprint a local range instead.
+        owned = [
+            (_local_spec(role, topology, name, layout.ranges[name].parameter), state)
+            for name, state in populated.items()
+        ]
     if not owned:
         raise RuntimeError("full-parameter optimizer has not completed a step")
     selected_spec, selected_state = min(
@@ -1722,11 +1807,47 @@ def full_parameter_optimizer_state(
     )
 
 
+def _master_ranges(
+    named_parameters: Sequence[tuple[str, torch.nn.Parameter]],
+    optimizer_owned: frozenset[int],
+) -> Mapping[str, sharded.MasterRange] | None:
+    """This rank's master ranges by name when masters are sharded, else None (see ``_local_layout``)."""
+
+    ordered = tuple(sorted(named_parameters, key=lambda value: value[0]))
+    return sharded.master_ranges(ordered, full_parameter_replication(), optimizer_owned)
+
+
+def _optimizer_owned_names(
+    named_parameters: Sequence[tuple[str, torch.nn.Parameter]],
+    optimizer_owned: frozenset[int],
+    layout: _LocalLayout,
+) -> dict[int, str]:
+    """``id(optimizer-owned tensor) -> parameter name`` of every local parameter."""
+
+    if layout.ranges is not None:
+        return sharded.owned_tensor_names(layout.ranges)
+    return {
+        id(_resolve_master(parameter, name, optimizer_owned_parameter_ids=optimizer_owned)[0]): name
+        for name, parameter in named_parameters
+    }
+
+
+def _local_spec(role: str, topology: FullParameterTopology, name: str, parameter: torch.Tensor) -> FullParameterShardSpec:
+    shape = tuple(int(dimension) for dimension in parameter.shape)
+    return FullParameterShardSpec(role, topology.shard_id, name, shape, "float32", math.prod(shape))
+
+
 def _validate_model_matches_masters(
     named_parameters: Iterable[tuple[str, torch.nn.Parameter]],
     *,
     optimizer_owned_parameter_ids: frozenset[int],
+    ranges: Mapping[str, sharded.MasterRange] | None = None,
 ) -> int:
+    """Model == master for every row; ``ranges`` (sharded masters): over each
+    row's range on this rank only.  Returns the rows checked."""
+
+    if ranges is not None:
+        return sharded.check_model(named_parameters, ranges)
     count = 0
     for name, parameter in named_parameters:
         master = _master_parameter(
@@ -1941,6 +2062,7 @@ def record_full_parameter_local_step(
         _validate_model_matches_masters(
             named_parameters,
             optimizer_owned_parameter_ids=optimizer_owned,
+            ranges=_master_ranges(named_parameters, optimizer_owned),
         )
     generation += 1
     # The local step changed the masters.
@@ -2143,21 +2265,78 @@ def _validate_cpu_chunk(
     return value
 
 
+def _fragment_sources(
+    fragment: FullParameterFragmentPlan,
+    layout: _LocalLayout,
+    *,
+    contributions: Mapping[int, Sequence[sharded.FullParameterMasterContribution]] | None = None,
+    ray_module=None,
+) -> list[torch.Tensor]:
+    """Flat FP32 tensors whose concatenation is ``fragment``'s payload on its owner.
+
+    Whole masters: the member ranges of the owned masters.  Sharded masters:
+    the owner's own ranges plus ``contributions[fragment_id]``, the ranges the
+    other replicas stored for it (``full_parameter_sharded_masters``)."""
+
+    if layout.ranges is None:
+        masters = layout.masters
+        members = fragment.members({name: masters[name].numel() for name in fragment.wire_names})
+        return [masters[name].detach().reshape(-1)[start:stop] for name, start, stop in members]
+    return sharded.fragment_sources(
+        fragment,
+        numel_by_wire={spec.wire_name: spec.numel for spec in layout.specs},
+        ranges_by_wire=layout.ranges_by_wire_name(),
+        contributions=(contributions or {}).get(fragment.fragment_id, ()),
+        ray_module=ray_module,
+    )
+
+
+def _plan_fragment_ids(plan: FullParameterOwnerFragmentPlan) -> tuple[int, ...]:
+    return tuple(fragment.fragment_id for fragment in plan.fragments)
+
+
+def _contributions_by_fragment(
+    actor,
+    layout: _LocalLayout,
+    contributions: Sequence[sharded.FullParameterMasterContribution],
+    *,
+    owner: FullParameterTopology,
+    fragment_ids: Sequence[int],
+) -> dict[int, tuple[sharded.FullParameterMasterContribution, ...]]:
+    """Checked contributions by fragment; none are accepted with whole masters."""
+
+    if layout.ranges is None:
+        if contributions:
+            raise RuntimeError("full-parameter contributions need sharded masters")
+        return {}
+    return sharded.contributions_by_fragment(
+        contributions, owner=owner, fragment_ids=fragment_ids, tracking=_tracking_identity(actor)
+    )
+
+
+def _tracking_identity(actor) -> sharded.Tracking:
+    """``(installed policy version, local-step generation, scheduler steps)``."""
+
+    installed, generation, _exported, _anchor = _require_full_parameter_tracking(actor)
+    return installed, generation, _scheduler_num_steps(actor)
+
+
 def _export_fragment_chunks(
     fragment: FullParameterFragmentPlan,
     *,
-    masters: Mapping[str, torch.Tensor],
+    sources: Sequence[torch.Tensor],
     max_chunk_numel: int,
     parameter_layout_hash: str,
     plan_hash: str,
     ray_module,
     overlap_checks: bool = True,
 ) -> tuple[FullParameterFragmentDescriptor, list[object | None]]:
-    """``overlap_checks=False``: run the finite check and the chunk hash in
-    this thread (callers that export several fragments on the scan pool)."""
+    """``sources``: flat FP32 tensors whose concatenation is the fragment
+    payload (:func:`_fragment_sources`).  ``overlap_checks=False``: run the
+    finite check and the chunk hash in this thread (callers that export several
+    fragments on the scan pool)."""
 
     submit = _hash_pool().submit if overlap_checks else _run_now
-    sources = [masters[name].detach().reshape(-1)[start:stop] for name, start, stop in fragment.members({name: masters[name].numel() for name in fragment.wire_names})]
     source_index = 0
     source_offset = 0
     flat_offset = 0
@@ -2236,7 +2415,7 @@ def _export_fragment_chunks(
 def _describe_fragment(
     fragment: FullParameterFragmentPlan,
     *,
-    masters: Mapping[str, torch.Tensor],
+    sources: Sequence[torch.Tensor],
     max_chunk_numel: int,
     parameter_layout_hash: str,
     plan_hash: str,
@@ -2248,7 +2427,6 @@ def _describe_fragment(
     chunk copy and no Ray object.  SHA-256 is a stream, so feeding a chunk in
     blocks gives the digest of the whole chunk."""
 
-    sources = [masters[name].detach().reshape(-1)[start:stop] for name, start, stop in fragment.members({name: masters[name].numel() for name in fragment.wire_names})]
     source_index = 0
     source_offset = 0
     flat_offset = 0
@@ -2424,6 +2602,7 @@ def export_full_parameter_chunked_shard(
     ray_module=None,
     defer_payload: bool = False,
     lazy: bool = False,
+    contributions: Sequence[sharded.FullParameterMasterContribution] = (),
 ) -> FullParameterChunkedShardState:
     """Export bounded owner chunks without materializing a rank or global cut.
 
@@ -2438,7 +2617,11 @@ def export_full_parameter_chunked_shard(
     (``_lazy_fragment_descriptor``), so the cut is a unique name for this
     export, not a content proof, and no NaN/Inf check runs.  The content
     descriptor, the NaN/Inf check and the model/master check of a fragment
-    run when ``materialize_full_parameter_fragments`` stores it."""
+    run when ``materialize_full_parameter_fragments`` stores it.
+
+    ``contributions``: with sharded masters, the master ranges the other
+    replicas hold of this rank's fragments (``full_parameter_master_contributions``),
+    at this tracking state; a lazy export reads none."""
 
     require_full_parameter_actor(actor.args, "export")
     if lazy and not defer_payload:
@@ -2459,7 +2642,13 @@ def export_full_parameter_chunked_shard(
     max_chunk_numel = _validate_chunk_byte_limit(max_chunk_bytes)
     ray_module = _resolve_ray_module(ray_module)
     plan, manifest, _replica_plan, _named, _owned, layout = _require_installed_layout(actor, role=role)
-    masters = layout.masters
+    contributed = _contributions_by_fragment(
+        actor, layout, contributions, owner=manifest.topology, fragment_ids=() if lazy else _plan_fragment_ids(plan)
+    )
+
+    def sources(fragment: FullParameterFragmentPlan) -> list[torch.Tensor]:
+        return _fragment_sources(fragment, layout, contributions=contributed, ray_module=ray_module)
+
     fragment_descriptors = []
     chunk_refs = []
     lazy_ids: frozenset[int] = frozenset()
@@ -2481,7 +2670,7 @@ def export_full_parameter_chunked_shard(
         fragment_descriptors = _parallel_map(
             lambda fragment: _describe_fragment(
                 fragment,
-                masters=masters,
+                sources=sources(fragment),
                 max_chunk_numel=max_chunk_numel,
                 parameter_layout_hash=plan.parameter_layout_hash,
                 plan_hash=plan.plan_hash,
@@ -2492,7 +2681,7 @@ def export_full_parameter_chunked_shard(
     for fragment in () if defer_payload else plan.fragments:
         descriptor, references = _export_fragment_chunks(
             fragment,
-            masters=masters,
+            sources=sources(fragment),
             max_chunk_numel=max_chunk_numel,
             parameter_layout_hash=plan.parameter_layout_hash,
             plan_hash=plan.plan_hash,
@@ -2555,10 +2744,72 @@ def note_full_parameter_replica_export(
     started = time.monotonic()
     _plan, _manifest, replica_plan, _named, _owned, layout = _require_installed_layout(actor, role=role)
     stats = replicas.note_replica_export(
-        actor, replica_plan, tuple(states), replica_masters=layout.replica_masters, lazy=lazy
+        actor,
+        replica_plan,
+        tuple(states),
+        replica_masters=None if layout.ranges is not None else layout.replica_masters,
+        lazy=lazy,
     )
     _note_apply_stats(actor, "replica_export", **stats, seconds=time.monotonic() - started)
     return stats["fragments"]
+
+
+def full_parameter_master_contributions(
+    actor,
+    *,
+    requests: Sequence[tuple[FullParameterTopology, tuple[int, ...] | None]],
+    held: Sequence[tuple[FullParameterTopology, int, int, str]] | None = None,
+    max_chunk_bytes: int = FULL_PARAMETER_DEFAULT_CHUNK_BYTES,
+    role: str = "actor",
+    ray_module=None,
+) -> tuple[sharded.FullParameterMasterContribution, ...]:
+    """Store this rank's FP32 master ranges of other ranks' fragments in Ray (sharded masters).
+
+    ``requests``: ``(owner topology, fragment IDs)`` for owners whose
+    parameters this rank replicates; None asks for every fragment of that
+    owner it holds a range of.  The owners pass the returned contributions to
+    their export or materialize (``full_parameter_sharded_masters``).
+
+    ``held`` (for a materialize): ``(owner topology, fragment ID, numel,
+    payload hash)`` of every requested fragment in the cut being stored; each
+    contributed fragment must be one this rank's live replica record holds with
+    exactly that hash (no local step, restore or commit start since).  With
+    whole masters there is nothing to contribute and ``requests`` must be empty."""
+
+    from miles.backends.megatron_utils import full_parameter_replicas as replicas  # import cycle
+    require_full_parameter_actor(actor.args, "contribute")
+    assert_full_parameter_boundary_clear(actor)
+    _validate_scheduler_tracking_congruence(actor, role=role)
+    started = time.monotonic()
+    max_chunk_numel = _validate_chunk_byte_limit(max_chunk_bytes)
+    _plan, manifest, replica_plan, _named, _owned, layout = _require_installed_layout(actor, role=role)
+    if layout.ranges is None:
+        if requests:
+            raise RuntimeError("full-parameter contributions need sharded masters")
+        return ()
+    holds = None
+    if held is not None:
+        expected = {(owner, fragment_id): (numel, payload_hash) for owner, fragment_id, numel, payload_hash in held}
+        holds = replicas.replica_holds(actor, replica_plan, expected)
+    ray_module = _resolve_ray_module(ray_module)
+    contributions = sharded.contribute(
+        topology=manifest.topology,
+        tracking=_tracking_identity(actor),
+        replica_plan=replica_plan,
+        ranges=layout.ranges,
+        requests=tuple(requests),
+        resident=holds,
+        max_chunk_numel=max_chunk_numel,
+        put=lambda value: put_full_parameter_chunk(ray_module, value),
+    )
+    _note_apply_stats(
+        actor,
+        "contribute",
+        contributions=len(contributions),
+        scalars=sum(contribution.numel for contribution in contributions),
+        seconds=time.monotonic() - started,
+    )
+    return contributions
 
 
 def materialize_full_parameter_fragments(
@@ -2569,6 +2820,7 @@ def materialize_full_parameter_fragments(
     role: str = "actor",
     ray_module=None,
     return_descriptors: bool = False,
+    contributions: Sequence[sharded.FullParameterMasterContribution] = (),
 ) -> tuple[tuple, ...]:
     """Store the bytes of deferred fragments of ``state`` while the masters hold them.
 
@@ -2587,7 +2839,11 @@ def materialize_full_parameter_fragments(
     model parameters are compared with their masters.  Its descriptor then
     differs from the label, so the caller must ask for it
     (``return_descriptors``: rows are ``(fragment_id, chunk refs,
-    descriptor)``) and read the stored chunks through it."""
+    descriptor)``) and read the stored chunks through it.
+
+    ``contributions``: with sharded masters, the master ranges the other
+    replicas hold of the requested fragments (``full_parameter_master_contributions``
+    with the residency check); the fragments are rebuilt from them."""
 
     require_full_parameter_actor(actor.args, "materialize")
     assert_full_parameter_boundary_clear(actor)
@@ -2616,13 +2872,15 @@ def materialize_full_parameter_fragments(
     lazy = _lazy_fragment_ids(actor, state) & frozenset(requested)
     if lazy and not return_descriptors:
         raise RuntimeError(f"full-parameter fragments {sorted(lazy)} come from a lazy export: materialize them with return_descriptors=True")
-    masters = layout.masters
+    contributed = _contributions_by_fragment(
+        actor, layout, contributions, owner=manifest.topology, fragment_ids=requested
+    )
 
     def store(fragment_id: int) -> tuple[int, list[object], FullParameterFragmentDescriptor]:
         expected = descriptors[fragment_id]
         descriptor, references = _export_fragment_chunks(
             fragments[fragment_id],
-            masters=masters,
+            sources=_fragment_sources(fragments[fragment_id], layout, contributions=contributed, ray_module=ray_module),
             max_chunk_numel=expected.chunks[0].numel,
             parameter_layout_hash=plan.parameter_layout_hash,
             plan_hash=plan.plan_hash,
@@ -2646,6 +2904,7 @@ def materialize_full_parameter_fragments(
         checked = _validate_model_matches_masters(
             (by_wire_name[name] for name in names),
             optimizer_owned_parameter_ids=optimizer_owned,
+            ranges=layout.ranges,
         )
     _note_apply_stats(
         actor,
@@ -2847,23 +3106,43 @@ def prepare_full_parameter_chunked_shard(
     return parameter_count
 
 
+MasterWriter = Callable[[str, int, torch.Tensor], None]
+
+
+def _whole_master_writer(masters: Mapping[str, torch.Tensor]) -> MasterWriter:
+    """``write(key, start, values)``: flat offsets ``[start, start + len(values))`` of ``masters[key]``."""
+
+    def write(key: str, start: int, values: torch.Tensor) -> None:
+        masters[key].detach().reshape(-1)[start : start + values.numel()].copy_(values, non_blocking=False)
+
+    return write
+
+
+def _commit_writer(layout: _LocalLayout, *, owned: bool) -> MasterWriter:
+    """Where a commit writes: the owned masters by wire name (``owned``) or
+    the replica masters by parameter name; with sharded masters the model and
+    this rank's range (``MasterRange.write``)."""
+
+    if layout.ranges is None:
+        return _whole_master_writer(layout.masters if owned else layout.replica_masters)
+    return sharded.range_writer(layout.ranges_by_wire_name() if owned else layout.ranges)
+
+
 def _copy_fragment_chunks_to_masters(
     fragment: FullParameterFragmentPlan,
     descriptor: FullParameterFragmentDescriptor,
     references: Sequence[object | None],
     *,
-    masters: Mapping[str, torch.Tensor],
+    numel_by_wire: Mapping[str, int],
+    write: MasterWriter,
     parameter_layout_hash: str,
     plan_hash: str,
     ray_module,
 ) -> int:
-    master_index = 0
-    master_offset = 0
+    members = fragment.members(numel_by_wire)
+    member_index = 0
+    member_offset = 0  # elements of the current member already written
     copied_parameters = 0
-    members = fragment.members({name: masters[name].numel() for name in fragment.wire_names})
-    flattened = [masters[name].detach().reshape(-1)[start:stop] for name, start, stop in members]
-    # A split parameter counts once: in the fragment holding its last range.
-    completes = [stop == masters[name].numel() for name, _start, stop in members]
     for chunk_descriptor, reference in zip(
         descriptor.chunks,
         references,
@@ -2881,37 +3160,31 @@ def _copy_fragment_chunks_to_masters(
         )
         source_offset = 0
         while source_offset < value.numel():
-            if master_index >= len(flattened):
+            if member_index >= len(members):
                 raise RuntimeError("full-parameter chunk target ended early")
-            master = flattened[master_index]
-            count = min(
-                value.numel() - source_offset,
-                master.numel() - master_offset,
-            )
-            master[master_offset : master_offset + count].copy_(
-                value[source_offset : source_offset + count],
-                non_blocking=False,
-            )
+            name, start, stop = members[member_index]
+            count = min(value.numel() - source_offset, stop - start - member_offset)
+            write(name, start + member_offset, value[source_offset : source_offset + count])
             source_offset += count
-            master_offset += count
-            if master_offset == master.numel():
-                copied_parameters += completes[master_index]
-                master_index += 1
-                master_offset = 0
+            member_offset += count
+            if member_offset == stop - start:
+                # A split parameter counts once: in the fragment holding its last range.
+                copied_parameters += stop == numel_by_wire[name]
+                member_index += 1
+                member_offset = 0
         del value
-    if master_index != len(flattened) or master_offset != 0:
+    if member_index != len(members) or member_offset != 0:
         raise RuntimeError("full-parameter chunks did not cover every target")
     return copied_parameters
 
 
 def _fragment_completed_parameters(
     fragment: FullParameterFragmentPlan,
-    masters: Mapping[str, torch.Tensor],
+    numel_by_wire: Mapping[str, int],
 ) -> int:
     """Parameters whose last flat range lies in ``fragment`` (as the copy counts them)."""
 
-    members = fragment.members({name: masters[name].numel() for name in fragment.wire_names})
-    return sum(stop == masters[name].numel() for name, _start, stop in members)
+    return sum(stop == numel_by_wire[name] for name, _start, stop in fragment.members(numel_by_wire))
 
 
 @torch.no_grad()
@@ -2956,7 +3229,8 @@ def commit_prepared_full_parameter_shard(
     ray_module = _resolve_ray_module(ray_module)
     plan, manifest, replica_plan, named_parameters, optimizer_owned, layout = _require_installed_layout(actor, role=role)
     _validate_chunked_shard_against_plan(state, plan, manifest)
-    specs, masters = layout.specs, layout.masters
+    specs = layout.specs
+    numel_by_wire = {spec.wire_name: spec.numel for spec in specs}
     if not prepared.commit_started:
         # Resident fragments are skipped only while the masters provably hold
         # them: the record taken at prepare must still be the live one.  A
@@ -2982,7 +3256,7 @@ def commit_prepared_full_parameter_shard(
         strict=True,
     ):
         if fragment.fragment_id in prepared.resident_fragment_ids:
-            count += _fragment_completed_parameters(fragment, masters)
+            count += _fragment_completed_parameters(fragment, numel_by_wire)
             continue
         copied_fragments += 1
         written.update(dict.fromkeys(fragment.wire_names))
@@ -2990,7 +3264,8 @@ def commit_prepared_full_parameter_shard(
             fragment,
             descriptor,
             references,
-            masters=masters,
+            numel_by_wire=numel_by_wire,
+            write=_commit_writer(layout, owned=True),
             parameter_layout_hash=state.parameter_layout_hash,
             plan_hash=state.plan_hash,
             ray_module=ray_module,
@@ -3001,7 +3276,7 @@ def commit_prepared_full_parameter_shard(
         replica_plan,
         prepared.replica_states,
         skip=prepared.replica_resident_ids,
-        replica_masters=layout.replica_masters,
+        write=_commit_writer(layout, owned=False),
         ray_module=ray_module,
     )
     copied_seconds = time.monotonic() - started
@@ -3017,8 +3292,9 @@ def commit_prepared_full_parameter_shard(
         named_parameters,
         optimizer_owned,
         written=tuple(written_names),
-        expected_count=count + len(layout.replica_masters),
+        expected_count=len(layout.holdings),
         role=role,
+        ranges=layout.ranges,
     )
     actor._external_full_policy_version = state.policy_version
     actor._external_full_local_step_generation = 0
@@ -3153,10 +3429,15 @@ def _finish_commit_writes(
     written: Sequence[str],
     expected_count: int,
     role: str,
+    ranges: Mapping[str, sharded.MasterRange] | None = None,
 ) -> dict[str, object]:
     """After the commit copied chunks into masters: make the hybrid optimizer
     copies, the model and the weight backup agree with the masters, and check
     model == master.
+
+    ``ranges`` (sharded masters): the commit already wrote the model and this
+    rank's master ranges (``MasterRange.write``); only the range check and the
+    backup of the written parameters remain.
 
     The parameters the commit did not write are untouched on both sides, so
     only ``written`` (local parameter names: owned and data-parallel replica
@@ -3164,6 +3445,8 @@ def _finish_commit_writes(
     the whole model, as before (``expected_count`` local parameters).  Returns
     timing stats."""
 
+    if ranges is not None:
+        return _finish_sharded_commit_writes(actor, named_parameters, written=written, ranges=ranges, role=role)
     refusal = _partial_commit_refusal(actor, named_parameters, optimizer_owned, written, len(named_parameters))
     stats: dict[str, object] = {"partial": refusal is None, "written_parameters": len(written)}
     if refusal is not None:
@@ -3208,6 +3491,31 @@ def _finish_commit_writes(
     lap("backup_seconds")
     stats["backup"] = backup
     return stats
+
+
+def _finish_sharded_commit_writes(
+    actor,
+    named_parameters: Sequence[tuple[str, torch.nn.Parameter]],
+    *,
+    written: Sequence[str],
+    ranges: Mapping[str, sharded.MasterRange],
+    role: str,
+) -> dict[str, object]:
+    started = time.monotonic()
+    by_name = dict(named_parameters)
+    rows = [(name, by_name[name]) for name in written]
+    if rows:
+        sharded.check_model(rows, ranges)
+    checked = time.monotonic()
+    backup = _backup_written_actor_weights(actor, [parameter for _name, parameter in rows]) if role == "actor" and rows else "none"
+    return {
+        "partial": True,
+        "sharded": True,
+        "written_parameters": len(written),
+        "check_seconds": checked - started,
+        "backup_seconds": time.monotonic() - checked,
+        "backup": backup,
+    }
 
 
 def _assert_masters_resident(actor) -> None:

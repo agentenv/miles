@@ -54,6 +54,10 @@ _CUT_CONTENT_IDENTITY_DOMAIN = b"miles-full-parameter-chunked-cut-content-v1\0"
 #   dp_replicas: data-parallel replicas (DP>1, EP spanning DP): one rank owns
 #       each parameter, the other ranks of its replica group apply the
 #       owner's bytes (``full_parameter_replicas``)
+#   sharded_masters: data-parallel replicas under Megatron's distributed
+#       optimizer, which keeps one FP32 range of each parameter per rank; the
+#       other ranks contribute their ranges to an owner's export
+#       (``full_parameter_sharded_masters``)
 FULL_PARAMETER_TRANSPORT_FEATURES = frozenset(
     {
         "skip_resident",
@@ -61,6 +65,7 @@ FULL_PARAMETER_TRANSPORT_FEATURES = frozenset(
         "optimizer_state_check_model",
         "zero_copy_chunks",
         "dp_replicas",
+        "sharded_masters",
         # Lazy export (labels, no master read), materialize returning the
         # content descriptors, delta reads through such a descriptor, and a
         # local-step receipt without the whole-model model/master check.
@@ -71,6 +76,9 @@ FULL_PARAMETER_TRANSPORT_FEATURES = frozenset(
 # Set on the group by ``install_fragment_plans``: ``{replica rank topology:
 # owner topologies}`` for every rank that holds data-parallel replicas.
 REPLICA_OWNERS_ATTRIBUTE = "full_parameter_replica_owners"
+# Set on the group by ``install_fragment_plans``: the topology of every rank
+# when the ranks keep sharded masters (empty for whole masters).
+SHARDED_MASTERS_ATTRIBUTE = "full_parameter_sharded_master_topologies"
 
 
 @dataclass(frozen=True)
@@ -716,11 +724,13 @@ async def install_fragment_plans(
     if set(topologies) != set(by_topology) or {manifest.topology for manifest in manifests} != set(by_topology):
         raise RuntimeError("full-parameter owner plans do not match the actor group")
     owner_manifests = replica_owner_manifests(manifests)
+    sharded = _sharded_master_topologies(manifests)
     arguments = {topology: {"plan": plan} for topology, plan in by_topology.items()}
     for topology, owners in owner_manifests.items():
         arguments[topology]["replica_sources"] = tuple((owner, by_topology[owner.topology]) for owner in owners)
     # Cleared first: a failed install leaves no routing to stale replica plans.
     setattr(group, REPLICA_OWNERS_ATTRIBUTE, {})
+    setattr(group, SHARDED_MASTERS_ATTRIBUTE, frozenset())
     results = await _rank_call(group, "install_full_parameter_fragment_plan", by_topology=arguments)
     expected = [len(by_topology[topology].fragments) for topology in topologies]
     if any(
@@ -733,7 +743,59 @@ async def install_fragment_plans(
         REPLICA_OWNERS_ATTRIBUTE,
         {topology: tuple(owner.topology for owner in owners) for topology, owners in owner_manifests.items()},
     )
+    setattr(group, SHARDED_MASTERS_ATTRIBUTE, sharded)
     return sum(results)
+
+
+def _sharded_master_topologies(manifests: Sequence[FullParameterShardManifest]) -> frozenset[FullParameterTopology]:
+    """Every rank's topology when the ranks keep sharded masters, else empty.
+
+    All ranks of a group decide alike (``full_parameter_sharded_masters.master_ranges``);
+    a mixed group is refused."""
+
+    flags = {manifest.sharded_masters for manifest in manifests}
+    if len(flags) != 1:
+        raise RuntimeError("full-parameter ranks disagree on sharded FP32 masters")
+    return frozenset(manifest.topology for manifest in manifests) if flags == {True} else frozenset()
+
+
+async def _master_contributions(
+    group,
+    fragments_by_owner: Mapping[FullParameterTopology, tuple[int, ...] | None],
+    *,
+    held: Sequence[tuple[FullParameterTopology, int, int, str]] | None = None,
+    max_chunk_bytes: int = FULL_PARAMETER_DEFAULT_CHUNK_BYTES,
+) -> dict[FullParameterTopology, tuple[object, ...]]:
+    """``{owner topology: contributions}``: the master ranges every replica of
+    an owner stores in Ray for ``fragments_by_owner[owner]`` (None: all its
+    fragments).  Empty for whole masters.  ``held``: see
+    ``full_parameter_master_contributions``."""
+
+    topologies = getattr(group, SHARDED_MASTERS_ATTRIBUTE, None) or frozenset()
+    if not topologies or not fragments_by_owner:
+        return {}
+    owners = _replica_owners(group)
+    results = await _rank_call(
+        group,
+        "full_parameter_master_contributions",
+        by_topology={
+            topology: {
+                "requests": tuple(
+                    (owner, fragments_by_owner[owner]) for owner in owners.get(topology, ()) if owner in fragments_by_owner
+                )
+            }
+            for topology in topologies
+        },
+        max_chunk_bytes=max_chunk_bytes,
+        **({} if held is None else {"held": tuple(held)}),
+    )
+    failure = next((result for result in results if isinstance(result, BaseException)), None)
+    if failure is not None or any(not isinstance(result, tuple) for result in results):
+        raise RuntimeError("Megatron replica ranks refused to contribute full-parameter master ranges") from failure
+    by_owner: dict[FullParameterTopology, list[object]] = {}
+    for contribution in (item for result in results for item in result):
+        by_owner.setdefault(contribution.owner, []).append(contribution)
+    return {owner: tuple(values) for owner, values in by_owner.items()}
 
 
 async def export_chunked_cut(
@@ -748,8 +810,19 @@ async def export_chunked_cut(
     """``defer_payload``: descriptors only; see ``materialize_chunked_fragments``.
 
     ``lazy`` (with ``defer_payload``): no rank reads its masters; descriptors
-    carry labels (``export_full_parameter_chunked_shard``)."""
+    carry labels (``export_full_parameter_chunked_shard``).
 
+    Sharded masters (the distributed optimizer at DP>1): unless ``lazy``, the
+    replicas first contribute their master ranges of every owner fragment and
+    each owner exports with them."""
+
+    sharded = () if lazy else getattr(group, SHARDED_MASTERS_ATTRIBUTE, None) or ()
+    routed = {}
+    if sharded:
+        contributions = await _master_contributions(
+            group, dict.fromkeys(sharded), max_chunk_bytes=max_chunk_bytes
+        )
+        routed = {"by_topology": {topology: {"contributions": contributions.get(topology, ())} for topology in sharded}}
     ordered = tuple(
         await _rank_values(
             group,
@@ -761,6 +834,7 @@ async def export_chunked_cut(
             max_chunk_bytes=max_chunk_bytes,
             **({"defer_payload": True} if defer_payload else {}),
             **({"lazy": True} if lazy else {}),
+            **routed,
         )
     )
     layout_hashes = {state.parameter_layout_hash for state in ordered}
@@ -835,6 +909,16 @@ async def materialize_chunked_fragments(
     topologies = await _group_topologies(group)
     if set(topologies) != set(by_topology):
         raise RuntimeError("full-parameter chunked cut does not match the actor group")
+    contributions = await _master_contributions(
+        group,
+        {topology: arguments["fragment_ids"] for topology, arguments in by_topology.items() if arguments["fragment_ids"]},
+        held=tuple(
+            (rows[fragment_id][0], fragment_id, rows[fragment_id][1].numel, rows[fragment_id][1].payload_hash)
+            for fragment_id in sorted(wanted)
+        ),
+    )
+    for topology, values in contributions.items():
+        by_topology[topology]["contributions"] = values
     results = await _rank_call(
         group,
         "materialize_full_parameter_fragments",
