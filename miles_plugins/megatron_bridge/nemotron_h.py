@@ -15,12 +15,16 @@ This plugin is a non-invasive drop-in that:
    :class:`~megatron.core.models.mamba.MambaModel` ``forward`` to
    adapt Miles' ``mtp_kwargs`` to the model's forward arguments while
    preserving ``loss_mask``.
+4. Registers :class:`MilesNemotronHLanguageOnlyBridge` for the Nemotron-H VL
+   checkpoint (``NemotronH_Omni_Reasoning_V3``, Nemotron-3.5 Super VL): Megatron
+   trains its language model only, the vision part stays frozen (see the class).
 
 Importing this module is idempotent — safe to import multiple times.
 """
 
 from __future__ import annotations
 
+import copy
 import logging
 
 import torch
@@ -44,6 +48,52 @@ _NEMOTRONH_MOE_MAPPINGS: dict[str, str] = {
     "decoder.layers.*.mlp.fc1_latent_proj.weight": "backbone.layers.*.mixer.fc1_latent_proj.weight",
     "decoder.layers.*.mlp.fc2_latent_proj.weight": "backbone.layers.*.mixer.fc2_latent_proj.weight",
 }
+
+# Nemotron-H VL checkpoints (Nemotron-3.5 Super VL 120B-A12B): a C-RADIO vision
+# encoder (``vision_model.*``), a projector (``mlp1.*``, ``vision_projector.*``)
+# and a NemotronHForCausalLM stored under ``language_model.`` (``backbone.*``,
+# ``lm_head.*`` and the MTP block ``mtp.*``).
+NEMOTRON_H_OMNI_ARCHITECTURE = "NemotronH_Omni_Reasoning_V3"
+LANGUAGE_MODEL_PREFIX = "language_model."
+
+
+def language_model_config(hf_config):
+    """The NemotronH config of a VL checkpoint config (``llm_config``)."""
+    llm_config = getattr(hf_config, "llm_config", None)
+    if llm_config is None:
+        raise ValueError(f"{NEMOTRON_H_OMNI_ARCHITECTURE} config has no llm_config")
+    return llm_config
+
+
+class LanguageModelView:
+    """An HF pretrained wrapper seen through its language model.
+
+    ``config`` is the wrapper config's ``llm_config``; every other attribute
+    (weights state, path, tokenizer) is the wrapper's own, so weights are read
+    under their checkpoint names.
+    """
+
+    def __init__(self, hf_pretrained):
+        self._hf_pretrained = hf_pretrained
+        self.config = language_model_config(hf_pretrained.config)
+
+    def __getattr__(self, name):
+        return getattr(self._hf_pretrained, name)
+
+
+def prefixed_mapping(mapping, prefix: str):
+    """A copy of a bridge parameter mapping whose HF name(s) carry ``prefix``.
+
+    Copies keep the mapping class, so the conversion (QKV split, Mamba conv1d
+    chunks, MTP index flattening) is unchanged; only the HF side moves.
+    """
+    copied = copy.copy(mapping)
+    if isinstance(mapping.hf_param, str):
+        copied.hf_param = prefix + mapping.hf_param
+    else:
+        copied.hf_param = {key: prefix + value for key, value in mapping.hf_param.items()}
+    return copied
+
 
 # HF name → provider name → cast. Miles' generic ``model_provider.py`` does not
 # forward ``moe_router_topk_scaling_factor`` by default, which silently runs
@@ -139,8 +189,7 @@ def _build_bridge_subclass():
         def mapping_registry(self):
             # Append MoE mappings unconditionally. Dense variants do not carry
             # the extra megatron params so these mappings are simply unreferenced.
-            registry = super().mapping_registry()
-            base = list(registry.mappings if hasattr(registry, "mappings") else registry._mappings)
+            base = _registry_mappings(super().mapping_registry())
             extras = [AutoMapping(megatron_param=m, hf_param=h) for m, h in _NEMOTRONH_MOE_MAPPINGS.items()]
             known_names = {mapping.megatron_param for mapping in base}
             mamba = [
@@ -153,7 +202,53 @@ def _build_bridge_subclass():
             ]
             return MegatronMappingRegistry(*base, *mamba, *extras)
 
+    @MegatronModelBridge.register_bridge(source=NEMOTRON_H_OMNI_ARCHITECTURE, target=MambaModel)
+    class MilesNemotronHLanguageOnlyBridge(MilesNemotronHBridge):
+        """Language-model RL on a Nemotron-H VL checkpoint; the vision part stays frozen.
+
+        Megatron builds the checkpoint's NemotronH language model only, with
+        the same provider and conversions as :class:`MilesNemotronHBridge`; the
+        HF names gain the ``language_model.`` prefix. The vision encoder and
+        the projector are neither built nor mapped, so they hold no optimizer
+        state, get no gradient, are not in the full-parameter manifests and are
+        never part of a weight update: the rollout engine serves the VL model
+        and keeps its own vision weights. The MTP block follows the text bridge
+        (dropped unless ``MILES_NEMOTRONH_KEEP_MTP``); its HF names are under
+        ``language_model.`` too.
+
+        Weight updates must therefore reach an engine that serves the VL
+        checkpoint (SGLang ``NemotronH_Omni_Reasoning_V3`` strips
+        ``language_model.``), and the engine must never drop its weights
+        (no colocated offload): nothing re-sends the vision part.
+        """
+
+        def provider_bridge(self, hf_pretrained):
+            return super().provider_bridge(LanguageModelView(hf_pretrained))
+
+        def mapping_registry(self):
+            language = MilesNemotronHBridge()
+            language.hf_config = language_model_config(self.hf_config)
+            mappings = _registry_mappings(language.mapping_registry())
+            return MegatronMappingRegistry(*(prefixed_mapping(m, LANGUAGE_MODEL_PREFIX) for m in mappings))
+
     return MilesNemotronHBridge
+
+
+def _registry_mappings(registry) -> list:
+    return list(registry.mappings if hasattr(registry, "mappings") else registry._mappings)
+
+
+def _accept_vl_architecture() -> None:
+    """Let ``AutoBridge`` accept the Nemotron-H VL architecture name.
+
+    ``AutoBridge.supports`` / ``_validate_config`` accept only names that end in
+    one of ``SUPPORTED_HF_ARCHITECTURES`` (read at call time);
+    ``NemotronH_Omni_Reasoning_V3`` does not, although its bridge is registered.
+    """
+    from megatron.bridge.models.conversion import auto_bridge
+
+    if not NEMOTRON_H_OMNI_ARCHITECTURE.endswith(auto_bridge.SUPPORTED_HF_ARCHITECTURES):
+        auto_bridge.SUPPORTED_HF_ARCHITECTURES = (*auto_bridge.SUPPORTED_HF_ARCHITECTURES, NEMOTRON_H_OMNI_ARCHITECTURE)
 
 
 def _install_nemotronh_hybrid_layer_shims() -> None:
@@ -216,8 +311,8 @@ def _install_mamba_model_loss_mask_shim() -> None:
 
 
 def install() -> None:
-    """Register the Nemotron-H bridge subclass."""
-    for fn in (_build_bridge_subclass,):
+    """Register the Nemotron-H bridge subclasses and accept the VL architecture name."""
+    for fn in (_build_bridge_subclass, _accept_vl_architecture):
         try:
             fn()
         except Exception as e:  # best-effort; avoid breaking unrelated models
