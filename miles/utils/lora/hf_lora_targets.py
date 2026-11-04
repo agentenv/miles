@@ -334,6 +334,12 @@ _HF_LORA_MODELS = {
         unembed="language_model.lm_head",
         unwrap_text_config=True,
     ),
+    "kimi_k31": _HfLoraModelSpec(
+        _kimi_k3_targets,
+        layer_prefix="language_model.model.layers.*",
+        unembed="language_model.lm_head",
+        unwrap_text_config=True,
+    ),
     "glm4": _HfLoraModelSpec(_glm4_targets),
     "glm4_moe": _HfLoraModelSpec(_glm4_moe_targets),
     # GLM-4.7-Flash: MLA attention with dense / sparse MLPs chosen per layer, as GLM-5's DSA stack
