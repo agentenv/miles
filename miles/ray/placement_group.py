@@ -2,6 +2,7 @@ import asyncio
 import logging
 import socket
 from argparse import Namespace
+from collections.abc import Sequence
 from typing import NamedTuple
 
 import ray
@@ -10,6 +11,14 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from miles.backends.megatron_utils.megatron_config import MegatronTrainerConfig
 from miles.backends.training_utils.checkpoint.tracker import read_checkpoint_tracker_iteration
+from miles.ray.placement_map import (  # noqa: F401 - re-exported for callers of the placement group module
+    STANDBY_PG_NAME,
+    PlacementMap,
+    RolloutCellDecl,
+    parse_placement_map,
+    rollout_cell_binding,
+    validate_placement_map,
+)
 from miles.ray.rollout.inference_controller import UpdatableEngines
 from miles.ray.rollout.router_manager import resolve_router_addrs, wait_session_server_ready
 from miles.ray.specs.inference import (
@@ -155,10 +164,21 @@ def _compute_trainer_num_gpus(args) -> int:
     return args.actor_num_nodes * args.actor_num_gpus_per_node * num_policies
 
 
-def create_placement_groups(args) -> dict[str, PlacementGroupInfo]:
-    """Create placement groups for actor and rollout engines."""
+def create_placement_groups(
+    args, *, placement_map: "PlacementMap | str | dict | None" = None
+) -> dict[str, PlacementGroupInfo]:
+    """Create placement groups for actor and rollout engines.
+
+    With an explicit ``placement_map`` (or ``--yeto-placement-map``) every role gets exactly the logical bundles the
+    map names and a ``standby`` view holds the reserved bundles no role starts on; without one the layout is the
+    trainer-then-rollout offset split.
+    """
 
     num_gpus, rollout_offset = _get_placement_group_layout(args)
+    if (
+        pm := parse_placement_map(placement_map if placement_map is not None else args.yeto_placement_map)
+    ) is not None:
+        return _create_placement_groups_from_map(args, pm, num_gpus=num_gpus, rollout_offset=rollout_offset)
 
     logger.info(f"Creating placement group with {num_gpus} GPUs...")
     pg, actor_pg_reordered_bundle_indices, actor_pg_reordered_gpu_ids = _create_placement_group(num_gpus)
@@ -168,6 +188,38 @@ def create_placement_groups(args) -> dict[str, PlacementGroupInfo]:
     ans = {
         "actor": PlacementGroupInfo(pg, actor_pg_reordered_bundle_indices, actor_pg_reordered_gpu_ids),
         "rollout": PlacementGroupInfo(pg, rollout_pg_reordered_bundle_indices, rollout_pg_reordered_gpu_ids),
+    }
+    if args.use_critic:
+        ans["critic"] = ans["actor"]
+    return ans
+
+
+def slice_pg_info(info: PlacementGroupInfo, indices: Sequence[int]) -> PlacementGroupInfo:
+    """The view of ``info`` made of its entries at ``indices`` (positions in ``info``, in the order given)."""
+    return PlacementGroupInfo(
+        info.pg,
+        [info.pg_reordered_bundle_indices[i] for i in indices],
+        [info.pg_reordered_gpu_ids[i] for i in indices],
+    )
+
+
+def _create_placement_groups_from_map(
+    args, pm: PlacementMap, *, num_gpus: int, rollout_offset: int
+) -> dict[str, PlacementGroupInfo]:
+    assert not args.colocate, "--yeto-placement-map splits GPUs between roles and cannot be combined with --colocate"
+    assert DeployComponent(args.deploy_component) == DeployComponent.ALL, (
+        "--yeto-placement-map lays out the whole run on one placement group; a split deployment "
+        f"(--deploy-component {args.deploy_component}) creates only its own part"
+    )
+    assert not args.eval_num_gpus, "--yeto-placement-map has no role for dedicated eval engines (--eval-num-gpus)"
+    validate_placement_map(pm, trainer_num_gpus=rollout_offset, rollout_num_gpus=num_gpus - rollout_offset)
+
+    logger.info(f"Creating placement group with {pm.num_bundles} GPUs from explicit map {pm}...")
+    full = _create_placement_group(pm.num_bundles)
+    ans = {
+        "actor": slice_pg_info(full, pm.trainer),
+        "rollout": slice_pg_info(full, pm.rollout),
+        STANDBY_PG_NAME: slice_pg_info(full, pm.standby),
     }
     if args.use_critic:
         ans["critic"] = ans["actor"]
