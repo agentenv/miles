@@ -37,6 +37,7 @@ from miles.utils import async_utils
 from miles.utils.distributed_utils import get_gloo_group
 from miles.utils.lora.utils import LORA_ADAPTER_NAME, full_parameter_lora_hybrid_enabled
 from miles.utils.timer import timer
+from miles.utils.workers.worker_handle import ExternalFailureError
 
 if TYPE_CHECKING:
     from miles.ray.rollout.inference_controller import UpdatableEngines
@@ -115,14 +116,37 @@ class WeightUpdater:
         return True
 
     def reconnect(self, info: "UpdatableEngines") -> None:
-        self.connect_rollout_engines(
-            info.rollout_engines,
-            engine_gpu_counts=info.engine_gpu_counts,
-            engine_gpu_offsets=info.engine_gpu_offsets,
-            engine_cell_ids=info.engine_cell_ids,
-        )
+        """Connect every rank to the engines; an engine-side failure is raised on every rank, the trainer stays up.
+
+        Only the sender rank talks to the engines, so only it can see an engine fail to join (e.g. an engine killed
+        during a publish). The outcome is agreed over the gloo group, which also serves as the barrier every rank
+        waits at after connecting, so that the other ranks raise the same ``ExternalFailureError`` instead of
+        waiting in the next collective for a rank that already gave up; the trainer cell then stays alive (see
+        ``TrainerCell._execute_raw``) and the next publication reconnects. Trainer-side errors are not agreed.
+        """
+        failure: str | None = None
+        cause: ExternalFailureError | None = None
+        try:
+            self.connect_rollout_engines(
+                info.rollout_engines,
+                engine_gpu_counts=info.engine_gpu_counts,
+                engine_gpu_offsets=info.engine_gpu_offsets,
+                engine_cell_ids=info.engine_cell_ids,
+            )
+        except ExternalFailureError as e:
+            failure, cause = f"{type(e).__name__}: {e}", e
+        gloo_group = get_gloo_group()
+        failures: list[str | None] = [None] * dist.get_world_size(group=gloo_group)
+        dist.all_gather_object(failures, failure, group=gloo_group)
+        if any(f is not None for f in failures):
+            # The previous group was torn down before connecting: whatever the connection status said, the next
+            # publication has to connect again.
+            self.conn_status.mark_trainer_stale()
+            if cause is not None:
+                raise cause
+            rank, message = next((r, f) for r, f in enumerate(failures) if f is not None)
+            raise ExternalFailureError(f"rank {rank} could not connect the rollout engines: {message}")
         self.conn_status.mark_reconnected(info.snapshot_cell_id_to_hashes)
-        dist.barrier(group=get_gloo_group())
 
     def verify_engine_version(self, rollout_engines: Sequence[SGLangApiClient], *, weight_version: int) -> None:
         if not rollout_engines:

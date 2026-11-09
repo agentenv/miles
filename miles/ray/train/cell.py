@@ -18,7 +18,7 @@ from miles.utils.ft_utils.indep_dp import IndepDPInfo
 from miles.utils.retry_utils import NonRetryableError
 from miles.utils.tracking_utils.structured_log import log_structured
 from miles.utils.workers.rpc.client.misc import ServerRestartedError
-from miles.utils.workers.worker_handle import BaseWorkerHandle, WorkerUnreachableError
+from miles.utils.workers.worker_handle import BaseWorkerHandle, ExternalFailureError, WorkerUnreachableError
 from miles.utils.workers.worker_provider.base import BaseWorkerProvider
 from miles.utils.workers.worker_spec import MASTER_PORT_NAME, HostAndPort
 
@@ -276,7 +276,9 @@ class TrainerCell:
             if self._disposed:
                 raise WorkerUnreachableError(f"Cell {self.cell_id} was removed") from None
             raise
-        except Exception:
+        except Exception as e:
+            # An ExternalFailureError says the workers are healthy and the fault lies elsewhere (e.g. a rollout
+            # engine died while they connected to it): the cell stays alive and keeps its ranks.
             log_structured(
                 logger.error,
                 tag="ft",
@@ -287,7 +289,7 @@ class TrainerCell:
                 elapsed_s=round(time.monotonic() - start, 1),
                 exc_info=True,
             )
-            if kill_on_failure and not self._disposed:
+            if kill_on_failure and not self._disposed and not isinstance(e, ExternalFailureError):
                 await self.mark_errored_and_kill()
             raise
 

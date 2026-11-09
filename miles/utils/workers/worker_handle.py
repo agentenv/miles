@@ -19,6 +19,17 @@ class WorkerStillBusyError(Exception):
     pass
 
 
+class ExternalFailureError(Exception):
+    """The worker raising it is healthy: the failure belongs to an external party it talked to.
+
+    A cell treats an exception from a worker call as a worker failure (mark errored, kill every rank). Raise a
+    subclass of this when the worker itself is fine and must stay alive, e.g. a rollout engine that died while
+    the trainer connected to it for a weight update (yeto A27: killing the trainer there left the island with no
+    trainer and brought the healthy old engines down with it). Raise it on *every* rank of the worker so that
+    no rank is left behind in a collective.
+    """
+
+
 class BaseWorkerHandle(abc.ABC):
     @abc.abstractmethod
     async def wait_ready(self, *, timeout: float, allow_server_uuid_change: bool = False) -> None: ...

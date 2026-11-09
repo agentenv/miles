@@ -28,7 +28,9 @@ def _build_protocol(
         patch(f"{_BROADCAST_MODULE}.get_parallel_state", return_value=parallel_state),
         patch(f"{_BROADCAST_MODULE}.create_world_ticket_lock") as create_lock,
     ):
-        protocol = UpdateWeightFromDistributed(Namespace(check_weight_update_equal=False))
+        protocol = UpdateWeightFromDistributed(
+            Namespace(check_weight_update_equal=False, update_weight_engine_request_timeout=300.0)
+        )
     return protocol, create_lock
 
 
