@@ -9,8 +9,11 @@ each wait the GPU idles until the host has launched the next kernels.
 
 The sync-free paths compute the same values bit for bit; they read sizes from host
 copies, build tensors on the device and copy host data without waiting.
-``MILES_HOST_SYNC_FREE=0`` restores the previous code paths (for A/B measurements and
-as an escape hatch); the default is on.
+``--no-host-sync-free`` (``DebugConfig.host_sync_free``) restores the previous code
+paths (for A/B measurements and as an escape hatch); the default is on. The switch is
+process-wide module state: the helpers run deep inside replay, loss and batch code that
+has no access to the configuration, so the trainer actor calls :func:`configure` with
+the typed field once, before it builds the model.
 """
 
 from __future__ import annotations
@@ -18,21 +21,26 @@ from __future__ import annotations
 import functools
 import hashlib
 import inspect
-import os
 import textwrap
 from collections.abc import Callable, Sequence
 from numbers import Number
 
 import torch
 
-ENV_VAR = "MILES_HOST_SYNC_FREE"
-_OFF_VALUES = frozenset({"0", "false", "no", "off"})
+_ENABLED = True
+
+
+def configure(enabled: bool) -> None:
+    """Set the process-wide switch from the typed ``host_sync_free`` field (the trainer actor does this at init)."""
+
+    global _ENABLED
+    _ENABLED = bool(enabled)
 
 
 def enabled() -> bool:
-    """True unless ``MILES_HOST_SYNC_FREE`` is set to 0/false/no/off."""
+    """True (the default) unless :func:`configure` turned the sync-free paths off."""
 
-    return os.environ.get(ENV_VAR, "1").strip().lower() not in _OFF_VALUES
+    return _ENABLED
 
 
 def source_sha256(function: Callable) -> str | None:
@@ -109,7 +117,7 @@ def scalars_to_tensor(values: Sequence, *, device: torch.device | str | int) -> 
     values are the same.  Element casts are exact for the element types a loss logs
     (bool, integers up to 2**24, float16/bfloat16/float32/float64).  Other inputs (an
     empty list, nested lists, tensors with dimensions, numpy numbers, tensors on another
-    GPU) and ``MILES_HOST_SYNC_FREE=0`` go to ``torch.tensor``.
+    GPU) and a disabled switch (``--no-host-sync-free``) go to ``torch.tensor``.
     """
 
     dtypes = [_tensor_dtype(v) for v in values]
