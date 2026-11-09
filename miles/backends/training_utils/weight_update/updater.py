@@ -35,7 +35,7 @@ from miles.backends.training_utils.weight_update.session import (
 from miles.backends.training_utils.weight_update.utils import record_lora_checksums
 from miles.utils import async_utils
 from miles.utils.distributed_utils import get_gloo_group
-from miles.utils.lora.utils import LORA_ADAPTER_NAME
+from miles.utils.lora.utils import LORA_ADAPTER_NAME, full_parameter_lora_hybrid_enabled
 from miles.utils.timer import timer
 
 if TYPE_CHECKING:
@@ -143,7 +143,12 @@ class WeightUpdater:
         if not protocol.begin_sync(weight_version, self._iter_base_buckets):
             return False
 
-        sync_base = not self.is_lora or protocol.needs_base_resync_for_lora
+        # A LoRA hybrid also trains base parameters, so every publish carries base weights.
+        sync_base = (
+            not self.is_lora
+            or protocol.needs_base_resync_for_lora
+            or full_parameter_lora_hybrid_enabled(self.args)
+        )
         adapters = self._get_updated_adapters()
 
         driver = dist.get_rank() == 0

@@ -49,8 +49,14 @@ def validate_lora_args(args):
     assert (
         args.lora_adapter_convert_save is None or args.lora_adapter_path is not None
     ), "--lora-adapter-convert-save converts --lora-adapter-path"
+    assert not args.full_parameter_lora_hybrid or is_lora_enabled(
+        args
+    ), "--full-parameter-lora-hybrid requires a LoRA actor (--lora-rank > 0)"
     if not is_lora_enabled(args):
         return
+    assert not (
+        args.full_parameter_lora_hybrid and args.lora_base_cpu_backup
+    ), "--full-parameter-lora-hybrid is incompatible with --lora-base-cpu-backup"
     # trainers resolve relative paths from their own cwd; rollout-only keeps the string so a hub id reaches SGLang
     if args.lora_adapter_path is not None and not args.debug_rollout_only:
         args.lora_adapter_path = os.path.abspath(args.lora_adapter_path)

@@ -11,6 +11,7 @@ from torch_memory_saver import torch_memory_saver
 
 import miles.backends.megatron_utils.runtime_patches  # noqa: F401  (DeepEP buffers stay out of torch_memory_saver)
 from miles.backends.megatron_utils.checkpoint_request import MegatronCkptLoadConfig
+from miles.backends.megatron_utils.full_parameter_state import assert_full_parameter_boundary_clear
 from miles.backends.megatron_utils.hf_export import save_hf_model
 from miles.backends.megatron_utils.lora.bridge_adapter_slots import BridgeAdapterSlots
 from miles.backends.megatron_utils.lora.checkpoint import build_adapter_slots
@@ -669,6 +670,8 @@ class MegatronTrainRayActor(TrainRayActor):
         external_data: TrainStepOutput | None = None,
     ) -> TrainStepOutput:
         self._heartbeat.bump()
+        # A pending full-parameter commit must resolve before any local step.
+        assert_full_parameter_boundary_clear(self)
         self._last_rollout_id = rollout_id
         if self.args.offload_train and self._asleep:
             self.wake_up()
