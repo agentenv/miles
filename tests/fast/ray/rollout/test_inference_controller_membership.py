@@ -244,6 +244,27 @@ class TestDeferredCells:
             state="unbound", deferred=True, tracked=False, serving=False, awaiting_admission=False
         )
 
+    async def test_describe_passes_a_worker_loss_through(self):
+        """A watchdog tells "its engine died" (workers_lost, named workers) from "it never started" (stopped)."""
+
+        class _LossProvider(_MembershipProvider):
+            async def describe_declared_cells(self):
+                return {
+                    "engine-0": dict(state="workers_lost", lost_workers=["engine-0-0"]),
+                    "engine-1": dict(state="stopped", lost_workers=None),
+                }
+
+        controller, _, _ = _controller(provider=_LossProvider(), servers={"default": _RecordingServer({})})
+        described = await controller.describe_cells()
+        assert described["engine-0"] == dict(
+            state="workers_lost",
+            lost_workers=["engine-0-0"],
+            tracked=False,
+            serving=False,
+            awaiting_admission=False,
+        )
+        assert described["engine-1"]["state"] == "stopped" and described["engine-1"]["lost_workers"] is None
+
     async def test_describe_needs_a_membership_provider(self):
         controller, _, _ = _controller(provider=_FakeWorkerProvider([]))
         with pytest.raises(NotImplementedError, match="cannot start or stop cells on demand"):

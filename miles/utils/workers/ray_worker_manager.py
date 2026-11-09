@@ -248,8 +248,12 @@ class RayWorkerManager:
         """Every cell of the pools ``get_cell_infos`` would list, with its state and binding, read-only.
 
         ``alias`` is the caller's name for the cell (placement map ``rollout_cells``) or None; ``state`` is
-        ``unbound`` (a deferred cell with no binding), ``stopped`` or ``running``; ``bundles`` / ``gpu_ids`` are the
-        bundles of the startup placement group the cell uses or would use at its next start.
+        ``unbound`` (a deferred cell with no binding), ``stopped``, ``running`` or ``workers_lost``: the liveness
+        scan found workers of the cell dead and tore the cell down, and ``lost_workers`` names them (None in every
+        other state). Only ``stop_cells`` on that cell, which succeeds and kills nothing more, or a new
+        ``start_cells`` leaves ``workers_lost``; the manager and its other cells are not affected by the loss.
+        ``bundles`` / ``gpu_ids`` are the bundles of the startup placement group the cell uses or would use at its
+        next start.
         """
         cell_ids = set(self.get_cell_infos(pool_ids=pool_ids, category=category))
         return {c.cell_id: c.describe() for c in self._all_cells() if c.cell_id in cell_ids}
@@ -443,6 +447,9 @@ class _CellManager(Generic[SpecT]):
     binding: _CellBinding | None = None
     # declared beyond the scheduling's num_cells: not started at init, and only a binding makes it startable
     deferred: bool = False
+    # workers the liveness scan found dead when it tore the cell down (state ``workers_lost``); None after an
+    # explicit stop, which acknowledges the loss, or a new start
+    lost_worker_names: list[str] | None = None
 
     @property
     def alias(self) -> str | None:
@@ -502,7 +509,8 @@ class _CellManager(Generic[SpecT]):
             alias=self.alias,
             pool_id=self.spec.name,
             deferred=self.deferred,
-            state="unbound" if self.unbound else ("running" if self.alive else "stopped"),
+            state=self.state,
+            lost_workers=None if self.lost_worker_names is None else list(self.lost_worker_names),
             generation=self.generation,
             pg_name=self.pg_name,
             pg_slot_offset=self.binding.pg_slot_offset if self.binding is not None else None,
@@ -513,6 +521,7 @@ class _CellManager(Generic[SpecT]):
     async def launch_actors(self):
         assert self.actors is None
         self.generation += 1
+        self.lost_worker_names = None
         scheduling = self.spec.scheduling(self.manager.scaling)
         actor_manager_cls = _actor_manager_cls(self.spec, comm_backend=self.manager.comm_backend)
         self.actors = [
@@ -535,11 +544,19 @@ class _CellManager(Generic[SpecT]):
     async def post_setup(self) -> None:
         await self._for_all_actors(lambda a: a.post_setup())
 
-    async def stop(self) -> None:
+    async def stop(self, *, lost_workers: list[str] | None = None) -> None:
+        """Stop the cell's workers. ``lost_workers`` (from the liveness scan) records why the cell went down.
+
+        An explicit stop (no ``lost_workers``) acknowledges an earlier loss, and on a cell already down it does
+        nothing else, so stopping a cell whose workers died succeeds.
+        """
+        if lost_workers is None:
+            self.lost_worker_names = None
         if self.actors is None:
             return
         await self._for_all_actors(lambda a: a.stop())
         self.actors = None
+        self.lost_worker_names = list(lost_workers) if lost_workers is not None else None
 
     async def _scan_liveness_forever(self, generation: int) -> None:
         while self.generation == generation and self.actors is not None:
@@ -560,9 +577,10 @@ class _CellManager(Generic[SpecT]):
                 return
             logger.error(
                 f"Cell {self.cell_id} lost workers {dead_worker_names} without being stopped, "
-                f"so the whole cell is torn down and reported as not alive"
+                f"so the whole cell is torn down and reported as not alive (state workers_lost); "
+                f"the manager and its other cells keep running"
             )
-            await self.stop()
+            await self.stop(lost_workers=dead_worker_names)
 
     async def _find_dead_worker_names(self) -> list[str]:
         if (actors := self.actors) is None:
@@ -590,6 +608,16 @@ class _CellManager(Generic[SpecT]):
     @property
     def alive(self) -> bool:
         return self.actors is not None
+
+    @property
+    def state(self) -> str:
+        """``unbound``, ``running``, ``workers_lost`` (torn down by the liveness scan, neither stopped nor started
+        since) or ``stopped``."""
+        if self.unbound:
+            return "unbound"
+        if self.alive:
+            return "running"
+        return "workers_lost" if self.lost_worker_names is not None else "stopped"
 
     @property
     def _all_workers_have_addrs(self) -> bool:
