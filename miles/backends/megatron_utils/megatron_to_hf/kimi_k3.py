@@ -1,5 +1,8 @@
 import re
 
+from miles_plugins.models.kimi_k3.partial_experts import TRAINABLE_HALF, hf_expert_id_for_export
+from miles_plugins.models.kimi_k3.permute import get_active_slot_layout
+
 _PREFIX = "language_model.model"
 
 _DIRECT_NAMES = {
@@ -70,9 +73,15 @@ def convert_kimi_k3_to_hf(args, name, param):
     layer_idx, rest = match.groups()
     layer_prefix = f"{_PREFIX}.layers.{layer_idx}"
 
-    expert_match = re.fullmatch(r"mlp\.experts\.(linear_fc[12])\.weight(\d+)", rest)
+    expert_match = re.fullmatch(rf"mlp\.experts\.(?:({TRAINABLE_HALF})\.)?(linear_fc[12])\.weight(\d+)", rest)
     if expert_match is not None:
-        projection, expert_idx = expert_match.groups()
+        trainable_half, projection, expert_idx = expert_match.groups()
+        if trainable_half is not None:
+            # a partial-experts trainer exports its trainable half only; the index is the global slot, the HF
+            # name carries the original expert id (the frozen half never reaches the converter)
+            layout = get_active_slot_layout()
+            assert layout is not None, f"{name}: split expert weight without an active --partial-experts-selection"
+            expert_idx = hf_expert_id_for_export(layout, int(layer_idx), int(expert_idx))
         expert_prefix = f"{layer_prefix}.block_sparse_moe.experts.{expert_idx}"
         if projection == "linear_fc1":
             gate, up = param.chunk(2, dim=0)
