@@ -24,6 +24,9 @@ from miles.utils.audit_utils.witness.module import install_witness
 from miles.utils.function_registry import load_function
 from miles.utils.megatron_bridge_utils import describe_bridge_moe_runtime_config, load_auto_bridge
 from miles.utils.replay_base import routing_replay_manager
+from miles.backends.training_utils.critic_freeze import freeze_attention_parameters
+from miles.backends.megatron_utils.critic_head import critic_head_owner
+from miles.utils.args.configs.yeto_algo import yeto_algo_option
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +131,19 @@ def _apply_bridge_runtime_config(provider, args: TrainerConfig) -> None:
 
 
 # Adapt from https://github.com/volcengine/verl/blob/c3b20575d2bc815fcccd84bddb4c0401fc4b632b/verl/models/llama/megatron/layers/parallel_linear.py#L82
+
+def _maybe_freeze_critic_attention(args: TrainerConfig, model: torch.nn.Module, role: str) -> None:
+    if role != "critic" or not yeto_algo_option(args, "critic_freeze_attention"):
+        return
+    tensors, elements = freeze_attention_parameters(model)
+    logger.info("Froze critic attention parameters: tensors=%d elements=%d", tensors, elements)
+
+
+def _value_head_output_size(args: TrainerConfig) -> int:
+    if yeto_algo_option(args, "value_loss_type") == "classification":
+        return args.value_num_bins
+    return 1
+
 class LinearForLastLayer(torch.nn.Linear):
     def __init__(
         self,
@@ -191,8 +207,9 @@ def get_model_provider_func(
             # Apply critic output layer if needed
             if post_process and role == "critic":
                 model.output_layer = LinearForLastLayer(
-                    input_size=model.config.hidden_size, output_size=1, config=model.config
+                    input_size=model.config.hidden_size, output_size=_value_head_output_size(args), config=model.config
                 )
+            _maybe_freeze_critic_attention(args, model, role)
             _maybe_install_witness(args, model, vp_stage=vp_stage)
             return model
 
@@ -222,9 +239,10 @@ def get_model_provider_func(
                 provider._pg_collection = pg_collection
             model = provider.provide(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
             if post_process and role == "critic":
-                model.output_layer = LinearForLastLayer(
-                    input_size=model.config.hidden_size, output_size=1, config=model.config
+                critic_head_owner(model).output_layer = LinearForLastLayer(
+                    input_size=model.config.hidden_size, output_size=_value_head_output_size(args), config=model.config
                 )
+            _maybe_freeze_critic_attention(args, model, role)
             assert not args.enable_witness, "Witness is not supported yet in this mode"
             ModelCompanionInstallationUtils.install(model=model, chunk_index=vp_stage or 0)
             # Gemma-4 forward returns (logits, loss_mask); keep logits only.
@@ -366,7 +384,10 @@ def get_model_provider_func(
         _maybe_freeze_for_partial_experts(args, model)
 
         if post_process and role == "critic":
-            model.output_layer = LinearForLastLayer(input_size=config.hidden_size, output_size=1, config=config)
+            model.output_layer = LinearForLastLayer(
+                input_size=config.hidden_size, output_size=_value_head_output_size(args), config=config
+            )
+        _maybe_freeze_critic_attention(args, model, role)
 
         _maybe_install_witness(args, model, vp_stage=vp_stage)
 

@@ -42,6 +42,7 @@ from miles.backends.training_utils.model_companion import (
     SampleIdentityExtractor,
 )
 from miles.backends.training_utils.types import TrainStepOutcome
+from miles.utils.args.configs.yeto_algo import yeto_algo_option
 from miles.utils.args.runtime import TrainerConfig
 from miles.utils.audit_utils.witness.allocator import WitnessInfo
 from miles.utils.audit_utils.witness.module import witness_dump_and_clear_stale
@@ -83,7 +84,9 @@ from .fp32_param_utils import enforce_marked_param_dtypes
 from .lora.bridge import _ensure_model_list, _setup_lora_model_via_bridge  # noqa: F401
 
 
-def get_optimizer_param_scheduler(args: TrainerConfig, optimizer: MegatronOptimizer) -> OptimizerParamScheduler | None:
+def get_optimizer_param_scheduler(
+    args: TrainerConfig, optimizer: MegatronOptimizer, role: str = "actor"
+) -> OptimizerParamScheduler | None:
     """Create and configure the optimizer learning-rate/weight-decay scheduler.
 
     This configures iteration-based schedules derived from the global batch size
@@ -97,10 +100,12 @@ def get_optimizer_param_scheduler(args: TrainerConfig, optimizer: MegatronOptimi
         OptimizerParamScheduler | None: None when the run trains no step.
     """
     # Iteration-based training.
+    # The critic takes --num-critic-epochs optimizer steps per rollout batch (SAO 16a9bea4).
+    updates_per_batch = yeto_algo_option(args, "num_critic_epochs") if role == "critic" else 1
     with args.backend.mutable():
         args.backend.train_iters = (
-            args.num_rollout * args.rollout_batch_size * args.n_samples_per_prompt // args.backend.global_batch_size
-        )
+            args.num_rollout * args.rollout_batch_size * args.n_samples_per_prompt * updates_per_batch
+        ) // args.backend.global_batch_size
         # a convert-save (--num-rollout 0) trains no step: no schedule, and a loaded one passes through untouched
         if args.backend.train_iters == 0 and args.lora_adapter_convert_save is not None:
             return None
@@ -247,7 +252,7 @@ def setup_model_and_optimizer(
 
         setup_optimizer_state_streaming(args, optimizer)
 
-    opt_param_scheduler = get_optimizer_param_scheduler(args, optimizer)
+    opt_param_scheduler = get_optimizer_param_scheduler(args, optimizer, role)
     return model, optimizer, opt_param_scheduler
 
 

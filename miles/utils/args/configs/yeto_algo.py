@@ -84,6 +84,44 @@ class YetoAlgoConfig(BaseConfig):
         ),
     ] = None
 
+    policy_objective: A[
+        str,
+        Arg(
+            choices=["ppo", "sao_dis"],
+            help="Policy-gradient objective. sao_dis uses current/rollout ratios and strict rejection.",
+        ),
+    ] = "ppo"
+    sao_dis_eps_low: A[float, Arg(help="SAO DIS lower deviation; the strict lower ratio bound is 1-eps-low.")] = 0.3
+    sao_dis_eps_high: A[float, Arg(help="SAO DIS upper deviation; the strict upper ratio bound is 1+eps-high.")] = 5.0
+    value_loss_type: A[
+        str,
+        Arg(choices=["mse", "classification"], help="Scalar MSE or categorical value prediction."),
+    ] = "mse"
+    value_num_bins: A[int, Arg(help="Number of support bins for classification value prediction.")] = 51
+    value_reward_range: A[
+        tuple[float, float],
+        Arg(type_parser=float, nargs=2, metavar=("LOW", "HIGH"), help="Categorical value support range."),
+    ] = (0.0, 1.0)
+    value_target_type: A[
+        str,
+        Arg(choices=["two_hot", "hl_gauss"], help="Projection from scalar returns to categorical targets."),
+    ] = "hl_gauss"
+    hl_gauss_sigma_ratio: A[float, Arg(help="HL-Gauss sigma divided by categorical bin width.")] = 0.75
+    num_critic_epochs: A[
+        int,
+        Arg(
+            aliases=("--critic-updates-per-step",),
+            help=(
+                "Critic optimizer updates per rollout batch (one actor step), reusing the fixed value targets. "
+                "--critic-updates-per-step is an alias (CompactionRL: 2; SAO: --num-critic-epochs 2)."
+            ),
+        ),
+    ] = 1
+    critic_freeze_attention: A[
+        bool,
+        Arg(help="Freeze critic attention modules while keeping its value head and non-attention blocks trainable."),
+    ] = False
+
 
 _DEFAULTS = {name: field.default for name, field in YetoAlgoConfig.model_fields.items()}
 
