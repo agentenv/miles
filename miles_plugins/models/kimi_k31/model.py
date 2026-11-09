@@ -20,6 +20,7 @@ from miles.utils.replay_base import indexer_replay_manager
 from miles_plugins.models.cp_utils import zigzag_gather_layout
 from miles_plugins.models.kimi_k3.layers import KimiK3Attention, _linear
 from miles_plugins.models.kimi_k3.model import KIMI_K3_KDA_LAYERS, get_kimi_k3_spec
+from miles_plugins.models.kimi_k31.dsa_layout import checked_dsa_layers
 
 
 class KimiK31Indexer(nn.Module):
@@ -133,10 +134,10 @@ class KimiK31DSAAttention(KimiK3Attention):
 
 def configure_kimi_k31_dsa(config, dsa_config: dict, topk_backend: str) -> None:
     """K3.1 adds a NoPE, LayerNorm-key indexer on every MLA layer; SGLang rejects other variants."""
-    assert sorted(dsa_config["dsa_layers"]) == [n for n in range(1, 94) if n not in KIMI_K3_KDA_LAYERS]
+    dsa_layers = checked_dsa_layers(dsa_config["dsa_layers"], num_layers=config.num_layers, kda_layers=KIMI_K3_KDA_LAYERS)
     assert dsa_config.get("index_topk_freq", 1) == 1 and dsa_config.get("index_rope_dim", 0) == 0
     assert dsa_config.get("index_k_norm_type", "layernorm") == "layernorm"
-    config.kimi_dsa_layers = sorted(dsa_config["dsa_layers"])
+    config.kimi_dsa_layers = dsa_layers
     config.kimi_dsa_index_topk = dsa_config["index_topk"]
     config.kimi_dsa_index_num_heads = dsa_config["index_num_heads"]
     config.kimi_dsa_index_head_dim = dsa_config["index_head_dim"]
