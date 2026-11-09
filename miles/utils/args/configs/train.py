@@ -94,6 +94,18 @@ class TrainConfig(BaseConfig):
             help="The method to convert megatron weights to hugging face weights for SGLang.",
         ),
     ] = "raw"
+    routed_expert_qat: A[
+        str | None,
+        Arg(
+            choices=["mxfp4"],
+            help=(
+                "Round the trainable routed-expert weights onto this format's grid in every Megatron forward "
+                "(quantization-aware training, straight-through), so the trainer computes with the weights the "
+                "rollout decodes from the released checkpoint. The BF16 parameters are rounded in place; the "
+                "fp32 master weights and optimizer states keep their precision."
+            ),
+        ),
+    ] = None
     dsa_attention_backend: A[
         str,
         Arg(
