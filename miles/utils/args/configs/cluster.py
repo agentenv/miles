@@ -41,6 +41,19 @@ class ClusterConfig(BaseConfig):
             )
         ),
     ] = None
+    yeto_placement_map: A[
+        str | None,
+        Arg(
+            help=(
+                "Optional JSON object naming the placement group bundles of each role explicitly, e.g. "
+                '\'{"trainer": [0, 1], "rollout": [2, 3], "standby": [4]}\'. Indices are logical bundle positions '
+                "in (node, gpu) order and together must cover 0..N-1 exactly once. An optional "
+                '"rollout_cells": [{"name", "bundles", "start"}, ...] declares the rollout engine cells by name, each '
+                "on a consecutive run of rollout/standby bundles or unbound (no bundles), started or declared stopped "
+                "(start false). Unset keeps the single trainer-then-rollout offset split. Rejected with --colocate."
+            )
+        ),
+    ] = None
     deploy_component: A[
         str,
         Arg(
