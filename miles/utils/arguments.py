@@ -1944,6 +1944,7 @@ def miles_validate_args(args):
     validate_policy_loss_variant_args(args)
     validate_positive_example_args(args)
     validate_sao_and_critic_args(args)
+    validate_routed_expert_qat_args(args)
 
     validate_score_centering_args(args)
 
@@ -2016,6 +2017,24 @@ def validate_sao_and_critic_args(args: argparse.Namespace) -> None:
     if is_lora_enabled(args) and (args.value_loss_type != "mse" or args.critic_freeze_attention):
         # the LoRA bridge builds its own one-output value head (lora/bridge.py _make_value_model_hook)
         raise ValueError("--value-loss-type classification and --critic-freeze-attention do not support LoRA")
+
+
+def validate_routed_expert_qat_args(args) -> None:
+    """--routed-expert-qat rounds BF16 parameters in place: straight-through only with fp32 master weights."""
+    if args.routed_expert_qat is None:
+        return
+    if args.train_backend != "megatron":
+        raise ValueError("--routed-expert-qat requires the Megatron backend.")
+    if args.megatron_to_hf_mode != "raw":
+        raise ValueError("--routed-expert-qat is installed on the raw GPTModel path; use --megatron-to-hf-mode raw.")
+    if not (getattr(args, "bf16", False) or getattr(args, "fp16", False)):
+        raise ValueError("--routed-expert-qat requires --bf16 or --fp16 training with fp32 master weights.")
+    if getattr(args, "use_precision_aware_optimizer", False) and str(args.main_params_dtype) not in ("fp32", "torch.float32"):
+        raise ValueError("--routed-expert-qat requires fp32 master weights (--main-params-dtype fp32).")
+    if getattr(args, "fp8_param_gather", False):
+        raise ValueError("--routed-expert-qat does not support FP8 primary weights (--fp8-param-gather).")
+    if is_lora_enabled(args):
+        raise ValueError("--routed-expert-qat does not support LoRA.")
 
 
 def validate_skip_actor_forward_only(args) -> None:

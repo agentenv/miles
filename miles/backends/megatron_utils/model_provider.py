@@ -382,6 +382,7 @@ def get_model_provider_func(
 
         _maybe_freeze_native_dsa_indexer(args, model)
         _maybe_freeze_for_partial_experts(args, model)
+        _maybe_install_routed_expert_qat(args, model)
 
         if post_process and role == "critic":
             model.output_layer = LinearForLastLayer(
@@ -424,6 +425,22 @@ def _maybe_freeze_for_partial_experts(args: TrainerConfig, model: GPTModel) -> N
     has_experts = any(".mlp.experts." in name for name, _ in model.named_parameters())
     assert trainable > 0 or not has_experts, "--partial-experts-selection: no trainable expert parameter on this rank"
     logger.info("partial experts: %d trainable expert parameters, %d frozen parameters on this rank", trainable, frozen)
+
+
+def _maybe_install_routed_expert_qat(args: TrainerConfig, model: torch.nn.Module) -> None:
+    """--routed-expert-qat: round the trainable routed experts onto the release grid in every forward.
+
+    Runs after the partial-experts freeze so only trainable expert grouped linears are hooked.
+    """
+    if args.routed_expert_qat is None:
+        return
+    from miles.utils.mxfp4_fake_qat import MXFP4, install_routed_expert_mxfp4_qat
+
+    assert args.routed_expert_qat == MXFP4, args.routed_expert_qat
+    count = install_routed_expert_mxfp4_qat(model)
+    has_experts = any(".mlp.experts." in name for name, _ in model.named_parameters())
+    assert count > 0 or not has_experts, "--routed-expert-qat: no trainable routed-expert grouped linear on this rank"
+    logger.info("routed-expert MXFP4 QAT on %d grouped linears of this rank", count)
 
 
 def _maybe_install_witness(
