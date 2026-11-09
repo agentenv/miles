@@ -13,7 +13,7 @@ def _actor():
 def _patch(monkeypatch, *, topology="t0", calls=None):
     monkeypatch.setattr(state, "full_parameter_topology", lambda: topology)
     monkeypatch.setattr(
-        state, "initialize_full_parameter_tracking", lambda actor, version: setattr(actor, "_external_full_policy_version", version)
+        state, "initialize_full_parameter_tracking", lambda actor, version: setattr(state.full_parameter_rank_state(actor), "policy_version", version)
     )
 
     def install(actor, plan, *, role):
@@ -36,7 +36,7 @@ def test_rank_call_picks_its_own_topology_and_passes_the_actor_role(monkeypatch)
 
     assert result == 2
     assert calls == [("p1", "critic")]
-    assert actor._external_full_policy_version == 0  # tracking bound from a fresh start
+    assert state.full_parameter_rank_state(actor).policy_version == 0  # tracking bound from a fresh start
 
 
 def test_rank_call_returns_failures_instead_of_raising(monkeypatch):

@@ -20,6 +20,7 @@ from miles.backends.megatron_utils.full_parameter_state import (
     FullParameterFragmentPlan,
     FullParameterOwnerFragmentPlan,
     export_full_parameter_chunked_shard,
+    full_parameter_rank_state,
     full_parameter_shard_manifest,
     install_full_parameter_fragment_plan,
     is_deferred_full_parameter_chunk,
@@ -74,9 +75,9 @@ def test_lazy_export_reads_no_master_and_labels_every_fragment(monkeypatch):
         assert _geometry(labelled) == _geometry(content) and labelled.numel == content.numel
         assert labelled.payload_hash != content.payload_hash
         assert {c.payload_hash for c in labelled.chunks}.isdisjoint(c.payload_hash for c in content.chunks)
-    record = actor._external_full_parameter_resident
+    record = full_parameter_rank_state(actor).resident
     assert record.lazy_fragment_ids == {0, 1, 2}
-    assert actor._external_full_parameter_apply_stats["export"]["lazy"] is True
+    assert full_parameter_rank_state(actor).apply_stats["export"]["lazy"] is True
     # Every lazy export names a new export of the masters.
     assert _export(actor, _CountingRay(), lazy=True).fragments != lazy.fragments
 
@@ -96,7 +97,7 @@ def test_materializing_a_labelled_fragment_gives_the_full_export_descriptor_and_
     full = _export(actor, full_ray, defer=False)
     ray = _CountingRay()
     lazy = _export(actor, ray, lazy=True)
-    record = actor._external_full_parameter_resident
+    record = full_parameter_rank_state(actor).resident
 
     with pytest.raises(RuntimeError, match="return_descriptors=True"):
         materialize_full_parameter_fragments(actor, state=lazy, fragment_ids=[1], ray_module=ray)
@@ -108,8 +109,8 @@ def test_materializing_a_labelled_fragment_gives_the_full_export_descriptor_and_
         assert descriptor == full.fragments[fragment_id]
         want = [full_ray.objects[ref] for ref in full.chunk_refs[fragment_id]]
         assert all(torch.equal(ray.objects[ref], value) for ref, value in zip(refs, want, strict=True))
-    assert actor._external_full_parameter_resident is record
-    stats = actor._external_full_parameter_apply_stats["materialize"]
+    assert full_parameter_rank_state(actor).resident is record
+    stats = full_parameter_rank_state(actor).apply_stats["materialize"]
     assert stats["lazy_fragments"] == 2 and stats["model_checked_parameters"] == 1  # both halves of proj
 
 
@@ -178,7 +179,7 @@ def test_apply_on_labelled_rows_is_bit_identical_to_the_full_path(monkeypatch, s
     assert all(torch.equal(a, b) for a, b in zip(_master_bits(named), want_masters, strict=True))
     assert all(torch.equal(a, b) for a, b in zip(_model_bits(named), want_model, strict=True))
     # The commit keeps the untouched rows labelled, so they stay usable.
-    record = actor._external_full_parameter_resident
+    record = full_parameter_rank_state(actor).resident
     assert record.lazy_fragment_ids == {0, 2}
     committed = _target(lazy, ray, 1, replaced)
     stored = _materialize_into(actor, committed, ray, [0])
@@ -229,7 +230,7 @@ def test_a_commit_finishes_over_the_written_parameters_only(monkeypatch):
     full_ray = _CountingRay()
     full = _export(actor, full_ray, defer=False)
     _apply(actor, _target(full, full_ray, 1, replaced), full_ray, "whole", skip=True)
-    assert actor._external_full_parameter_apply_stats["commit"]["partial"] is False
+    assert full_parameter_rank_state(actor).apply_stats["commit"]["partial"] is False
     want_masters, want_model = _master_bits(full_named), _model_bits(full_named)
 
     monkeypatch.delenv("MILES_FULL_PARAMETER_PARTIAL_COMMIT")
@@ -241,7 +242,7 @@ def test_a_commit_finishes_over_the_written_parameters_only(monkeypatch):
 
     assert all(torch.equal(a, b) for a, b in zip(_master_bits(named), want_masters, strict=True))
     assert all(torch.equal(a, b) for a, b in zip(_model_bits(named), want_model, strict=True))
-    stats = actor._external_full_parameter_apply_stats["commit"]
+    stats = full_parameter_rank_state(actor).apply_stats["commit"]
     assert stats["partial"] is True and stats["written_parameters"] == 1 and stats["backup"] == "all"
     assert {"propagate_seconds", "model_copy_seconds", "check_seconds", "backup_seconds"} <= set(stats)
 
@@ -251,7 +252,7 @@ def test_writing_every_parameter_finishes_over_the_whole_model(monkeypatch):
     ray = _CountingRay()
     exported = _export(actor, ray, defer=False)
     _apply(actor, _target(exported, ray, 1, {0: [1.0, 2.0], 1: [3.0, 4.0, 5.0]}), ray, "all", skip=True)
-    stats = actor._external_full_parameter_apply_stats["commit"]
+    stats = full_parameter_rank_state(actor).apply_stats["commit"]
     assert stats["partial"] is False and stats["partial_refusal"] == "every parameter written"
 
 
@@ -290,7 +291,7 @@ def _distopt_commit(monkeypatch, mode, *, partial):
     replaced = {proj: [0.5, 1.5, 2.5, 3.5, 4.5, 5.5], native: [-0.75, 0.125]}
     _apply(actor, _target(exported, ray, 1, replaced), ray, f"{mode}-{partial}", skip=True)
     monkeypatch.delenv("MILES_FULL_PARAMETER_PARTIAL_COMMIT", raising=False)
-    stats = actor._external_full_parameter_apply_stats["commit"]
+    stats = full_parameter_rank_state(actor).apply_stats["commit"]
     assert stats["partial"] is partial
     model = [parameter.detach().clone().float() for _name, parameter in named]
     copies = [copy.detach().clone().float() for copy in inner.values()]
@@ -317,7 +318,7 @@ def test_an_uncovered_hybrid_copy_forces_the_whole_model(monkeypatch):
     ray = _CountingRay()
     exported = export_full_parameter_chunked_shard(actor, policy_version=0, max_chunk_bytes=8, ray_module=ray)
     _apply(actor, _target(exported, ray, 1, {0: [1.0, 2.0]}), ray, "stray", skip=True)
-    stats = actor._external_full_parameter_apply_stats["commit"]
+    stats = full_parameter_rank_state(actor).apply_stats["commit"]
     assert stats["partial"] is False and "no named parameter" in stats["partial_refusal"]
 
 
@@ -328,7 +329,7 @@ def test_backup_follows_the_actor_switch_and_refreshes_written_tensors(monkeypat
     actor._enable_weight_backup = False
     _apply(actor, _target(exported, ray, 1, {0: [1.0, 2.0]}), ray, "off", skip=True)
     assert actor.weights_backuper.calls == []
-    assert actor._external_full_parameter_apply_stats["commit"]["backup"] == "off"
+    assert full_parameter_rank_state(actor).apply_stats["commit"]["backup"] == "off"
 
     actor, named = _split_actor(monkeypatch)
     backuper = TensorBackuper.create(source_getter=lambda: named)
@@ -336,7 +337,7 @@ def test_backup_follows_the_actor_switch_and_refreshes_written_tensors(monkeypat
     actor.weights_backuper = backuper
     exported = _export(actor, ray, defer=False)
     _apply(actor, _target(exported, ray, 1, {0: [1.0, 2.0]}), ray, "written", skip=True)
-    assert actor._external_full_parameter_apply_stats["commit"]["backup"] == "written"
+    assert full_parameter_rank_state(actor).apply_stats["commit"]["backup"] == "written"
     for name, parameter in named:
         assert torch.equal(backuper.get("actor")[name], parameter.detach())
     # No complete backup yet: the caller must take a full one.

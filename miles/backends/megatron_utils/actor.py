@@ -11,7 +11,10 @@ from torch_memory_saver import torch_memory_saver
 
 import miles.backends.megatron_utils.runtime_patches  # noqa: F401  (DeepEP buffers stay out of torch_memory_saver)
 from miles.backends.megatron_utils.checkpoint_request import MegatronCkptLoadConfig
-from miles.backends.megatron_utils.full_parameter_state import assert_full_parameter_boundary_clear
+from miles.backends.megatron_utils.full_parameter_state import (
+    FullParameterRankState,
+    assert_full_parameter_boundary_clear,
+)
 from miles.backends.megatron_utils.hf_export import save_hf_model
 from miles.backends.megatron_utils.lora.bridge_adapter_slots import BridgeAdapterSlots
 from miles.backends.megatron_utils.lora.checkpoint import build_adapter_slots
@@ -152,6 +155,8 @@ class MegatronTrainRayActor(TrainRayActor):
         monkey_patch_torch_dist()
 
         self._last_rollout_id: int | None = None
+        # Per-rank state of the full-parameter transport (yeto DiLoCo).
+        self.full_parameter = FullParameterRankState()
         self._cell_index = indep_dp_info.cell_index
         super()._init_common(args, role, with_ref, with_opd_teacher=with_opd_teacher)
 

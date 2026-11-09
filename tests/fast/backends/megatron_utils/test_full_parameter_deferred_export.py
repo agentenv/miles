@@ -23,6 +23,7 @@ from miles.backends.megatron_utils.full_parameter_state import (
     export_full_parameter_chunked_shard,
     forget_full_parameter_resident_fragments,
     full_parameter_optimizer_state,
+    full_parameter_rank_state,
     is_deferred_full_parameter_chunk,
     materialize_full_parameter_fragments,
     prepare_full_parameter_chunked_shard,
@@ -63,7 +64,7 @@ def test_deferred_export_has_the_full_descriptors_and_stores_nothing(monkeypatch
     monkeypatch.setenv("MILES_FULL_PARAMETER_HASH_THREADS", str(threads))
     actor, _named = _split_actor(monkeypatch)
     full = _export(actor, _CountingRay(), defer=False)
-    full_record = actor._external_full_parameter_resident
+    full_record = full_parameter_rank_state(actor).resident
 
     ray = _CountingRay()
     deferred = _export(actor, ray, defer=True)
@@ -72,8 +73,8 @@ def test_deferred_export_has_the_full_descriptors_and_stores_nothing(monkeypatch
     assert ray.objects == {}
     assert all(is_deferred_full_parameter_chunk(ref) for refs in deferred.chunk_refs for ref in refs)
     assert [len(refs) for refs in deferred.chunk_refs] == [len(refs) for refs in full.chunk_refs]
-    assert actor._external_full_parameter_resident.payload_hashes == full_record.payload_hashes
-    assert actor._external_full_parameter_apply_stats["export"]["deferred"] is True
+    assert full_parameter_rank_state(actor).resident.payload_hashes == full_record.payload_hashes
+    assert full_parameter_rank_state(actor).apply_stats["export"]["deferred"] is True
 
 
 def test_deferred_export_still_refuses_a_non_finite_master(monkeypatch):
@@ -98,7 +99,7 @@ def test_materialize_stores_exactly_the_bytes_of_the_full_export(monkeypatch):
 
     ray = _CountingRay()
     deferred = _export(actor, ray, defer=True)
-    record = actor._external_full_parameter_resident
+    record = full_parameter_rank_state(actor).resident
     stored = materialize_full_parameter_fragments(actor, state=deferred, fragment_ids=[2, 0], ray_module=ray)
 
     assert [fragment_id for fragment_id, _refs in stored] == [0, 2]
@@ -107,7 +108,7 @@ def test_materialize_stores_exactly_the_bytes_of_the_full_export(monkeypatch):
         assert len(got) == len(want[fragment_id])
         assert all(torch.equal(a, b) for a, b in zip(got, want[fragment_id], strict=True))
     # Nothing about the masters' bookkeeping moved.
-    assert actor._external_full_parameter_resident is record
+    assert full_parameter_rank_state(actor).resident is record
 
 
 def test_materialize_refuses_after_the_masters_changed(monkeypatch):
@@ -148,7 +149,7 @@ def test_apply_of_a_target_built_on_a_deferred_cut_is_bit_identical(monkeypatch)
     assert all(torch.equal(a, b) for a, b in zip(_master_bits(named), want_masters, strict=True))
     assert all(torch.equal(a, b) for a, b in zip(_model_bits(named), want_model, strict=True))
     # The commit records the deferred rows as resident: the next apply skips them too.
-    assert set(actor._external_full_parameter_resident.payload_hashes) == {0, 1, 2}
+    assert set(full_parameter_rank_state(actor).resident.payload_hashes) == {0, 1, 2}
 
 
 def test_a_deferred_fragment_is_resident_even_with_the_skip_switched_off(monkeypatch):

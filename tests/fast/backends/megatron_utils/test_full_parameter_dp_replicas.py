@@ -35,6 +35,7 @@ from miles.backends.megatron_utils.full_parameter_state import (
     FullParameterOwnerFragmentPlan,
     FullParameterReplication,
     FullParameterTopology,
+    full_parameter_rank_state,
 )
 from miles.ray import full_parameter_transport as transport
 from miles.ray.full_parameter_transport import (
@@ -51,6 +52,17 @@ from miles.ray.full_parameter_transport import (
 )
 
 pytestmark = pytest.mark.asyncio
+
+def _backend(*, global_batch_size: int = 1, swiglu: bool = False) -> SimpleNamespace:
+    """The Megatron-owned trainer fields the transport reads through ``args.backend``."""
+
+    return SimpleNamespace(
+        global_batch_size=global_batch_size,
+        swiglu=swiglu,
+        overlap_param_gather=False,
+        num_distributed_optimizer_instances=1,
+    )
+
 
 _LAYOUT_HASH = "9" * 64
 _EXPERTS_PER_RANK = 2
@@ -130,10 +142,11 @@ class _Rank:
             )
         )
         self.args = SimpleNamespace(full_parameter_lora_hybrid=False, 
-            lora_rank=0, lora_adapter_path=None, num_steps_per_rollout=1, global_batch_size=1, start_rollout_id=None
+            lora_rank=0, lora_adapter_path=None, num_steps_per_rollout=1, backend=_backend(global_batch_size=1), start_rollout_id=None
         )
         self.opt_param_scheduler = SimpleNamespace(num_steps=0)
-        self.weights_backuper = SimpleNamespace(backup=lambda role: None)
+        self.weights_backuper = SimpleNamespace(backup=lambda role: None, backup_tensors=lambda tag, ids: 0)
+        self._enable_weight_backup = True
         self._last_rollout_id = 0
 
     def masters(self) -> dict[str, torch.Tensor]:
@@ -408,7 +421,7 @@ async def test_skip_resident_after_deferred_export_reads_only_changed_fragments(
         assert torch.equal(after[name], before[name]) == (name not in changed_names), name
     replica_readers = 0
     for rank in ranks:
-        stats = rank._external_full_parameter_apply_stats
+        stats = full_parameter_rank_state(rank).apply_stats
         owns_changed = rank.topology == owner_plan.topology
         replicates_changed = not owns_changed and any(name in changed_names for name, _parameter in rank.named)
         replica_readers += replicates_changed
@@ -439,7 +452,7 @@ async def test_diverged_replica_is_refused_when_checked(cluster, monkeypatch):
 
     monkeypatch.setenv(VERIFY_REPLICAS_ENV, "1")
     checked = await export_chunked_cut(group, 1, 1, max_chunk_bytes=16, defer_payload=True)
-    assert all(rank._external_full_parameter_apply_stats["replica_export"]["verified_chunks"] > 0 for rank in ranks)
+    assert all(full_parameter_rank_state(rank).apply_stats["replica_export"]["verified_chunks"] > 0 for rank in ranks)
 
     # Rank 1 holds a replica of a dense parameter rank 0 owns; make it drift.
     # The check hashes only chunks that lie wholly inside rank 1's replicas;
@@ -498,7 +511,7 @@ async def test_lazy_boundary_with_replicas_writes_only_changed_parameters(cluste
     monkeypatch.setenv(VERIFY_REPLICAS_ENV, "1")
     lazy = await export_chunked_cut(group, 1, 1, max_chunk_bytes=16, defer_payload=True, lazy=True)
     for rank in ranks:
-        note = rank._external_full_parameter_apply_stats["replica_export"]
+        note = full_parameter_rank_state(rank).apply_stats["replica_export"]
         assert (note["lazy"], note["verified_chunks"]) == (1, 0)
     # An owner materializes a lazy fragment through its content descriptor.
     (content, refs) = (await materialize_chunked_fragments(group, lazy, [1], return_descriptors=True))[1]
@@ -519,7 +532,7 @@ async def test_lazy_boundary_with_replicas_writes_only_changed_parameters(cluste
     for name in before:
         assert torch.equal(after[name], before[name]) == (name not in changed_names), name
     for rank in ranks:
-        commit = rank._external_full_parameter_apply_stats["commit"]
+        commit = full_parameter_rank_state(rank).apply_stats["commit"]
         holds_changed = any(name in changed_names for name, _parameter in rank.named)
         # The commit finished over the parameters it wrote: owned and replica ones.
         assert commit["partial"] is True
@@ -530,4 +543,4 @@ async def test_lazy_boundary_with_replicas_writes_only_changed_parameters(cluste
         rank.local_step(rollout_id=2, delta=0.5)
     await record_local_step(group, base_policy_version=2, rollout_id=2)
     await export_chunked_cut(group, 2, 1, max_chunk_bytes=16, defer_payload=True)
-    assert all(rank._external_full_parameter_apply_stats["replica_export"]["verified_chunks"] > 0 for rank in ranks)
+    assert all(full_parameter_rank_state(rank).apply_stats["replica_export"]["verified_chunks"] > 0 for rank in ranks)

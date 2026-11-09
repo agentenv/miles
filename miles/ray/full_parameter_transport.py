@@ -736,7 +736,7 @@ def replica_owner_manifests(
 
 
 def _replica_owners(group) -> Mapping[FullParameterTopology, tuple[FullParameterTopology, ...]]:
-    return getattr(group, REPLICA_OWNERS_ATTRIBUTE, None) or {}
+    return getattr(group, REPLICA_OWNERS_ATTRIBUTE, None) or {}  # config-access-exempt: controller stand-ins in tests may lack the replica registry
 
 
 def _validate_group_plans(
@@ -813,7 +813,7 @@ async def _master_contributions(
     fragments).  Empty for whole masters.  ``held``: see
     ``full_parameter_master_contributions``."""
 
-    topologies = getattr(group, SHARDED_MASTERS_ATTRIBUTE, None) or frozenset()
+    topologies = getattr(group, SHARDED_MASTERS_ATTRIBUTE, None) or frozenset()  # config-access-exempt: controller stand-ins in tests may lack the sharded-master registry
     if not topologies or not fragments_by_owner:
         return {}
     owners = _replica_owners(group)
@@ -858,7 +858,7 @@ async def export_chunked_cut(
     replicas first contribute their master ranges of every owner fragment and
     each owner exports with them."""
 
-    sharded = () if lazy else getattr(group, SHARDED_MASTERS_ATTRIBUTE, None) or ()
+    sharded = () if lazy else getattr(group, SHARDED_MASTERS_ATTRIBUTE, None) or ()  # config-access-exempt: controller stand-ins in tests may lack the sharded-master registry
     routed = {}
     if sharded:
         contributions = await _master_contributions(

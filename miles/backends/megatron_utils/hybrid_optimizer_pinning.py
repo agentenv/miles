@@ -50,7 +50,7 @@ def _is_pinned(value: torch.Tensor) -> bool:
 
 
 def _empty_pinned_cache() -> None:
-    empty = getattr(torch._C, "_host_emptyCache", None)
+    empty = getattr(torch._C, "_host_emptyCache", None)  # config-access-exempt: older torch builds lack _host_emptyCache
     if empty is not None:
         empty()
 
@@ -59,7 +59,7 @@ def _cpu_stepped_tensors(optimizer) -> Iterator[torch.Tensor]:
     """Every CPU tensor the CPU sub-optimizers step, once each."""
 
     seen: set[int] = set()
-    for group in getattr(optimizer, "cpu_param_groups", None) or ():
+    for group in getattr(optimizer, "cpu_param_groups", None) or ():  # config-access-exempt: cpu_param_groups exists only on HybridDeviceOptimizer
         for tensor in group["params"]:
             if id(tensor) not in seen and tensor.device.type == "cpu":
                 seen.add(id(tensor))
@@ -77,7 +77,7 @@ def pin_cpu_optimizer_params(
     In place (``tensor.data``), values unchanged; returns the bytes moved.  No-op
     when the optimizer was built with ``pin_cpu_params=False``."""
 
-    if not getattr(optimizer, "pin_cpu_params", True):
+    if not getattr(optimizer, "pin_cpu_params", True):  # config-access-exempt: pin_cpu_params exists only on HybridDeviceOptimizer
         return 0
     pin = pin or _pin
     is_pinned = is_pinned or _is_pinned
@@ -97,7 +97,7 @@ def wrap_init_sub_optimizers(hybrid_optimizer_cls) -> bool:
     """Wrap ``hybrid_optimizer_cls._init_sub_optimizers`` once; returns False when already wrapped."""
 
     original = hybrid_optimizer_cls._init_sub_optimizers
-    if getattr(original, _WRAPPED_MARK, False):
+    if getattr(original, _WRAPPED_MARK, False):  # config-access-exempt: marker set by install() on the wrapped function
         return False
 
     @functools.wraps(original)

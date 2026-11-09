@@ -159,13 +159,13 @@ def master_ranges(
     and some parameter is replicated on more than one rank.  Every rank of a
     replica group sees the same groups, so all of them decide alike."""
 
-    views = getattr(optimizer_owned_parameter_ids, "distributed_views", None) or {}
-    if not views and not any(getattr(parameter, "main_param_sharded", False) for _name, parameter in named_parameters):
+    views = getattr(optimizer_owned_parameter_ids, "distributed_views", None) or {}  # config-access-exempt: a plain frozenset of ids (non-distributed optimizer) has no master views
+    if not views and not any(getattr(parameter, "main_param_sharded", False) for _name, parameter in named_parameters):  # config-access-exempt: main_param_sharded is optional backend-attached tensor metadata
         return None  # the non-distributed optimizer: whole masters
     group_sizes = {name: len(replication.ranks_for(name, parameter)) for name, parameter in named_parameters}
     if all(size == 1 for size in group_sizes.values()):
         return None  # DP=1: every range is the whole parameter
-    if getattr(optimizer_owned_parameter_ids, "hybrid_copies", False):
+    if getattr(optimizer_owned_parameter_ids, "hybrid_copies", False):  # config-access-exempt: a plain frozenset of ids has no HybridDeviceOptimizer copies
         raise RuntimeError(
             "full-parameter sync at DP>1 with the distributed optimizer needs its FP32 masters on the "
             "device: no optimizer CPU offload (HybridDeviceOptimizer)"
@@ -228,9 +228,9 @@ def refuse_unsupported_args(args) -> None:
       FP32 element."""
 
     unsupported = []
-    if getattr(args, "overlap_param_gather", False):
+    if args.backend.overlap_param_gather:
         unsupported.append("overlap_param_gather")
-    if int(getattr(args, "num_distributed_optimizer_instances", 1) or 1) > 1:
+    if int(args.backend.num_distributed_optimizer_instances or 1) > 1:
         unsupported.append("num_distributed_optimizer_instances > 1")
     if unsupported:
         raise RuntimeError(
@@ -286,7 +286,7 @@ class FullParameterMasterContribution:
 
     def __post_init__(self) -> None:
         for name in ("fragment_id", "policy_version", "local_step_generation", "scheduler_num_steps"):
-            value = getattr(self, name)
+            value = getattr(self, name)  # config-access-exempt: attribute selected at runtime from field name
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"full-parameter contribution {name.replace('_', ' ')} is malformed")
         if self.contributor == self.owner:
@@ -371,7 +371,7 @@ def _local_pieces(fragment, ranges: Mapping[str, MasterRange]) -> list[tuple[int
 
     pieces = []
     for copy in fragment.copies:
-        if not getattr(copy, "contributes", True):
+        if not getattr(copy, "contributes", True):  # config-access-exempt: contributes is set only on master copies that opt out
             continue  # another tensor-parallel rank's group holds the owner's master ranges
         inside = ranges[copy.name].overlap(copy.start, copy.stop)
         if inside is not None:

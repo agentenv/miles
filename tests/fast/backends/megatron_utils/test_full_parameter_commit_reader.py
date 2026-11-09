@@ -25,6 +25,7 @@ import torch
 from miles.backends.megatron_utils import full_parameter_chunk_reader as reader_module
 from miles.backends.megatron_utils import full_parameter_sharded_masters as sharded
 from miles.backends.megatron_utils.full_parameter_chunk_reader import CommitChunkReader, prefetch_enabled, touch_pages
+from miles.backends.megatron_utils.full_parameter_state import full_parameter_rank_state
 from miles.ray.full_parameter_transport import apply_chunked_cut, export_chunked_cut
 from tests.fast.backends.megatron_utils.test_full_parameter_dp_sharded_masters import (  # noqa: F401 - fixture
     _CHUNK_BYTES,
@@ -252,14 +253,14 @@ async def test_read_ahead_and_device_cast_apply_the_same_bits(cluster, monkeypat
         _assert_same_bits(pair)  # equal to the whole-master cluster
         snapshots[(prefetch, device_cast)] = _snapshot(pair)
         for rank in pair["sharded"].ranks:
-            commit = rank._external_full_parameter_apply_stats["commit"]
+            commit = full_parameter_rank_state(rank).apply_stats["commit"]
             if commit["prefetched_chunks"]:
                 assert commit["prefetch"]
             assert commit["fetch_wait_seconds"] >= 0 and commit["write_seconds"] >= 0
             if not prefetch:
                 assert commit["prefetched_chunks"] == 0
         if prefetch:
-            assert sum(rank._external_full_parameter_apply_stats["commit"]["prefetched_chunks"] for rank in pair["sharded"].ranks) > 0
+            assert sum(full_parameter_rank_state(rank).apply_stats["commit"]["prefetched_chunks"] for rank in pair["sharded"].ranks) > 0
     reference = snapshots[(0, "0")]
     for key, snapshot in snapshots.items():
         assert snapshot["masters"].keys() == reference["masters"].keys()
@@ -292,7 +293,7 @@ async def test_read_ahead_reads_each_chunk_as_often_as_the_plain_commit(cluster,
 
         monkeypatch.setattr(side.ray, "get", counting_get)
         await apply_chunked_cut(side.group, target, commit_token="apply-1")
-        prefetched = sum(rank._external_full_parameter_apply_stats["commit"]["prefetched_chunks"] for rank in side.ranks)
+        prefetched = sum(full_parameter_rank_state(rank).apply_stats["commit"]["prefetched_chunks"] for rank in side.ranks)
         assert (prefetched > 0) == (prefetch > 0)
         totals[prefetch] = counts
     assert totals[0] == totals[1]
@@ -307,7 +308,7 @@ async def test_materialize_reports_its_time_split(cluster):  # noqa: F811 - the 
     deferred = await export_chunked_cut(side.group, 0, 0, max_chunk_bytes=_CHUNK_BYTES, defer_payload=True)
     fragment_ids = [descriptor.fragment_id for shard in deferred.shards for descriptor in shard.fragments]
     await materialize_chunked_fragments(side.group, deferred, fragment_ids)
-    owners = [rank._external_full_parameter_apply_stats["materialize"] for rank in side.ranks]
+    owners = [full_parameter_rank_state(rank).apply_stats["materialize"] for rank in side.ranks]
     for stats in owners:
         if stats["fragments"]:
             for key in ("sources_seconds", "copy_out_seconds", "check_seconds", "put_seconds", "model_check_seconds"):
