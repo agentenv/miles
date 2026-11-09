@@ -61,7 +61,7 @@ def prefetch_enabled(ray_module) -> bool:
         raise RuntimeError(f"{PREFETCH_ENV} must be 0 or 1, got {raw!r}")
     if raw == "0" or os.environ.get(_ZERO_COPY_ENV, "1") == "0":
         return False
-    return getattr(ray_module, "__name__", None) == "ray" or _PREFETCH_STANDINS
+    return getattr(ray_module, "__name__", None) == "ray" or _PREFETCH_STANDINS  # config-access-exempt: ray may be a test double without __name__
 
 
 def touch_pages(value: object, spans: tuple[tuple[int, int], ...] | None) -> None:

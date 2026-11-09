@@ -45,7 +45,6 @@ from miles.backends.megatron_utils.full_parameter_state import (
     FullParameterOwnerFragmentPlan,
     FullParameterShardManifest,
     FullParameterTopology,
-    _REPLICA_RESIDENT_ATTRIBUTE,
     _chunk_hash,
     _hash_pool,
     _parallel_map,
@@ -55,14 +54,13 @@ from miles.backends.megatron_utils.full_parameter_state import (
     _scheduler_num_steps,
     _validate_cpu_chunk,
     _validate_fragment_plan_against_manifest,
+    full_parameter_rank_state,
     is_deferred_full_parameter_chunk,
     validate_full_parameter_chunked_shard_state,
 )
 
 VERIFY_REPLICAS_ENV = "MILES_FULL_PARAMETER_VERIFY_REPLICAS"
 
-_PLAN_ATTRIBUTE = "_external_full_parameter_replica_plan"
-_RESIDENT_ATTRIBUTE = _REPLICA_RESIDENT_ATTRIBUTE
 
 ReplicaFragmentKey = tuple[FullParameterTopology, int]
 
@@ -237,9 +235,9 @@ def _numel(shape: tuple[int, ...]) -> int:
 
 
 def install_replica_plan(actor, replica_plan: ReplicaPlan | None) -> None:
-    installed = getattr(actor, _PLAN_ATTRIBUTE, None)
+    installed = full_parameter_rank_state(actor).replica_plan
     if installed is None:
-        setattr(actor, _PLAN_ATTRIBUTE, replica_plan)
+        full_parameter_rank_state(actor).replica_plan = replica_plan
     elif installed != replica_plan:
         raise RuntimeError("full-parameter replica plan is already installed")
 
@@ -247,7 +245,7 @@ def install_replica_plan(actor, replica_plan: ReplicaPlan | None) -> None:
 def require_replica_plan(actor, manifest: FullParameterShardManifest) -> ReplicaPlan | None:
     """The installed replica plan, refused when the local holdings changed since install."""
 
-    replica_plan = getattr(actor, _PLAN_ATTRIBUTE, None)
+    replica_plan = full_parameter_rank_state(actor).replica_plan
     if replica_plan is None:
         if manifest.replicated_holdings():
             raise RuntimeError("full-parameter replica plan is not installed")
@@ -296,7 +294,7 @@ def match_replica_states(
 
 
 def forget_replica_resident(actor) -> None:
-    setattr(actor, _RESIDENT_ATTRIBUTE, None)
+    full_parameter_rank_state(actor).replica_resident = None
 
 
 def record_replica_resident(
@@ -316,16 +314,12 @@ def record_replica_resident(
         for fragment in source.fragments:
             descriptor = descriptors[fragment.fragment_id]
             hashes[(source.topology, fragment.fragment_id)] = (descriptor.numel, descriptor.payload_hash)
-    setattr(
-        actor,
-        _RESIDENT_ATTRIBUTE,
-        ReplicaResidentRecord(
-            parameter_layout_hash=replica_plan.parameter_layout_hash,
-            policy_version=installed,
-            local_step_generation=generation,
-            scheduler_num_steps=_scheduler_num_steps(actor),
-            payload_hashes=hashes,
-        ),
+    full_parameter_rank_state(actor).replica_resident = ReplicaResidentRecord(
+        parameter_layout_hash=replica_plan.parameter_layout_hash,
+        policy_version=installed,
+        local_step_generation=generation,
+        scheduler_num_steps=_scheduler_num_steps(actor),
+        payload_hashes=hashes,
     )
 
 
@@ -344,7 +338,7 @@ def resident_replica_fragments(
 
     if replica_plan is None:
         return frozenset(), None
-    record = getattr(actor, _RESIDENT_ATTRIBUTE, None)
+    record = full_parameter_rank_state(actor).replica_resident
     held = _live_resident(actor, replica_plan, record)
     resident, deferred = set(), set()
     for source, state in zip(replica_plan.sources, states, strict=True):
@@ -395,14 +389,14 @@ def replica_holds(
     replicas hold that owner fragment with exactly ``expected``'s ``(numel,
     payload hash)``."""
 
-    live = {} if replica_plan is None else _live_resident(actor, replica_plan, getattr(actor, _RESIDENT_ATTRIBUTE, None))
+    live = {} if replica_plan is None else _live_resident(actor, replica_plan, full_parameter_rank_state(actor).replica_resident)
     return lambda owner, fragment_id: (
         (owner, fragment_id) in expected and live.get((owner, fragment_id)) == expected[(owner, fragment_id)]
     )
 
 
 def require_live_replica_record(actor, prepared_record: object, resident: frozenset[ReplicaFragmentKey]) -> None:
-    if resident and getattr(actor, _RESIDENT_ATTRIBUTE, None) is not prepared_record:
+    if resident and full_parameter_rank_state(actor).replica_resident is not prepared_record:
         raise RuntimeError("full-parameter replica resident fragments changed after prepare")
 
 

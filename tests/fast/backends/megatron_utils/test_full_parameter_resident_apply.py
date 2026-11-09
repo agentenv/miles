@@ -18,6 +18,7 @@ from miles.backends.megatron_utils.full_parameter_state import (
     export_full_parameter_chunked_shard,
     finalize_full_parameter_commit,
     forget_full_parameter_resident_fragments,
+    full_parameter_rank_state,
     install_full_parameter_fragment_plan,
     prepare_full_parameter_chunked_shard,
 )
@@ -42,7 +43,7 @@ class _CountingRay:
 
 def _split_actor(monkeypatch):
     actor, named, _state, manifest, _plan = _chunked_actor(monkeypatch)
-    delattr(actor, "_external_full_parameter_fragment_plan")
+    full_parameter_rank_state(actor).fragment_plan = None
     plan = _split_plan(manifest)
     assert install_full_parameter_fragment_plan(actor, plan) == 3
     return actor, named
@@ -88,11 +89,11 @@ def _two_applies(monkeypatch, *, skip):
     exported = export_full_parameter_chunked_shard(actor, policy_version=0, max_chunk_bytes=8, ray_module=ray)
     first = _target(exported, ray, 1, {1: [30.5, -1.25, 1e-30]})
     counts = [_apply(actor, first, ray, "apply-1", skip=skip)]
-    stats = [dict(actor._external_full_parameter_apply_stats)]
+    stats = [dict(full_parameter_rank_state(actor).apply_stats)]
     # The next apply starts from the committed target, as the role stream does.
     second = _target(first, ray, 2, {2: [-0.0, 3.75, 2.5e38]})
     counts.append(_apply(actor, second, ray, "apply-2", skip=skip))
-    stats.append(dict(actor._external_full_parameter_apply_stats))
+    stats.append(dict(full_parameter_rank_state(actor).apply_stats))
     return actor, named, counts, stats
 
 
@@ -111,7 +112,7 @@ def test_resident_skip_is_bit_identical_and_reads_only_replaced_fragments(monkey
     assert [gets for _, gets in full_counts] == [10, 10]
     # Skip: only the replaced fragment's 2 chunks, twice.
     assert [gets for _, gets in counts] == [4, 4]
-    for one, replaced in zip(stats, (1, 2), strict=True):
+    for one, _replaced in zip(stats, (1, 2), strict=True):
         assert one["prepare"]["resident_fragments"] == 2 and one["prepare"]["read_fragments"] == 1
         assert one["commit"]["copied_fragments"] == 1 and one["commit"]["resident_fragments"] == 2
     assert actor.weights_backuper.calls == ["actor", "actor"]
@@ -140,10 +141,10 @@ def test_new_local_generation_disables_the_skip(monkeypatch):
     ray = _CountingRay()
     exported = export_full_parameter_chunked_shard(actor, policy_version=0, max_chunk_bytes=8, ray_module=ray)
     target = _target(exported, ray, 1, {0: [1.0, 2.0]})
-    record = actor._external_full_parameter_resident
+    record = full_parameter_rank_state(actor).resident
     assert record is not None and record.local_step_generation == 0
     # A record from another generation does not describe the masters.
-    actor._external_full_parameter_resident = replace(record, local_step_generation=5)
+    full_parameter_rank_state(actor).resident = replace(record, local_step_generation=5)
     _count, gets = _apply(actor, target, ray, "other-generation", skip=True)
     assert gets == 10
 
@@ -181,7 +182,7 @@ def test_retried_commit_after_a_partial_copy_keeps_the_skip_exact(monkeypatch):
     monkeypatch.setattr(fps, "_propagate_master_writes", fail_once)
     with pytest.raises(RuntimeError, match="injected"):
         commit_prepared_full_parameter_shard(actor, commit_token="r", ray_module=ray)
-    assert actor._external_full_parameter_resident is None
+    assert full_parameter_rank_state(actor).resident is None
     commit_prepared_full_parameter_shard(actor, commit_token="r", ray_module=ray)
     finalize_full_parameter_commit(actor, commit_token="r")
     second = _target(first, ray, 2, {2: [-0.0, 3.75, 2.5e38]})

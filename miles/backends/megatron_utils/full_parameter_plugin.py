@@ -42,7 +42,7 @@ PLUGIN_PATH = "miles.backends.megatron_utils.full_parameter_plugin.full_paramete
 def ensure_full_parameter_tracking(actor) -> None:
     """Bind the global-version boundary once, from the configured start."""
 
-    if getattr(actor, "_external_full_policy_version", None) is None:
+    if state.full_parameter_rank_state(actor).policy_version is None:
         state.initialize_full_parameter_tracking(
             actor, state.full_parameter_initial_policy_version(actor.args, -1)
         )

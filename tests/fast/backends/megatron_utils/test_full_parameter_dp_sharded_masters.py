@@ -35,6 +35,7 @@ from miles.backends.megatron_utils.full_parameter_state import (
     FullParameterOwnerFragmentPlan,
     FullParameterReplication,
     FullParameterTopology,
+    full_parameter_rank_state,
 )
 from miles.ray import full_parameter_transport as transport
 from miles.ray.full_parameter_transport import (
@@ -51,6 +52,17 @@ from miles.ray.full_parameter_transport import (
 )
 
 pytestmark = pytest.mark.asyncio
+
+def _backend(*, global_batch_size: int = 1, swiglu: bool = False) -> SimpleNamespace:
+    """The Megatron-owned trainer fields the transport reads through ``args.backend``."""
+
+    return SimpleNamespace(
+        global_batch_size=global_batch_size,
+        swiglu=swiglu,
+        overlap_param_gather=False,
+        num_distributed_optimizer_instances=1,
+    )
+
 
 _LAYOUT_HASH = "9" * 64
 _EXPERTS_PER_RANK = 2
@@ -104,10 +116,11 @@ class _Rank:
             "expert": (self.replication.expert_ranks, _expert_names(rank % ep)),
         }
         self.args = SimpleNamespace(full_parameter_lora_hybrid=False, 
-            lora_rank=0, lora_adapter_path=None, num_steps_per_rollout=1, global_batch_size=1, start_rollout_id=None
+            lora_rank=0, lora_adapter_path=None, num_steps_per_rollout=1, backend=_backend(global_batch_size=1), start_rollout_id=None
         )
         self.opt_param_scheduler = SimpleNamespace(num_steps=0)
-        self.weights_backuper = SimpleNamespace(backup=lambda role: None)
+        self.weights_backuper = SimpleNamespace(backup=lambda role: None, backup_tensors=lambda tag, ids: 0)
+        self._enable_weight_backup = True
         self._last_rollout_id = 0
         self.sharded_masters = sharded_masters
         self.ranges: dict[str, tuple[int, int]] = {}
@@ -482,7 +495,7 @@ async def test_exports_are_byte_identical_to_whole_masters(cluster, mode, world,
         assert whole_lazy == sharded_lazy  # the same content descriptors
     else:
         assert [shard.fragments for shard in whole_cut.shards] == [shard.fragments for shard in sharded_cut.shards]
-    contributed = [rank._external_full_parameter_apply_stats["contribute"] for rank in pair["sharded"].ranks]
+    contributed = [full_parameter_rank_state(rank).apply_stats["contribute"] for rank in pair["sharded"].ranks]
     assert sum(stats["scalars"] for stats in contributed) > 0
 
 
@@ -508,10 +521,10 @@ async def test_applies_are_bit_identical_to_whole_masters(cluster, world, ep):
     for whole_rank, sharded_rank in zip(pair["whole"].ranks, pair["sharded"].ranks, strict=True):
         for phase, key in (("prepare", "read_fragments"), ("prepare", "replica_read_fragments"), ("commit", "replica_copied_fragments")):
             assert (
-                whole_rank._external_full_parameter_apply_stats[phase][key]
-                == sharded_rank._external_full_parameter_apply_stats[phase][key]
+                full_parameter_rank_state(whole_rank).apply_stats[phase][key]
+                == full_parameter_rank_state(sharded_rank).apply_stats[phase][key]
             )
-        assert sharded_rank._external_full_parameter_apply_stats["commit"]["sharded"]
+        assert full_parameter_rank_state(sharded_rank).apply_stats["commit"]["sharded"]
 
     # Adam state survives on every rank, and the model matches each local range.
     cluster.use(pair["sharded"].group)
@@ -590,10 +603,10 @@ def test_offload_precision_aware_and_param_gather_are_refused(monkeypatch):
         sharded.master_ranges(named, rank.replication, without_main)
 
     with pytest.raises(RuntimeError, match="overlap_param_gather"):
-        sharded.refuse_unsupported_args(SimpleNamespace(overlap_param_gather=True))
+        sharded.refuse_unsupported_args(SimpleNamespace(backend=SimpleNamespace(overlap_param_gather=True, num_distributed_optimizer_instances=1)))
     with pytest.raises(RuntimeError, match="num_distributed_optimizer_instances"):
-        sharded.refuse_unsupported_args(SimpleNamespace(num_distributed_optimizer_instances=2))
-    sharded.refuse_unsupported_args(SimpleNamespace(overlap_param_gather=False, num_distributed_optimizer_instances=1))
+        sharded.refuse_unsupported_args(SimpleNamespace(backend=SimpleNamespace(overlap_param_gather=False, num_distributed_optimizer_instances=2)))
+    sharded.refuse_unsupported_args(SimpleNamespace(backend=SimpleNamespace(overlap_param_gather=False, num_distributed_optimizer_instances=1)))
 
 
 async def test_a_group_mixing_whole_and_sharded_masters_is_refused(cluster):

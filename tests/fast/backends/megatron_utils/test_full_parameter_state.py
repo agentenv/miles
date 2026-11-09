@@ -12,6 +12,7 @@ from miles.backends.megatron_utils.full_parameter_state import (
     FULL_PARAMETER_MAX_CHUNK_BYTES,
     FullParameterFragmentPlan,
     FullParameterOwnerFragmentPlan,
+    FullParameterRankState,
     FullParameterShardState,
     FullParameterTopology,
     abort_prepared_full_parameter_shard,
@@ -23,6 +24,7 @@ from miles.backends.megatron_utils.full_parameter_state import (
     finalize_full_parameter_commit,
     full_parameter_initial_policy_version,
     full_parameter_optimizer_state,
+    full_parameter_rank_state,
     full_parameter_shard_manifest,
     initialize_full_parameter_tracking,
     install_full_parameter_fragment_plan,
@@ -32,6 +34,17 @@ from miles.backends.megatron_utils.full_parameter_state import (
     record_full_parameter_local_step,
     validate_full_parameter_shard_values,
 )
+
+
+def _backend(*, global_batch_size: int = 1, swiglu: bool = False) -> SimpleNamespace:
+    """The Megatron-owned trainer fields the transport reads through ``args.backend``."""
+
+    return SimpleNamespace(
+        global_batch_size=global_batch_size,
+        swiglu=swiglu,
+        overlap_param_gather=False,
+        num_distributed_optimizer_instances=1,
+    )
 
 
 def topology(*, tp_rank=0, tp_size=2, dp_rank=0, dp_size=1):
@@ -231,12 +244,11 @@ def test_optimizer_state_proof_binds_progress_and_survives_parameter_apply(
             lora_rank=0,
             lora_adapter_path=None,
             num_steps_per_rollout=1,
-            global_batch_size=1,
+            backend=_backend(global_batch_size=1),
         ),
         optimizer=SimpleNamespace(optimizer=base),
         opt_param_scheduler=SimpleNamespace(num_steps=1),
-        _external_full_policy_version=0,
-        _external_full_local_step_generation=1,
+        full_parameter=FullParameterRankState(policy_version=0, local_step_generation=1),
         _last_rollout_id=0,
     )
     monkeypatch.setattr(
@@ -252,7 +264,7 @@ def test_optimizer_state_proof_binds_progress_and_survives_parameter_apply(
     for _name, parameter in named:
         parameter.main_param.add_(0.5)
         parameter.data.copy_(parameter.main_param.to(dtype=parameter.dtype))
-    actor._external_full_policy_version = 1
+    full_parameter_rank_state(actor).policy_version = 1
     after_apply = full_parameter_optimizer_state(actor)
 
     assert before.selected_state_sha256 == after_apply.selected_state_sha256
@@ -285,11 +297,12 @@ def test_local_step_generation_keeps_global_base_until_complete_apply(monkeypatc
             lora_rank=0,
             lora_adapter_path=None,
             num_steps_per_rollout=1,
-            global_batch_size=1,
+            backend=_backend(global_batch_size=1),
         ),
         optimizer=SimpleNamespace(optimizer=base),
         opt_param_scheduler=SimpleNamespace(num_steps=0),
-        weights_backuper=SimpleNamespace(backup=backups.append),
+        weights_backuper=SimpleNamespace(backup=backups.append, backup_tensors=lambda tag, ids: 0),
+        _enable_weight_backup=True,
     )
     monkeypatch.setattr(
         "miles.backends.megatron_utils.full_parameter_state._named_actor_parameters",
@@ -328,7 +341,7 @@ def test_local_step_generation_keeps_global_base_until_complete_apply(monkeypatc
 
     assert receipt.base_policy_version == 0
     assert receipt.local_step_generation == 1
-    assert actor._external_full_policy_version == 0
+    assert full_parameter_rank_state(actor).policy_version == 0
     with pytest.raises(RuntimeError, match="generation is stale"):
         export_full_parameter_shard(
             actor,
@@ -349,10 +362,10 @@ def test_local_step_generation_keeps_global_base_until_complete_apply(monkeypatc
         local_step_generation=0,
     )
     assert apply_full_parameter_shard(actor, global_target) == 2
-    assert actor._external_full_policy_version == 1
-    assert actor._external_full_local_step_generation == 0
-    assert actor._external_full_exported_local_step_generation == 0
-    assert actor._external_full_scheduler_anchor_steps == 1
+    assert full_parameter_rank_state(actor).policy_version == 1
+    assert full_parameter_rank_state(actor).local_step_generation == 0
+    assert full_parameter_rank_state(actor).exported_local_step_generation == 0
+    assert full_parameter_rank_state(actor).scheduler_anchor_steps == 1
     assert backups == ["actor"]
     assert anchor.policy_version == 0
 
@@ -372,7 +385,8 @@ def test_local_step_generation_keeps_global_base_until_complete_apply(monkeypatc
 
 @pytest.mark.parametrize(
     ("role", "expected_optimizer_steps"),
-    (("actor", 2), ("critic", 6)),
+    # Upstream has no critic-epochs knob: a critic steps as often as the actor.
+    (("actor", 2), ("critic", 2)),
 )
 def test_local_step_receipt_uses_role_aware_optimizer_progress(
     monkeypatch,
@@ -388,8 +402,7 @@ def test_local_step_receipt_uses_role_aware_optimizer_progress(
             lora_rank=0,
             lora_adapter_path=None,
             num_steps_per_rollout=2,
-            num_critic_epochs=3,
-            global_batch_size=4,
+            backend=_backend(global_batch_size=4),
         ),
         optimizer=SimpleNamespace(
             optimizer=SimpleNamespace(
@@ -440,7 +453,7 @@ def test_local_step_receipt_rejects_normal_without_scheduler_progress(monkeypatc
             lora_rank=0,
             lora_adapter_path=None,
             num_steps_per_rollout=1,
-            global_batch_size=1,
+            backend=_backend(global_batch_size=1),
         ),
         optimizer=SimpleNamespace(optimizer=SimpleNamespace(param_groups=[{"params": masters}], state={})),
         opt_param_scheduler=SimpleNamespace(num_steps=0),
@@ -458,7 +471,7 @@ def test_local_step_receipt_rejects_normal_without_scheduler_progress(monkeypatc
             base_policy_version=0,
             rollout_id=0,
         )
-    assert actor._external_full_local_step_generation == 0
+    assert full_parameter_rank_state(actor).local_step_generation == 0
 
 
 def test_export_rejects_optimizer_progress_without_a_receipt(monkeypatch):
@@ -483,7 +496,7 @@ def test_tracking_initialization_is_atomic_when_scheduler_state_is_missing():
     with pytest.raises(RuntimeError, match="scheduler progress"):
         initialize_full_parameter_tracking(actor, 0)
 
-    assert not hasattr(actor, "_external_full_policy_version")
+    assert full_parameter_rank_state(actor).policy_version is None
 
 
 def test_initial_policy_version_follows_effective_train_loop_start():
@@ -527,7 +540,7 @@ def test_local_step_receipt_does_not_advance_when_topology_proof_fails(
             lora_rank=0,
             lora_adapter_path=None,
             num_steps_per_rollout=1,
-            global_batch_size=1,
+            backend=_backend(global_batch_size=1),
         ),
         optimizer=SimpleNamespace(optimizer=SimpleNamespace(param_groups=[{"params": masters}], state={})),
         opt_param_scheduler=SimpleNamespace(num_steps=0),
@@ -551,8 +564,8 @@ def test_local_step_receipt_does_not_advance_when_topology_proof_fails(
             rollout_id=0,
         )
 
-    assert actor._external_full_local_step_generation == 0
-    assert actor._external_full_last_local_rollout_id is None
+    assert full_parameter_rank_state(actor).local_step_generation == 0
+    assert full_parameter_rank_state(actor).last_local_rollout_id is None
 
 
 class _FakeRay:
@@ -585,7 +598,7 @@ def _chunked_actor(monkeypatch):
             lora_rank=0,
             lora_adapter_path=None,
             num_steps_per_rollout=1,
-            global_batch_size=1,
+            backend=_backend(global_batch_size=1),
         ),
         optimizer=SimpleNamespace(
             optimizer=SimpleNamespace(
@@ -594,7 +607,8 @@ def _chunked_actor(monkeypatch):
             )
         ),
         opt_param_scheduler=SimpleNamespace(num_steps=0),
-        weights_backuper=SimpleNamespace(calls=[], backup=lambda role: actor.weights_backuper.calls.append(role)),
+        weights_backuper=SimpleNamespace(calls=[], backup=lambda role: actor.weights_backuper.calls.append(role), backup_tensors=lambda tag, ids: 0),
+        _enable_weight_backup=True,
     )
     monkeypatch.setattr(
         "miles.backends.megatron_utils.full_parameter_state._named_actor_parameters",
@@ -682,8 +696,8 @@ def test_chunked_export_splits_tensors_and_commit_preserves_optimizer(monkeypatc
     ) == len(named)
     actual = torch.cat([parameter.main_param.detach().reshape(-1) for spec in manifest.specs for name, parameter in named if name == spec.name])
     assert torch.equal(actual, expected)
-    assert actor._external_full_policy_version == 1
-    assert actor._external_full_local_step_generation == 0
+    assert full_parameter_rank_state(actor).policy_version == 1
+    assert full_parameter_rank_state(actor).local_step_generation == 0
     assert actor.weights_backuper.calls == ["actor"]
     assert {id(parameter): tuple(id(value) for value in state.values()) for parameter, state in optimizer_state.items()} == before_optimizer_ids
     with pytest.raises(RuntimeError, match="unfinalized"):
@@ -754,7 +768,7 @@ def test_chunked_partial_commit_retries_same_token_from_immutable_refs(monkeypat
             commit_token="commit-retry",
             ray_module=fake_ray,
         )
-    assert hasattr(actor, "_external_full_parameter_prepared_cut")
+    assert full_parameter_rank_state(actor).prepared_cut is not None
     with pytest.raises(RuntimeError, match="committing"):
         abort_prepared_full_parameter_shard(
             actor,
@@ -832,7 +846,7 @@ def test_chunked_prepare_rejects_corrupt_late_chunk_before_mutation(monkeypatch)
             ray_module=fake_ray,
         )
 
-    assert not hasattr(actor, "_external_full_parameter_prepared_cut")
+    assert full_parameter_rank_state(actor).prepared_cut is None
     assert all(torch.equal(parameter.main_param, value) for (_name, parameter), value in zip(named, before, strict=True))
 
 
@@ -939,7 +953,7 @@ def test_chunked_commit_rejects_boundary_drift_before_mutation(monkeypatch):
 def test_owner_plan_requires_canonical_exact_spec_coverage(monkeypatch):
     actor, _named, _optimizer_state, manifest, _plan = _chunked_actor(monkeypatch)
     other, _named, _optimizer_state, other_manifest, _plan = _chunked_actor(monkeypatch)
-    delattr(other, "_external_full_parameter_fragment_plan")
+    full_parameter_rank_state(other).fragment_plan = None
     names = tuple(spec.wire_name for spec in manifest.specs)
     missing = FullParameterOwnerFragmentPlan(
         topology=manifest.topology,
@@ -981,7 +995,7 @@ def test_owner_plan_requires_canonical_exact_spec_coverage(monkeypatch):
     )
     with pytest.raises(RuntimeError, match="canonical spec order"):
         install_full_parameter_fragment_plan(other, split_reordered)
-    assert actor._external_full_parameter_fragment_plan is not None
+    assert full_parameter_rank_state(actor).fragment_plan is not None
 
 
 def test_chunked_export_rejects_unbounded_ray_objects(monkeypatch):
@@ -1139,10 +1153,11 @@ def _distopt_actor(monkeypatch, *, mode: str):
         shard_float16_groups=[bf16_views or [first.detach().view(-1), second.detach().view(-1)]],
     )
     actor = SimpleNamespace(
-        args=SimpleNamespace(full_parameter_lora_hybrid=False, lora_rank=0, lora_adapter_path=None, num_steps_per_rollout=1, global_batch_size=1),
+        args=SimpleNamespace(full_parameter_lora_hybrid=False, lora_rank=0, lora_adapter_path=None, num_steps_per_rollout=1, backend=_backend(global_batch_size=1)),
         optimizer=wrapper,
         opt_param_scheduler=SimpleNamespace(num_steps=0),
-        weights_backuper=SimpleNamespace(backup=lambda role: None),
+        weights_backuper=SimpleNamespace(backup=lambda role: None, backup_tensors=lambda tag, ids: 0),
+        _enable_weight_backup=True,
         _last_rollout_id=0,
     )
     monkeypatch.setattr(
@@ -1296,7 +1311,7 @@ def test_plan_hash_of_whole_parameter_plans_is_unchanged():
 
 def test_split_parameter_round_trips_through_chunked_commit(monkeypatch):
     actor, named, _optimizer_state, manifest, _plan = _chunked_actor(monkeypatch)
-    delattr(actor, "_external_full_parameter_fragment_plan")
+    full_parameter_rank_state(actor).fragment_plan = None
     plan = _split_plan(manifest)
     assert install_full_parameter_fragment_plan(actor, plan) == 3
     fake_ray = _FakeRay()
@@ -1319,7 +1334,7 @@ def test_split_parameter_round_trips_through_chunked_commit(monkeypatch):
 @pytest.mark.parametrize("halves", [((0, 3), (4, 6)), ((0, 3), (3, 5)), ((3, 6), (0, 3))])
 def test_split_parameter_ranges_must_tile_in_order(monkeypatch, halves):
     actor, _named, _optimizer_state, manifest, _plan = _chunked_actor(monkeypatch)
-    delattr(actor, "_external_full_parameter_fragment_plan")
+    full_parameter_rank_state(actor).fragment_plan = None
     with pytest.raises(RuntimeError, match="tile|exactly cover|canonical"):
         install_full_parameter_fragment_plan(actor, _split_plan(manifest, halves=halves))
 
@@ -1359,7 +1374,7 @@ def test_rebase_after_restore_lets_first_apply_through(monkeypatch):
     assert prepare_full_parameter_chunked_shard(actor, target, commit_token="commit-1", ray_module=fake_ray) == len(named)
     assert commit_prepared_full_parameter_shard(actor, commit_token="commit-1", ray_module=fake_ray) == len(named)
     assert finalize_full_parameter_commit(actor, commit_token="commit-1") == len(named)
-    assert actor._external_full_scheduler_anchor_steps == 7
+    assert full_parameter_rank_state(actor).scheduler_anchor_steps == 7
     # Later progress still needs a receipt.
     actor.opt_param_scheduler.num_steps = 8
     with pytest.raises(RuntimeError, match="no local-step receipt"):
@@ -1376,6 +1391,6 @@ def test_rebase_refuses_pending_local_progress_or_commit(monkeypatch):
     with pytest.raises(RuntimeError, match="prepared full-parameter cut"):
         rebase_full_parameter_scheduler_anchor(actor, reason="peer snapshot restore")
     abort_prepared_full_parameter_shard(actor, commit_token="commit-1")
-    actor._external_full_local_step_generation = 1
+    full_parameter_rank_state(actor).local_step_generation = 1
     with pytest.raises(RuntimeError, match="discard local-step progress"):
         rebase_full_parameter_scheduler_anchor(actor, reason="peer snapshot restore")

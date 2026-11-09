@@ -11,15 +11,14 @@ import struct
 import threading
 import time
 import warnings
-from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, replace
 
 import torch
 
 from miles.backends.megatron_utils import full_parameter_sharded_masters as sharded
 from miles.backends.megatron_utils.full_parameter_chunk_reader import CommitChunkReader, prefetch_enabled
-
 
 _ROLE = re.compile(r"[a-z][a-z0-9_-]{0,31}\Z")
 _PARAMETER_NAME = re.compile(r"[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,511}\Z")
@@ -39,6 +38,47 @@ _LAZY_FRAGMENT_DOMAIN = b"miles-full-parameter-lazy-fragment-v1\0"
 _SHARD_IDENTITY_DOMAIN = b"miles-full-parameter-chunked-shard-identity-v1\0"
 
 
+@dataclass
+class FullParameterRankState:
+    """Per-rank bookkeeping of the full-parameter transport (yeto DiLoCo).
+
+    Lives on the train actor as ``actor.full_parameter``; every field is
+    ``None`` until the corresponding phase sets it.  ``policy_version`` is
+    the transport's transaction number (the installed global base), not the
+    published weight version (the model companion ``weight_version``).
+    """
+
+    policy_version: int | None = None
+    local_step_generation: int | None = None
+    exported_local_step_generation: int | None = None
+    scheduler_anchor_steps: int | None = None
+    scheduler_rebase_reason: str | None = None
+    last_local_rollout_id: int | None = None
+    last_local_step_receipt: object | None = None
+    fragment_plan: object | None = None
+    owner_map: object | None = None
+    resident: object | None = None
+    replica_plan: object | None = None
+    replica_resident: object | None = None
+    prepared_cut: object | None = None
+    committed_cut: object | None = None
+    last_finalized_cut: object | None = None
+    apply_stats: dict | None = None
+
+
+def full_parameter_rank_state(actor) -> FullParameterRankState:
+    """The actor's full-parameter state, created on first use."""
+
+    try:
+        state = actor.full_parameter
+    except AttributeError:
+        state = None
+    if not isinstance(state, FullParameterRankState):
+        state = FullParameterRankState()
+        actor.full_parameter = state
+    return state
+
+
 @dataclass(frozen=True, order=True)
 class FullParameterTopology:
     tp_rank: int
@@ -54,14 +94,14 @@ class FullParameterTopology:
 
     def __post_init__(self) -> None:
         for prefix in ("tp", "pp", "ep", "cp", "dp"):
-            rank = getattr(self, f"{prefix}_rank")
-            size = getattr(self, f"{prefix}_size")
+            rank = getattr(self, f"{prefix}_rank")  # config-access-exempt: attribute selected at runtime from field name
+            size = getattr(self, f"{prefix}_size")  # config-access-exempt: attribute selected at runtime from field name
             if isinstance(rank, bool) or not isinstance(rank, int) or isinstance(size, bool) or not isinstance(size, int) or size < 1 or not 0 <= rank < size:
                 raise ValueError(f"invalid {prefix} topology coordinates")
 
     @property
     def shard_id(self) -> str:
-        return ".".join(f"{prefix}{getattr(self, f'{prefix}_rank')}-of-{getattr(self, f'{prefix}_size')}" for prefix in ("tp", "pp", "ep", "cp", "dp"))
+        return ".".join(f"{prefix}{getattr(self, f'{prefix}_rank')}-of-{getattr(self, f'{prefix}_size')}" for prefix in ("tp", "pp", "ep", "cp", "dp"))  # config-access-exempt: attribute selected at runtime from field name
 
 
 @dataclass(frozen=True, order=True)
@@ -134,7 +174,7 @@ class FullParameterLocalStepReceipt:
             "scheduler_start_steps",
             "scheduler_end_steps",
         ):
-            value = getattr(self, name)
+            value = getattr(self, name)  # config-access-exempt: attribute selected at runtime from field name
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"invalid full-parameter local-step field: {name}")
         if self.local_step_generation < 1 or self.optimizer_steps < 1:
@@ -178,7 +218,7 @@ class FullParameterOptimizerState:
             "optimizer_state_scalar_count",
             "model_master_parameter_count",
         ):
-            value = getattr(self, name)
+            value = getattr(self, name)  # config-access-exempt: attribute selected at runtime from field name
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"invalid optimizer-state field: {name}")
         if self.populated_parameter_count < 1:
@@ -224,14 +264,14 @@ class FullParameterReplication:
     def __post_init__(self) -> None:
         _validate_non_negative_integer(self.global_rank, "global rank")
         for name in ("dense_ranks", "expert_ranks"):
-            ranks = getattr(self, name)
+            ranks = getattr(self, name)  # config-access-exempt: attribute selected at runtime from field name
             if ranks is None and name == "expert_ranks":
                 continue
             if self.global_rank not in _validate_rank_tuple(ranks, name.replace("_", " ")):
                 raise ValueError(f"full-parameter {name.replace('_', ' ')} do not contain this rank")
 
     def ranks_for(self, name: str, parameter: torch.Tensor) -> tuple[int, ...]:
-        if getattr(parameter, "allreduce", True):
+        if getattr(parameter, "allreduce", True):  # config-access-exempt: allreduce is optional expert-parallel tensor metadata
             return self.dense_ranks
         if self.expert_ranks is None:
             raise RuntimeError(f"{name!r} is an expert parameter but Megatron has no expert data-parallel group")
@@ -327,7 +367,7 @@ class FullParameterPartitionReport:
             raise ValueError(f"invalid full-parameter role: {self.role!r}")
         _validate_non_negative_integer(self.global_rank, "global rank")
         for name in ("dense_ranks", "tensor_parallel_ranks"):
-            if self.global_rank not in _validate_rank_tuple(getattr(self, name), name.replace("_", " ")):
+            if self.global_rank not in _validate_rank_tuple(getattr(self, name), name.replace("_", " ")):  # config-access-exempt: attribute selected at runtime from field name
                 raise ValueError(f"full-parameter {name.replace('_', ' ')} do not contain this rank")
         if self.expert_ranks is not None and self.global_rank not in _validate_rank_tuple(self.expert_ranks, "expert ranks"):
             raise ValueError("full-parameter expert ranks do not contain this rank")
@@ -506,7 +546,7 @@ class FullParameterChunkDescriptor:
 
     def __post_init__(self) -> None:
         for name in ("chunk_index", "flat_offset", "numel"):
-            value = getattr(self, name)
+            value = getattr(self, name)  # config-access-exempt: attribute selected at runtime from field name
             if isinstance(value, bool) or not isinstance(value, int) or value < (1 if name == "numel" else 0):
                 raise ValueError(f"invalid full-parameter chunk field: {name}")
         if not _SHA256.fullmatch(self.payload_hash):
@@ -708,11 +748,11 @@ def _resolve_master(
     ``full_parameter_sharded_masters`` instead.
     """
 
-    sharded = bool(getattr(parameter, "main_param_sharded", False))
-    owned = getattr(parameter, "main_param", None)
+    sharded = bool(getattr(parameter, "main_param_sharded", False))  # config-access-exempt: main_param_sharded is optional backend-attached tensor metadata
+    owned = getattr(parameter, "main_param", None)  # config-access-exempt: main_param is optional backend-attached tensor metadata
     fp32 = owned
     if owned is None:
-        distributed = getattr(optimizer_owned_parameter_ids, "distributed_masters", {})
+        distributed = optimizer_owned_parameter_ids.distributed_masters if isinstance(optimizer_owned_parameter_ids, _OptimizerOwnedParameters) else {}
         if id(parameter) in distributed:
             owned, fp32 = distributed[id(parameter)]
             sharded = True
@@ -845,8 +885,6 @@ def _replica_owners(
     return owners
 
 
-_OWNER_MAP_ATTRIBUTE = "_external_full_parameter_owner_map"
-
 
 def _installed_owners(
     named_parameters: Sequence[tuple[str, torch.nn.Parameter]],
@@ -954,7 +992,7 @@ def _actor_local_layout(actor, *, role: str, topology: FullParameterTopology) ->
         topology=topology,
         replication=full_parameter_replication(),
         optimizer_owned_parameter_ids=optimizer_owned,
-        owner_map=getattr(actor, _OWNER_MAP_ATTRIBUTE, None),
+        owner_map=full_parameter_rank_state(actor).owner_map,
     )
     return named_parameters, optimizer_owned, layout
 
@@ -1197,8 +1235,6 @@ def _deferred_fragment_ids(state: FullParameterChunkedShardState) -> frozenset[i
 
 
 _RESIDENT_SKIP_ENV = "MILES_FULL_PARAMETER_SKIP_RESIDENT"
-# The owner fragments a rank's data-parallel replicas hold (``full_parameter_replicas``).
-_REPLICA_RESIDENT_ATTRIBUTE = "_external_full_parameter_replica_resident"
 
 
 def _resident_skip_enabled() -> bool:
@@ -1211,10 +1247,8 @@ def forget_full_parameter_resident_fragments(actor) -> None:
     Call after anything writes optimizer masters outside the chunked
     export/commit path (a checkpoint or peer snapshot restore)."""
 
-    actor._external_full_parameter_resident = None
-    setattr(actor, _REPLICA_RESIDENT_ATTRIBUTE, None)
-
-
+    full_parameter_rank_state(actor).resident = None
+    full_parameter_rank_state(actor).replica_resident = None
 def _record_resident_fragments(
     actor,
     *,
@@ -1225,7 +1259,7 @@ def _record_resident_fragments(
     fragments: Sequence[FullParameterFragmentDescriptor],
     lazy_fragment_ids: frozenset[int] = frozenset(),
 ) -> None:
-    actor._external_full_parameter_resident = _ResidentFullParameterFragments(
+    full_parameter_rank_state(actor).resident = _ResidentFullParameterFragments(
         parameter_layout_hash=parameter_layout_hash,
         plan_hash=plan_hash,
         policy_version=policy_version,
@@ -1247,7 +1281,7 @@ def _resident_fragment_ids(
     ``honor_kill_switch=False``: ignore ``MILES_FULL_PARAMETER_SKIP_RESIDENT``
     (deferred fragments have no stored bytes; residency is their only source)."""
 
-    record = getattr(actor, "_external_full_parameter_resident", None)
+    record = full_parameter_rank_state(actor).resident
     if (honor_kill_switch and not _resident_skip_enabled()) or not isinstance(record, _ResidentFullParameterFragments):
         return frozenset(), None
     installed, generation, exported, _anchor = _require_full_parameter_tracking(actor)
@@ -1274,7 +1308,7 @@ def _lazy_fragment_ids(actor, state: FullParameterChunkedShardState) -> frozense
     Only the label is compared here; whether the record still describes the
     masters is :func:`_resident_fragment_ids`' check."""
 
-    record = getattr(actor, "_external_full_parameter_resident", None)
+    record = full_parameter_rank_state(actor).resident
     if not isinstance(record, _ResidentFullParameterFragments) or not record.lazy_fragment_ids:
         return frozenset()
     return frozenset(
@@ -1286,9 +1320,9 @@ def _lazy_fragment_ids(actor, state: FullParameterChunkedShardState) -> frozense
 
 
 def _note_apply_stats(actor, phase: str, **values) -> None:
-    stats = dict(getattr(actor, "_external_full_parameter_apply_stats", None) or {})
+    stats = dict(full_parameter_rank_state(actor).apply_stats or {})
     stats[phase] = values
-    actor._external_full_parameter_apply_stats = stats
+    full_parameter_rank_state(actor).apply_stats = stats
 
 
 def full_parameter_chunked_shard_identity(
@@ -1480,7 +1514,7 @@ def require_full_parameter_actor(args, action: str) -> None:
         raise RuntimeError(
             f"full-parameter DiLoCo cannot {action} a LoRA actor without --full-parameter-lora-hybrid"
         )
-    if getattr(args, "lora_base_cpu_backup", False):
+    if args.lora_base_cpu_backup:
         raise RuntimeError("--full-parameter-lora-hybrid is incompatible with --lora-base-cpu-backup")
 
 
@@ -1525,7 +1559,7 @@ def _optimizer_owned_parameter_ids(optimizer) -> frozenset[int]:
     bases = _optimizer_bases(optimizer)
     owned: set[int] = set()
     for base in bases:
-        groups = getattr(base, "param_groups", None)
+        groups = getattr(base, "param_groups", None)  # config-access-exempt: base optimizers are duck-typed torch optimizers
         if not isinstance(groups, list):
             raise RuntimeError("full-parameter optimizer has no parameter groups")
         for group in groups:
@@ -1545,18 +1579,18 @@ def _optimizer_owned_parameter_ids(optimizer) -> frozenset[int]:
         owned,
         _distributed_masters(optimizer),
         distributed_views=_distributed_views(optimizer),
-        hybrid_copies=any(getattr(base, "param_to_inner_param", None) for base in bases),
+        hybrid_copies=any(getattr(base, "param_to_inner_param", None) for base in bases),  # config-access-exempt: param_to_inner_param exists only on HybridDeviceOptimizer
     )
 
 
 def _optimizer_wrappers(optimizer) -> tuple[object, ...]:
-    wrappers = getattr(optimizer, "chained_optimizers", None)
+    wrappers = getattr(optimizer, "chained_optimizers", None)  # config-access-exempt: chained_optimizers exists only on Megatron ChainedOptimizer
     return tuple((optimizer,) if wrappers is None else wrappers)
 
 
 def _paired_groups(wrapper, model_attribute: str, shard_attribute: str):
-    model_groups = getattr(wrapper, model_attribute, None)
-    shard_groups = getattr(wrapper, shard_attribute, None)
+    model_groups = getattr(wrapper, model_attribute, None)  # config-access-exempt: distributed-optimizer group attribute selected by name
+    shard_groups = getattr(wrapper, shard_attribute, None)  # config-access-exempt: distributed-optimizer group attribute selected by name
     if model_groups is None and shard_groups is None:
         return
     if model_groups is None or shard_groups is None:
@@ -1578,9 +1612,9 @@ def _distributed_masters(optimizer) -> dict[int, tuple[torch.Tensor, torch.Tenso
     for wrapper in _optimizer_wrappers(optimizer):
         for model_param, shard in _paired_groups(wrapper, "model_fp32_groups", "shard_fp32_groups"):
             add(model_param, (shard, shard))
-        inner = getattr(getattr(wrapper, "optimizer", None), "param_to_inner_param", None)
+        inner = getattr(getattr(wrapper, "optimizer", None), "param_to_inner_param", None)  # config-access-exempt: param_to_inner_param exists only on a HybridDeviceOptimizer base
         for model_param, shard in _paired_groups(wrapper, "model_float16_groups", "shard_float16_groups"):
-            if getattr(model_param, "main_param", None) is not None:
+            if getattr(model_param, "main_param", None) is not None:  # config-access-exempt: main_param is optional backend-attached tensor metadata
                 continue  # read through main_param
             fp32 = None if inner is None or shard is None else inner.get(shard)
             if fp32 is not None and fp32.dtype == torch.float32:
@@ -1599,11 +1633,11 @@ def _distributed_views(optimizer) -> dict[int, tuple[torch.Tensor | None, torch.
 
     views: dict[int, tuple[torch.Tensor | None, torch.Tensor, torch.Tensor | None]] = {}
     for wrapper in _optimizer_wrappers(optimizer):
-        inner = getattr(getattr(wrapper, "optimizer", None), "param_to_inner_param", None) or {}
+        inner = getattr(getattr(wrapper, "optimizer", None), "param_to_inner_param", None) or {}  # config-access-exempt: param_to_inner_param exists only on a HybridDeviceOptimizer base
         for model_param, view in _paired_groups(wrapper, "model_fp32_groups", "shard_fp32_groups"):
             views[id(model_param)] = (view, view, view)
         for model_param, view in _paired_groups(wrapper, "model_float16_groups", "shard_float16_groups"):
-            main = getattr(model_param, "main_param", None)
+            main = getattr(model_param, "main_param", None)  # config-access-exempt: main_param is optional backend-attached tensor metadata
             if main is not None:
                 views[id(model_param)] = (view, main, main)
             else:
@@ -1633,7 +1667,7 @@ def _propagate_master_writes(actor, *, owned_ids: frozenset[int] | set[int] | No
 
     pairs = 0
     for base in _optimizer_bases(actor.optimizer):
-        inner = getattr(base, "param_to_inner_param", None)
+        inner = getattr(base, "param_to_inner_param", None)  # config-access-exempt: param_to_inner_param exists only on HybridDeviceOptimizer
         if inner is None:
             continue
         for owned, copy in inner.items():
@@ -1652,7 +1686,7 @@ def _propagate_master_writes(actor, *, owned_ids: frozenset[int] | set[int] | No
 def _optimizer_bases(optimizer) -> tuple[object, ...]:
     bases = []
     for wrapper in _optimizer_wrappers(optimizer):
-        base = getattr(wrapper, "optimizer", wrapper)
+        base = getattr(wrapper, "optimizer", wrapper)  # config-access-exempt: Megatron optimizer wrappers expose .optimizer; a bare torch optimizer is its own base
         if any(base is existing for existing in bases):
             raise RuntimeError("full-parameter optimizer base is duplicated")
         bases.append(base)
@@ -1682,7 +1716,7 @@ def full_parameter_shard_manifest(
         topology=topology,
         replication=replication,
         optimizer_owned_parameter_ids=optimizer_owned,
-        owner_map=getattr(actor, _OWNER_MAP_ATTRIBUTE, None),
+        owner_map=full_parameter_rank_state(actor).owner_map,
     )
     if layout.ranges is not None:
         sharded.refuse_unsupported_args(actor.args)
@@ -1715,13 +1749,13 @@ def _parameter_partition(name: str, parameter: torch.nn.Parameter, *, gated: boo
     factory), so its local rows are two blocks."""
 
     shape = tuple(int(dimension) for dimension in parameter.shape)
-    expert = not bool(getattr(parameter, "allreduce", True))
-    if expert or not bool(getattr(parameter, "tensor_model_parallel", False)):
+    expert = not bool(getattr(parameter, "allreduce", True))  # config-access-exempt: allreduce is optional expert-parallel tensor metadata
+    if expert or not bool(getattr(parameter, "tensor_model_parallel", False)):  # config-access-exempt: tensor_model_parallel is optional tensor-parallel metadata
         return FullParameterPartition(name=name, shape=shape, expert=expert)
-    if int(getattr(parameter, "partition_stride", 1)) != 1:
+    if int(getattr(parameter, "partition_stride", 1)) != 1:  # config-access-exempt: partition_stride is optional tensor-parallel metadata
         raise RuntimeError(f"{name!r} has a strided tensor-parallel partition; a shape-free layout needs stride 1")
-    dim = int(getattr(parameter, "partition_dim", 0))
-    sizes = getattr(parameter, "partition_sizes", None)
+    dim = int(getattr(parameter, "partition_dim", 0))  # config-access-exempt: partition_dim is optional tensor-parallel metadata
+    sizes = getattr(parameter, "partition_sizes", None)  # config-access-exempt: partition_sizes is optional Mamba tensor-parallel metadata
     if sizes is None and gated and dim == 0 and name.endswith("linear_fc1.weight") and shape[0] % 2 == 0:
         sizes = (shape[0] // 2, shape[0] // 2)
     sizes = (shape[dim],) if sizes is None else tuple(int(size) for size in sizes)
@@ -1751,7 +1785,7 @@ def full_parameter_partition_report(
         expert_tensor_parallel_size=expert_tp,
         parameters=tuple(
             sorted(
-                _parameter_partition(name, parameter, gated=bool(getattr(actor.args, "swiglu", False)))
+                _parameter_partition(name, parameter, gated=bool(actor.args.backend.swiglu))
                 for name, parameter in named_parameters
             )
         ),
@@ -1771,17 +1805,17 @@ def install_full_parameter_owner_map(
     is a no-op; another map is refused once a plan is installed."""
 
     require_full_parameter_actor(actor.args, "describe")
-    if getattr(actor, "_external_full_parameter_prepared_cut", None) is not None:
+    if full_parameter_rank_state(actor).prepared_cut is not None:
         raise RuntimeError("cannot change full-parameter owners with a prepared cut")
     normalized = {
         str(name): (int(owner), tuple(int(rank) for rank in writers)) for name, (owner, writers) in owner_map.items()
     }
     named_parameters, _optimizer_owned = _actor_parameter_context(actor)
     _installed_owners(tuple(sorted(named_parameters, key=lambda value: value[0])), full_parameter_replication(), normalized)
-    installed = getattr(actor, _OWNER_MAP_ATTRIBUTE, None)
-    if installed is not None and installed != normalized and getattr(actor, "_external_full_parameter_fragment_plan", None) is not None:
+    installed = full_parameter_rank_state(actor).owner_map
+    if installed is not None and installed != normalized and full_parameter_rank_state(actor).fragment_plan is not None:
         raise RuntimeError("full-parameter owners cannot change after the fragment plan is installed")
-    setattr(actor, _OWNER_MAP_ATTRIBUTE, normalized)
+    full_parameter_rank_state(actor).owner_map = normalized
     return len(normalized)
 
 
@@ -1880,21 +1914,21 @@ def install_full_parameter_fragment_plan(
 
     from miles.backends.megatron_utils import full_parameter_replicas as replicas  # import cycle
 
-    if getattr(actor, "_external_full_parameter_prepared_cut", None) is not None:
+    if full_parameter_rank_state(actor).prepared_cut is not None:
         raise RuntimeError("cannot change a full-parameter plan with a prepared cut")
     manifest = full_parameter_shard_manifest(actor, role=role)
     _validate_fragment_plan_against_manifest(plan, manifest)
     master_ranks = None
-    if getattr(actor, _OWNER_MAP_ATTRIBUTE, None) is not None:
+    if full_parameter_rank_state(actor).owner_map is not None:
         replication = full_parameter_replication()
         named_parameters, _optimizer_owned = _actor_parameter_context(actor)
         master_ranks = {name: replication.ranks_for(name, parameter) for name, parameter in named_parameters}
     replica_plan = replicas.build_replica_plan(manifest, plan, tuple(replica_sources), master_ranks=master_ranks)
-    installed = getattr(actor, "_external_full_parameter_fragment_plan", None)
+    installed = full_parameter_rank_state(actor).fragment_plan
     if installed is not None and installed != plan:
         raise RuntimeError("full-parameter owner plan is already installed")
     replicas.install_replica_plan(actor, replica_plan)
-    actor._external_full_parameter_fragment_plan = plan
+    full_parameter_rank_state(actor).fragment_plan = plan
     return len(plan.fragments)
 
 
@@ -1906,7 +1940,7 @@ def _require_installed_layout(actor, *, role: str):
 
     from miles.backends.megatron_utils import full_parameter_replicas as replicas  # import cycle
 
-    plan = getattr(actor, "_external_full_parameter_fragment_plan", None)
+    plan = full_parameter_rank_state(actor).fragment_plan
     if not isinstance(plan, FullParameterOwnerFragmentPlan):
         raise RuntimeError("full-parameter owner plan is not installed")
     require_full_parameter_actor(actor.args, "describe")
@@ -1919,7 +1953,7 @@ def _require_installed_layout(actor, *, role: str):
         topology=topology,
         replication=replication,
         optimizer_owned_parameter_ids=optimizer_owned,
-        owner_map=getattr(actor, _OWNER_MAP_ATTRIBUTE, None),
+        owner_map=full_parameter_rank_state(actor).owner_map,
     )
     manifest = _manifest_from_layout(layout, topology=topology, role=role, global_rank=replication.global_rank)
     _validate_fragment_plan_against_manifest(plan, manifest)
@@ -1991,14 +2025,10 @@ def full_parameter_optimizer_state(
 
     require_full_parameter_actor(actor.args, "inspect")
     assert_full_parameter_boundary_clear(actor)
-    installed = getattr(actor, "_external_full_policy_version", None)
-    local_step_generation = getattr(
-        actor,
-        "_external_full_local_step_generation",
-        None,
-    )
-    last_rollout_id = getattr(actor, "_last_rollout_id", None)
-    scheduler_num_steps = getattr(actor.opt_param_scheduler, "num_steps", None)
+    installed = full_parameter_rank_state(actor).policy_version
+    local_step_generation = full_parameter_rank_state(actor).local_step_generation
+    last_rollout_id = actor._last_rollout_id
+    scheduler_num_steps = actor.opt_param_scheduler.num_steps
     for name, value in (
         ("installed policy version", installed),
         ("local-step generation", local_step_generation),
@@ -2028,7 +2058,7 @@ def full_parameter_optimizer_state(
     tensor_count = 0
     scalar_count = 0
     for base in _optimizer_bases(actor.optimizer):
-        states = getattr(base, "state", None)
+        states = getattr(base, "state", None)  # config-access-exempt: base optimizers are duck-typed torch optimizers
         if not isinstance(states, Mapping):
             raise RuntimeError("full-parameter optimizer state is unavailable")
         for parameter, state in states.items():
@@ -2133,7 +2163,7 @@ def _validate_model_matches_masters(
 
 
 def _scheduler_num_steps(actor) -> int:
-    value = getattr(actor.opt_param_scheduler, "num_steps", None)
+    value = actor.opt_param_scheduler.num_steps
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise RuntimeError("full-parameter scheduler progress is unavailable")
     return value
@@ -2144,23 +2174,16 @@ def _optimizer_steps_per_local_round(
     *,
     role: str = "actor",
 ) -> tuple[int, int]:
-    optimizer_steps = getattr(actor.args, "num_steps_per_rollout", None)
-    global_batch_size = getattr(actor.args, "global_batch_size", None)
+    optimizer_steps = actor.args.num_steps_per_rollout
+    global_batch_size = actor.args.backend.global_batch_size
     for name, value in (
         ("optimizer steps per rollout", optimizer_steps),
         ("global batch size", global_batch_size),
     ):
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise RuntimeError(f"full-parameter {name} is invalid")
-    if role == "critic":
-        critic_epochs = getattr(actor.args, "num_critic_epochs", 1)
-        if (
-            isinstance(critic_epochs, bool)
-            or not isinstance(critic_epochs, int)
-            or critic_epochs < 1
-        ):
-            raise RuntimeError("full-parameter critic epochs is invalid")
-        optimizer_steps *= critic_epochs
+    # A critic steps once per rollout here: upstream has no critic-epochs knob, so
+    # the critic's optimizer progress per local round equals the actor's.
     return optimizer_steps, optimizer_steps * global_batch_size
 
 
@@ -2183,7 +2206,7 @@ def full_parameter_initial_policy_version(args, loaded_rollout_id: int) -> int:
 
     if isinstance(loaded_rollout_id, bool) or not isinstance(loaded_rollout_id, int) or loaded_rollout_id < -1:
         raise RuntimeError("full-parameter loaded rollout ID is invalid")
-    start = getattr(args, "start_rollout_id", None)
+    start = args.start_rollout_id
     if start is None:
         return loaded_rollout_id + 1
     if isinstance(start, bool) or not isinstance(start, int) or start < 0:
@@ -2196,15 +2219,15 @@ def initialize_full_parameter_tracking(actor, policy_version: int) -> None:
 
     if isinstance(policy_version, bool) or not isinstance(policy_version, int) or policy_version < 0:
         raise RuntimeError("full-parameter initial policy version is invalid")
-    installed = getattr(actor, "_external_full_policy_version", None)
+    installed = full_parameter_rank_state(actor).policy_version
     if installed is None:
         anchor = _scheduler_num_steps(actor)
-        actor._external_full_policy_version = policy_version
-        actor._external_full_local_step_generation = 0
-        actor._external_full_exported_local_step_generation = 0
-        actor._external_full_scheduler_anchor_steps = anchor
-        actor._external_full_last_local_rollout_id = None
-        actor._external_full_last_local_step_receipt = None
+        full_parameter_rank_state(actor).policy_version = policy_version
+        full_parameter_rank_state(actor).local_step_generation = 0
+        full_parameter_rank_state(actor).exported_local_step_generation = 0
+        full_parameter_rank_state(actor).scheduler_anchor_steps = anchor
+        full_parameter_rank_state(actor).last_local_rollout_id = None
+        full_parameter_rank_state(actor).last_local_step_receipt = None
         forget_full_parameter_resident_fragments(actor)
         return
     installed, _generation, _exported, _anchor = _require_full_parameter_tracking(actor)
@@ -2229,11 +2252,11 @@ def rebase_full_parameter_scheduler_anchor(actor, *, reason: str) -> int:
     _installed, generation, exported, _anchor = _require_full_parameter_tracking(actor)
     if generation != 0 or exported != 0:
         raise RuntimeError("full-parameter scheduler rebase would discard local-step progress")
-    if getattr(actor, "_external_full_last_local_step_receipt", None) is not None:
+    if full_parameter_rank_state(actor).last_local_step_receipt is not None:
         raise RuntimeError("full-parameter scheduler rebase would discard a local-step receipt")
     anchor = _scheduler_num_steps(actor)
-    actor._external_full_scheduler_anchor_steps = anchor
-    actor._external_full_scheduler_rebase_reason = reason
+    full_parameter_rank_state(actor).scheduler_anchor_steps = anchor
+    full_parameter_rank_state(actor).scheduler_rebase_reason = reason
     # The restore that needs this rebase wrote the masters.
     forget_full_parameter_resident_fragments(actor)
     return anchor
@@ -2242,14 +2265,10 @@ def rebase_full_parameter_scheduler_anchor(actor, *, reason: str) -> int:
 def _require_full_parameter_tracking(actor) -> tuple[int, int, int, int]:
     """Return initialized tracking state without silently creating it."""
 
-    installed = getattr(actor, "_external_full_policy_version", None)
-    generation = getattr(actor, "_external_full_local_step_generation", None)
-    exported = getattr(
-        actor,
-        "_external_full_exported_local_step_generation",
-        None,
-    )
-    anchor = getattr(actor, "_external_full_scheduler_anchor_steps", None)
+    installed = full_parameter_rank_state(actor).policy_version
+    generation = full_parameter_rank_state(actor).local_step_generation
+    exported = full_parameter_rank_state(actor).exported_local_step_generation
+    anchor = full_parameter_rank_state(actor).scheduler_anchor_steps
     for name, value in (
         ("installed policy version", installed),
         ("local-step generation", generation),
@@ -2260,7 +2279,7 @@ def _require_full_parameter_tracking(actor) -> tuple[int, int, int, int]:
             raise RuntimeError(f"full-parameter {name} is unavailable")
     if exported > generation:
         raise RuntimeError("full-parameter exported generation is ahead of local progress")
-    last_rollout = getattr(actor, "_external_full_last_local_rollout_id", None)
+    last_rollout = full_parameter_rank_state(actor).last_local_rollout_id
     if last_rollout is not None and (isinstance(last_rollout, bool) or not isinstance(last_rollout, int) or last_rollout < 0):
         raise RuntimeError("full-parameter local rollout progress is unavailable")
     return installed, generation, exported, anchor
@@ -2269,9 +2288,9 @@ def _require_full_parameter_tracking(actor) -> tuple[int, int, int, int]:
 def assert_full_parameter_boundary_clear(actor) -> None:
     """Reject any operation that could observe an unresolved policy commit."""
 
-    if getattr(actor, "_external_full_parameter_prepared_cut", None) is not None:
+    if full_parameter_rank_state(actor).prepared_cut is not None:
         raise RuntimeError("a prepared full-parameter cut blocks boundary mutation until commit or abort")
-    if getattr(actor, "_external_full_parameter_committed_cut", None) is not None:
+    if full_parameter_rank_state(actor).committed_cut is not None:
         raise RuntimeError("an unfinalized full-parameter commit blocks boundary mutation")
 
 
@@ -2300,14 +2319,10 @@ def record_full_parameter_local_step(
     if not _ROLE.fullmatch(role):
         raise RuntimeError("full-parameter local-step role is invalid")
     installed, generation, _exported, anchor = _require_full_parameter_tracking(actor)
-    previous_rollout = actor._external_full_last_local_rollout_id
+    previous_rollout = full_parameter_rank_state(actor).last_local_rollout_id
     if installed != base_policy_version:
         raise RuntimeError("full-parameter local step has a stale global base")
-    previous_receipt = getattr(
-        actor,
-        "_external_full_last_local_step_receipt",
-        None,
-    )
+    previous_receipt = full_parameter_rank_state(actor).last_local_step_receipt
     if previous_receipt is not None:
         if not isinstance(previous_receipt, FullParameterLocalStepReceipt):
             raise RuntimeError("full-parameter local-step journal is malformed")
@@ -2315,7 +2330,7 @@ def record_full_parameter_local_step(
             if generation != previous_receipt.local_step_generation or previous_rollout != rollout_id or _scheduler_num_steps(actor) != previous_receipt.scheduler_end_steps:
                 raise RuntimeError("full-parameter local-step journal disagrees with actor")
             return previous_receipt
-    if isinstance(rollout_id, bool) or not isinstance(rollout_id, int) or rollout_id < 0 or getattr(actor, "_last_rollout_id", None) != rollout_id or (previous_rollout is not None and rollout_id <= previous_rollout):
+    if isinstance(rollout_id, bool) or not isinstance(rollout_id, int) or rollout_id < 0 or actor._last_rollout_id != rollout_id or (previous_rollout is not None and rollout_id <= previous_rollout):
         raise RuntimeError("full-parameter local step has invalid rollout progress")
     optimizer_steps, scheduler_increment = _optimizer_steps_per_local_round(
         actor,
@@ -2345,9 +2360,9 @@ def record_full_parameter_local_step(
         scheduler_start_steps=start,
         scheduler_end_steps=end,
     )
-    actor._external_full_local_step_generation = generation
-    actor._external_full_last_local_rollout_id = rollout_id
-    actor._external_full_last_local_step_receipt = receipt
+    full_parameter_rank_state(actor).local_step_generation = generation
+    full_parameter_rank_state(actor).last_local_rollout_id = rollout_id
+    full_parameter_rank_state(actor).last_local_step_receipt = receipt
     return receipt
 
 
@@ -2375,7 +2390,7 @@ def export_full_parameter_shard(
         named_parameters=named_parameters,
         optimizer_owned_parameter_ids=optimizer_owned,
     )
-    actor._external_full_exported_local_step_generation = local_step_generation
+    full_parameter_rank_state(actor).exported_local_step_generation = local_step_generation
     return state
 
 
@@ -2390,11 +2405,10 @@ def validate_full_parameter_shard(
     _validate_scheduler_tracking_congruence(actor, role=role)
     if state.local_step_generation != 0:
         raise RuntimeError("a global full-parameter cut cannot contain local steps")
-    installed = getattr(actor, "_external_full_policy_version", -1)
-    if getattr(actor, "_external_full_exported_local_step_generation", -1) != getattr(
-        actor,
-        "_external_full_local_step_generation",
-        -2,
+    rank_state = full_parameter_rank_state(actor)
+    installed = -1 if rank_state.policy_version is None else rank_state.policy_version
+    if rank_state.exported_local_step_generation is None or (
+        rank_state.exported_local_step_generation != rank_state.local_step_generation
     ):
         raise RuntimeError("full-parameter global apply has unexported local progress")
     if state.policy_version <= installed:
@@ -2420,11 +2434,10 @@ def apply_full_parameter_shard(
     _reject_prepared_full_parameter_boundary_mutation(actor)
     if state.local_step_generation != 0:
         raise RuntimeError("a global full-parameter cut cannot contain local steps")
-    installed = getattr(actor, "_external_full_policy_version", -1)
-    if getattr(actor, "_external_full_exported_local_step_generation", -1) != getattr(
-        actor,
-        "_external_full_local_step_generation",
-        -2,
+    rank_state = full_parameter_rank_state(actor)
+    installed = -1 if rank_state.policy_version is None else rank_state.policy_version
+    if rank_state.exported_local_step_generation is None or (
+        rank_state.exported_local_step_generation != rank_state.local_step_generation
     ):
         raise RuntimeError("full-parameter global apply has unexported local progress")
     if state.policy_version <= installed:
@@ -2448,12 +2461,12 @@ def apply_full_parameter_shard(
         raise RuntimeError("full-parameter model/master check is incomplete")
     if role == "actor":
         actor.weights_backuper.backup("actor")
-    actor._external_full_policy_version = state.policy_version
-    actor._external_full_local_step_generation = 0
-    actor._external_full_exported_local_step_generation = 0
-    actor._external_full_scheduler_anchor_steps = _scheduler_num_steps(actor)
-    actor._external_full_last_local_rollout_id = None
-    actor._external_full_last_local_step_receipt = None
+    full_parameter_rank_state(actor).policy_version = state.policy_version
+    full_parameter_rank_state(actor).local_step_generation = 0
+    full_parameter_rank_state(actor).exported_local_step_generation = 0
+    full_parameter_rank_state(actor).scheduler_anchor_steps = _scheduler_num_steps(actor)
+    full_parameter_rank_state(actor).last_local_rollout_id = None
+    full_parameter_rank_state(actor).last_local_step_receipt = None
     return count
 
 
@@ -2462,7 +2475,7 @@ def _resolve_ray_module(ray_module):
         import ray as ray_module
 
     for name in ("put", "get"):
-        if not callable(getattr(ray_module, name, None)):
+        if not callable(getattr(ray_module, name, None)):  # config-access-exempt: ray may be an in-process stand-in lacking put/get
             raise TypeError(f"full-parameter Ray module has no {name} operation")
     return ray_module
 
@@ -2502,7 +2515,7 @@ def put_full_parameter_chunk(ray_module, value: torch.Tensor):
     real Ray module (``MILES_FULL_PARAMETER_ZERO_COPY_CHUNKS=0`` keeps the
     tensor pickling).  An in-process stand-in stores the tensor itself."""
 
-    if getattr(ray_module, "__name__", None) == "ray" and os.environ.get(_ZERO_COPY_ENV, "1") != "0":
+    if getattr(ray_module, "__name__", None) == "ray" and os.environ.get(_ZERO_COPY_ENV, "1") != "0":  # config-access-exempt: ray may be a test double without __name__
         return ray_module.put(_ObjectStoreChunk(value))
     return ray_module.put(value)
 
@@ -2985,7 +2998,7 @@ def export_full_parameter_chunked_shard(
         fragments=tuple(fragment_descriptors),
         chunk_refs=chunk_refs,
     )
-    actor._external_full_exported_local_step_generation = local_step_generation
+    full_parameter_rank_state(actor).exported_local_step_generation = local_step_generation
     _record_resident_fragments(
         actor,
         parameter_layout_hash=plan.parameter_layout_hash,
@@ -3350,9 +3363,9 @@ def prepare_full_parameter_chunked_shard(
     require_full_parameter_actor(actor.args, "prepare")
     token = _validate_commit_token(commit_token)
     state_identity_hash = full_parameter_chunked_shard_identity(state)
-    prepared = getattr(actor, "_external_full_parameter_prepared_cut", None)
-    committed = getattr(actor, "_external_full_parameter_committed_cut", None)
-    finalized = getattr(actor, "_external_full_parameter_last_finalized_cut", None)
+    prepared = full_parameter_rank_state(actor).prepared_cut
+    committed = full_parameter_rank_state(actor).committed_cut
+    finalized = full_parameter_rank_state(actor).last_finalized_cut
     for outcome in (committed, finalized):
         if outcome is not None and not isinstance(outcome, _FullParameterCommitOutcome):
             raise RuntimeError("full-parameter commit journal is malformed")
@@ -3452,7 +3465,7 @@ def prepare_full_parameter_chunked_shard(
         seconds=time.monotonic() - started,
     )
     parameter_count = len(manifest.specs)
-    actor._external_full_parameter_prepared_cut = _PreparedFullParameterChunkedShard(
+    full_parameter_rank_state(actor).prepared_cut = _PreparedFullParameterChunkedShard(
         commit_token=token,
         state=state,
         parameter_tensor_count=parameter_count,
@@ -3572,8 +3585,8 @@ def commit_prepared_full_parameter_shard(
     from miles.backends.megatron_utils import full_parameter_replicas as replicas  # import cycle
 
     token = _validate_commit_token(commit_token)
-    committed = getattr(actor, "_external_full_parameter_committed_cut", None)
-    finalized = getattr(actor, "_external_full_parameter_last_finalized_cut", None)
+    committed = full_parameter_rank_state(actor).committed_cut
+    finalized = full_parameter_rank_state(actor).last_finalized_cut
     for outcome in (committed, finalized):
         if outcome is not None and not isinstance(outcome, _FullParameterCommitOutcome):
             raise RuntimeError("full-parameter commit journal is malformed")
@@ -3589,7 +3602,7 @@ def commit_prepared_full_parameter_shard(
         if installed != finalized.policy_version:
             raise RuntimeError("finalized full-parameter commit journal is stale")
         return finalized.parameter_tensor_count
-    prepared = getattr(actor, "_external_full_parameter_prepared_cut", None)
+    prepared = full_parameter_rank_state(actor).prepared_cut
     if not isinstance(prepared, _PreparedFullParameterChunkedShard):
         raise RuntimeError("no full-parameter cut is prepared")
     if prepared.commit_token != token:
@@ -3609,12 +3622,12 @@ def commit_prepared_full_parameter_shard(
         # retried commit (commit_started) wrote only non-resident fragments,
         # which never overlap a resident one, so the skip stays exact.
         if prepared.resident_fragment_ids and (
-            getattr(actor, "_external_full_parameter_resident", None) is not prepared.resident_record
+            full_parameter_rank_state(actor).resident is not prepared.resident_record
         ):
             raise RuntimeError("full-parameter resident fragments changed after prepare")
         replicas.require_live_replica_record(actor, prepared.replica_resident_record, prepared.replica_resident_ids)
         prepared = replace(prepared, commit_started=True)
-        actor._external_full_parameter_prepared_cut = prepared
+        full_parameter_rank_state(actor).prepared_cut = prepared
     # From here the masters may be partly written: no record describes them.
     forget_full_parameter_resident_fragments(actor)
     started = time.monotonic()
@@ -3682,13 +3695,13 @@ def commit_prepared_full_parameter_shard(
         role=role,
         ranges=layout.ranges,
     )
-    actor._external_full_policy_version = state.policy_version
-    actor._external_full_local_step_generation = 0
-    actor._external_full_exported_local_step_generation = 0
-    actor._external_full_scheduler_anchor_steps = _scheduler_num_steps(actor)
-    actor._external_full_last_local_rollout_id = None
-    actor._external_full_last_local_step_receipt = None
-    actor._external_full_parameter_committed_cut = _FullParameterCommitOutcome(
+    full_parameter_rank_state(actor).policy_version = state.policy_version
+    full_parameter_rank_state(actor).local_step_generation = 0
+    full_parameter_rank_state(actor).exported_local_step_generation = 0
+    full_parameter_rank_state(actor).scheduler_anchor_steps = _scheduler_num_steps(actor)
+    full_parameter_rank_state(actor).last_local_rollout_id = None
+    full_parameter_rank_state(actor).last_local_step_receipt = None
+    full_parameter_rank_state(actor).committed_cut = _FullParameterCommitOutcome(
         commit_token=token,
         policy_version=state.policy_version,
         parameter_tensor_count=count,
@@ -3720,7 +3733,7 @@ def commit_prepared_full_parameter_shard(
         **reader.stats(),
         **finish_stats,
     )
-    del actor._external_full_parameter_prepared_cut
+    full_parameter_rank_state(actor).prepared_cut = None
     return count
 
 
@@ -3791,18 +3804,18 @@ def _partial_commit_refusal(
     for _name, parameter in named_parameters:
         if type(parameter.data) is not torch.Tensor or parameter.dtype not in _DENSE_MODEL_DTYPES:
             return "a model parameter is not a dense tensor"
-    for child in getattr(actor.optimizer, "chained_optimizers", (actor.optimizer,)):
-        ddp_config = getattr(child, "ddp_config", None)
-        if getattr(ddp_config, "use_megatron_fsdp", False) or getattr(ddp_config, "fp4_param_gather", False):
+    for child in getattr(actor.optimizer, "chained_optimizers", (actor.optimizer,)):  # config-access-exempt: chained_optimizers exists only on Megatron ChainedOptimizer
+        ddp_config = getattr(child, "ddp_config", None)  # config-access-exempt: only Megatron DDP-aware optimizer wrappers carry ddp_config
+        if ddp_config is not None and (ddp_config.use_megatron_fsdp or ddp_config.fp4_param_gather):
             return "Megatron-FSDP or a quantized parameter gather"
-        if getattr(child, "_layer_wise_non_distopt_child", False):
+        if getattr(child, "_layer_wise_non_distopt_child", False):  # config-access-exempt: layer-wise optimizer children carry this marker only
             return "layer-wise FP8 optimizer"
     owned = {
         id(_resolve_master(parameter, name, optimizer_owned_parameter_ids=optimizer_owned)[0])
         for name, parameter in named_parameters
     }
     for base in _optimizer_bases(actor.optimizer):
-        inner = getattr(base, "param_to_inner_param", None) or {}
+        inner = getattr(base, "param_to_inner_param", None) or {}  # config-access-exempt: param_to_inner_param exists only on HybridDeviceOptimizer
         if any(key is not copy and id(key) not in owned for key, copy in inner.items()):
             return "a hybrid optimizer copy belongs to no named parameter"
     return None
@@ -3834,11 +3847,11 @@ def _backup_written_actor_weights(actor, written: Sequence[torch.nn.Parameter] |
     changed; a backuper that updates a subset in place takes only those, any
     other backs up every weight.  Returns what was done (for the stats)."""
 
-    if getattr(actor, "_enable_weight_backup", True) is False:
+    if actor._enable_weight_backup is False:
         return "off"
     backuper = actor.weights_backuper
-    backup_tensors = getattr(backuper, "backup_tensors", None)
-    if written is not None and callable(backup_tensors):
+    backup_tensors = backuper.backup_tensors
+    if written is not None:
         expected = {id(parameter) for parameter in written}
         if backup_tensors("actor", expected) == len(expected):
             return "written"
@@ -3947,7 +3960,7 @@ def _assert_masters_resident(actor) -> None:
     """Megatron's precondition of a main-to-model copy (no-op without an
     optimizer-state offloader)."""
 
-    check = getattr(actor.optimizer, "assert_master_weights_resident", None)
+    check = getattr(actor.optimizer, "assert_master_weights_resident", None)  # config-access-exempt: only optimizers with a state offloader define this check
     if callable(check):
         check("full-parameter partial commit")
 
@@ -3956,8 +3969,8 @@ def finalize_full_parameter_commit(actor, *, commit_token: str) -> int:
     """Acknowledge a group-wide commit after every rank has converged."""
 
     token = _validate_commit_token(commit_token)
-    committed = getattr(actor, "_external_full_parameter_committed_cut", None)
-    finalized = getattr(actor, "_external_full_parameter_last_finalized_cut", None)
+    committed = full_parameter_rank_state(actor).committed_cut
+    finalized = full_parameter_rank_state(actor).last_finalized_cut
     if isinstance(finalized, _FullParameterCommitOutcome) and (finalized.commit_token == token):
         installed, _generation, _exported, _anchor = _require_full_parameter_tracking(actor)
         if installed != finalized.policy_version:
@@ -3970,8 +3983,8 @@ def finalize_full_parameter_commit(actor, *, commit_token: str) -> int:
     installed, generation, exported, _anchor = _require_full_parameter_tracking(actor)
     if installed != committed.policy_version or generation != 0 or exported != 0:
         raise RuntimeError("committed full-parameter journal disagrees with actor")
-    actor._external_full_parameter_last_finalized_cut = committed
-    del actor._external_full_parameter_committed_cut
+    full_parameter_rank_state(actor).last_finalized_cut = committed
+    full_parameter_rank_state(actor).committed_cut = None
     return committed.parameter_tensor_count
 
 
@@ -3988,9 +4001,9 @@ def full_parameter_commit_status(
     _validate_non_negative_integer(policy_version, "policy version")
     if not _SHA256.fullmatch(state_identity_hash):
         raise ValueError("full-parameter commit state identity is malformed")
-    prepared = getattr(actor, "_external_full_parameter_prepared_cut", None)
-    committed = getattr(actor, "_external_full_parameter_committed_cut", None)
-    finalized = getattr(actor, "_external_full_parameter_last_finalized_cut", None)
+    prepared = full_parameter_rank_state(actor).prepared_cut
+    committed = full_parameter_rank_state(actor).committed_cut
+    finalized = full_parameter_rank_state(actor).last_finalized_cut
     if prepared is not None:
         if not isinstance(prepared, _PreparedFullParameterChunkedShard):
             raise RuntimeError("full-parameter prepared context is malformed")
@@ -4040,14 +4053,14 @@ def abort_prepared_full_parameter_shard(
     """Discard actor-local prepare metadata without deleting shared Ray objects."""
 
     token = _validate_commit_token(commit_token)
-    committed = getattr(actor, "_external_full_parameter_committed_cut", None)
+    committed = full_parameter_rank_state(actor).committed_cut
     if committed is not None:
         if not isinstance(committed, _FullParameterCommitOutcome):
             raise RuntimeError("full-parameter commit journal is malformed")
         if committed.commit_token == token:
             raise RuntimeError("a committed full-parameter cut cannot be aborted")
         raise RuntimeError("another full-parameter commit is unresolved")
-    prepared = getattr(actor, "_external_full_parameter_prepared_cut", None)
+    prepared = full_parameter_rank_state(actor).prepared_cut
     if prepared is None:
         return False
     if not isinstance(prepared, _PreparedFullParameterChunkedShard):
@@ -4056,16 +4069,16 @@ def abort_prepared_full_parameter_shard(
         raise RuntimeError("full-parameter abort token does not match prepared state")
     if prepared.commit_started:
         raise RuntimeError("a committing full-parameter cut cannot be aborted")
-    del actor._external_full_parameter_prepared_cut
+    full_parameter_rank_state(actor).prepared_cut = None
     return True
 
 
 def _copy_masters_to_model(actor) -> None:
     """Copy every FP32 optimizer master back into its model parameter."""
 
-    children = getattr(actor.optimizer, "chained_optimizers", (actor.optimizer,))
+    children = getattr(actor.optimizer, "chained_optimizers", (actor.optimizer,))  # config-access-exempt: chained_optimizers exists only on Megatron ChainedOptimizer
     for child in children:
-        copy = getattr(child, "_copy_main_params_to_model_params", None)
+        copy = getattr(child, "_copy_main_params_to_model_params", None)  # config-access-exempt: only Megatron mixed-precision optimizers define the main-to-model copy
         if copy is None:
             raise RuntimeError("Megatron optimizer lacks main-to-model copy")
         copy()

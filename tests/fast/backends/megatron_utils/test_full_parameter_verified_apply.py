@@ -15,6 +15,7 @@ import torch
 
 from miles.backends.megatron_utils.full_parameter_state import (
     export_full_parameter_chunked_shard,
+    full_parameter_rank_state,
     prepare_full_parameter_chunked_shard,
     verify_stored_fragment_chunks,
 )
@@ -81,7 +82,7 @@ def _two_applies(monkeypatch, *, ahead):
             results.append(_apply_verified(actor, target, ray, token, _verified(target, replaced)))
         else:
             results.append(_apply(actor, target, ray, token, skip=True))
-        stats.append(dict(actor._external_full_parameter_apply_stats))
+        stats.append(dict(full_parameter_rank_state(actor).apply_stats))
     return named, results, stats
 
 
@@ -111,7 +112,7 @@ def test_a_verified_entry_with_another_payload_hash_is_checked_as_usual(monkeypa
     target = _target(exported, ray, 1, {1: [30.5, -1.25, 1e-30]})
     _count, gets = _apply_verified(actor, target, ray, "stale-claim", {1: "0" * 64})
     assert gets == 4
-    stats = actor._external_full_parameter_apply_stats["prepare"]
+    stats = full_parameter_rank_state(actor).apply_stats["prepare"]
     assert (stats["read_fragments"], stats["verified_ahead_fragments"]) == (1, 0)
 
 
@@ -147,7 +148,7 @@ def test_the_transport_advertises_the_verified_apply():
     assert "verified_apply" in FULL_PARAMETER_TRANSPORT_FEATURES
 
 
-async def test_replica_ranks_skip_the_checks_of_verified_fragments(cluster):
+async def test_replica_ranks_skip_the_checks_of_verified_fragments(cluster):  # noqa: F811
     async def run(verified: bool):
         group, ranks, ray = cluster(4, 2)
         _manifests, _plans = await _install(group)
@@ -172,7 +173,7 @@ async def test_replica_ranks_skip_the_checks_of_verified_fragments(cluster):
                         claim[changed] = descriptor.payload_hash
         await apply_chunked_cut(group, target, commit_token="dp-apply-2", skip_resident_fragments=True,
                                 verified_fragments=claim)
-        stats = [rank._external_full_parameter_apply_stats for rank in ranks]
+        stats = [full_parameter_rank_state(rank).apply_stats for rank in ranks]
         return _assert_replicas_identical(ranks), stats
 
     checked, checked_stats = await run(False)
