@@ -44,6 +44,7 @@ from miles.utils.args.configs.tensorboard import TensorboardConfig
 from miles.utils.args.configs.tinker import TinkerConfig
 from miles.utils.args.configs.train import TrainConfig, TrainRolloutOnlyConfig
 from miles.utils.args.configs.wandb import WandbConfig, WandbRolloutOnlyConfig
+from miles.utils.args.configs.yeto_algo import YetoAlgoConfig
 from miles.utils.args.configs.yeto_extension import YetoExtensionConfig
 from miles.utils.args.runtime_base import BaseLeafConfig
 
@@ -62,6 +63,7 @@ class OrchestratorConfig(
     DataConfig,
     EvalConfig,
     AlgoConfig,
+    YetoAlgoConfig,
     OnPolicyDistillationConfig,
     LoraConfig,
     PartialExpertsConfig,
@@ -99,6 +101,7 @@ class TrainerConfig(
     DataConfig,
     EvalConfig,
     AlgoConfig,
+    YetoAlgoConfig,
     OnPolicyDistillationConfig,
     LoraConfig,
     PartialExpertsConfig,
@@ -183,6 +186,7 @@ class InferenceControllerConfig(
     DataConfig,
     EvalConfig,
     AlgoConfig,
+    YetoAlgoConfig,
     OnPolicyDistillationConfig,
     LoraConfig,
     PartialExpertsConfig,
@@ -232,6 +236,7 @@ class RolloutConfig(
     DataConfig,
     EvalConfig,
     AlgoConfig,
+    YetoAlgoConfig,
     OnPolicyDistillationConfig,
     LoraConfig,
     PartialExpertsConfig,
@@ -270,6 +275,7 @@ class MultiLoraConfig(
     DataConfig,
     EvalConfig,
     AlgoConfig,
+    YetoAlgoConfig,
     OnPolicyDistillationConfig,
     LoraConfig,
     PartialExpertsConfig,
@@ -310,6 +316,7 @@ class AllConfig(
     EvalConfig,
     EvalRolloutOnlyConfig,
     AlgoConfig,
+    YetoAlgoConfig,
     AlgoRolloutOnlyConfig,
     TrainerBackendTraitConfig,
     OnPolicyDistillationConfig,

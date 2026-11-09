@@ -1,5 +1,6 @@
 import argparse
 import logging
+import math
 import os
 import re
 import tempfile
@@ -1940,6 +1941,8 @@ def miles_validate_args(args):
     if args.skip_actor_forward_only:
         validate_skip_actor_forward_only(args)
 
+    validate_policy_loss_variant_args(args)
+
     validate_score_centering_args(args)
 
     _maybe_apply_dumper_overrides(args)
@@ -1951,6 +1954,25 @@ def miles_validate_args(args):
         raise ValueError("--mini-ft-controller-enable requires --api-server-port to be set (non-zero)")
 
     _validate_deploy_component(args)
+
+
+def validate_policy_loss_variant_args(args) -> None:
+    variant = args.policy_loss_variant
+    if variant == "policy_loss":
+        return
+    assert args.loss_type == "policy_loss", f"--policy-loss-variant {variant} requires --loss-type policy_loss"
+    assert (
+        args.advantage_estimator != "gspo"
+    ), f"--policy-loss-variant {variant} cannot be combined with --advantage-estimator gspo"
+    assert args.eps_clip_c is None, f"--policy-loss-variant {variant} cannot be combined with --eps-clip-c"
+    if variant == "gmpo":
+        assert (
+            not args.calculate_per_token_loss
+        ), "--policy-loss-variant gmpo cannot be combined with --calculate-per-token-loss"
+    names = {"sapo": ("sapo_tau_pos", "sapo_tau_neg"), "gmpo": ("gmpo_log_clip_low", "gmpo_log_clip_high")}
+    for name in names.get(variant, ()):
+        value = vars(args)[name]
+        assert math.isfinite(value) and value > 0, f"--{name.replace('_', '-')} must be finite and > 0, got {value}"
 
 
 def validate_skip_actor_forward_only(args) -> None:
