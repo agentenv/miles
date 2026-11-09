@@ -149,7 +149,9 @@ class RayWorkerManager:
             cell.binding = None
             logger.info(f"Cell {cell_id} unbound")
 
-    async def set_pg_view(self, pg_name: str, info: PlacementGroupInfo) -> None:
+    async def set_pg_view(
+        self, pg_name: str, info: PlacementGroupInfo, *, replacing_pools: list[str] | tuple[str, ...] = ()
+    ) -> None:
         """Point ``pg_name`` at another slice of the startup placement group (e.g. GPUs a trainer released).
 
         Refused while a running cell uses the view, when a bundle lies outside the startup placement group or is
@@ -169,17 +171,61 @@ class RayWorkerManager:
             num_slots = len(info.pg_reordered_bundle_indices)
             overflowing = {
                 c.cell_id: slots
-                for c in self._all_cells()
+                for pool_id, pool in self._pools.items()
+                if pool_id not in replacing_pools
+                for c in pool.cells
                 if c.pg_name == pg_name and (slots := [slot for slot in c.all_slots() if slot >= num_slots])
             }
             assert not overflowing, (
                 f"stopped cells {overflowing} are bound to slots beyond the {num_slots} bundles of the new "
-                f"{pg_name!r} view; rebind them first"
+                f"{pg_name!r} view; rebind them or replace their pools (replacing_pools) first"
             )
             self.pgs = {**self.pgs, pg_name: info}
 
     def get_pg_view(self, pg_name: str) -> PlacementGroupInfo:
         return self.pgs[pg_name]
+
+    async def stop_pools(self, pool_ids: list[str]) -> None:
+        async with self._membership_lock:
+            await asyncio.gather(*[cell.stop() for pool_id in pool_ids for cell in self._pools[pool_id].cells])
+
+    async def start_pools(self, pool_ids: list[str]) -> None:
+        """Start the stopped cells of the pools, except deferred cells, which only start through ``start_cells``."""
+        await self.start_cells(
+            [c.cell_id for pool_id in pool_ids for c in self._pools[pool_id].cells if not c.deferred]
+        )
+
+    async def replace_scaling(self, scaling: ScalingConfig, *, pool_ids: list[str]) -> None:
+        """Adopt ``scaling`` (e.g. a trainer with a new GPU count) and lay the fully stopped ``pool_ids`` out anew.
+
+        Only those pools may change their cell layout: every other pool must schedule exactly as before. The new
+        cells start one generation above the old ones, so no workers_hash repeats.
+        """
+        async with self._membership_lock:
+            if unknown := sorted(set(pool_ids) - set(self._pools)):
+                raise KeyError(f"unknown pools {unknown}; known: {sorted(self._pools)}")
+            if running := [c.cell_id for pool_id in pool_ids for c in self._pools[pool_id].cells if c.alive]:
+                raise AssertionError(f"cells {running} are running; stop their pools first")
+            changed = [
+                name
+                for name, pool in self._pools.items()
+                if name not in pool_ids and pool.spec.scheduling(scaling) != pool.spec.scheduling(self.scaling)
+            ]
+            assert not changed, f"the new scaling also changes pools {changed}, which are not replaced"
+            old_generations = {
+                pool_id: max((c.generation for c in self._pools[pool_id].cells), default=0) for pool_id in pool_ids
+            }
+            self.scaling = scaling
+            for pool_id in pool_ids:
+                pool = _PoolManager.initial(self._pools[pool_id].spec, self)
+                for cell in pool.cells:
+                    cell.generation = old_generations[pool_id] + 1
+                    if cell.binding is not None or not cell.all_slots():
+                        continue
+                    num_slots = len(self.pgs[cell.pg_name].pg_reordered_bundle_indices)
+                    bad = [slot for slot in cell.all_slots() if slot >= num_slots]
+                    assert not bad, f"cell {cell.cell_id} needs slots {bad} beyond the {num_slots} of {cell.pg_name!r}"
+                self._pools[pool_id] = pool
 
     def get_cell_bundles(self, cell_id: str) -> list[int]:
         return sorted(b for _, b in self._find_cell(cell_id).bundles())
