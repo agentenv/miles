@@ -49,6 +49,11 @@ class MilesRouter:
         self.worker_failure_counts: dict[str, int] = {}
         # Quarantined workers excluded from routing pool
         self.dead_workers: set[str] = set()
+        # Cordoned workers keep their registration and in-flight count but are never selected for new requests
+        self.cordoned_workers: set[str] = set()
+        # URL -> registration generation; a request only hands its slot back to the registration it was counted on
+        self.worker_generations: dict[str, int] = {}
+        self._next_generation = 1
 
         self.client = httpx.AsyncClient(
             limits=httpx.Limits(max_connections=config.max_connections),
@@ -67,6 +72,10 @@ class MilesRouter:
         self.app.post("/add_worker")(self.add_worker)
         self.app.post("/remove_worker")(self.remove_worker)
         self.app.get("/list_workers")(self.list_workers)
+        # cordon / drain (miles router only)
+        self.app.post("/cordon_worker")(self.cordon_worker)
+        self.app.post("/uncordon_worker")(self.uncordon_worker)
+        self.app.get("/worker_inflight")(self.get_worker_inflight)
         # Catch-all route for proxying to SGLang - must be registered LAST
         self.app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])(self.proxy)
 
@@ -142,6 +151,7 @@ class MilesRouter:
     ) -> dict:
         """Core proxy logic. Returns dict with request_body, response_body, status_code, headers."""
         worker_url = self._use_url()
+        generation = self.worker_generations.get(worker_url, 0)
         url = f"{worker_url}/{path}"
 
         if body is None:
@@ -161,7 +171,7 @@ class MilesRouter:
                 "headers": dict(response.headers),
             }
         finally:
-            self._finish_url(worker_url)
+            self._finish_url(worker_url, generation=generation)
 
     def build_proxy_response(self, result: dict) -> Response:
         """Build HTTP response from proxy result."""
@@ -193,7 +203,8 @@ class MilesRouter:
                 status_code=400, content={"error": "worker_url is required (use query ?url=... or JSON body)"}
             )
 
-        self._add_worker_url(worker_url)
+        # ?cordoned=1 registers the worker already cordoned, e.g. an engine that must pass a weight read-back first
+        self._add_worker_url(worker_url, cordoned=request.query_params.get("cordoned", "").lower() in ("1", "true"))
         return {"status": "success", "worker_urls": self.worker_request_counts}
 
     async def remove_worker(self, request: Request):
@@ -219,7 +230,7 @@ class MilesRouter:
                 status_code=400, content={"error": "miles router serves only regular workers (no PD disaggregation)"}
             )
 
-        self._add_worker_url(worker_url)
+        self._add_worker_url(worker_url, cordoned=payload.get("cordoned") is True)
         return {"status": "success", "worker_id": _worker_id(worker_url)}
 
     async def get_workers(self, request: Request):
@@ -230,9 +241,14 @@ class MilesRouter:
         self._remove_worker_url(worker_id)
         return {"status": "success"}
 
-    def _add_worker_url(self, worker_url: str) -> None:
+    def _add_worker_url(self, worker_url: str, *, cordoned: bool = False) -> None:
+        if cordoned:
+            # set before the worker becomes selectable, so a cordoned registration never takes a request
+            self.cordoned_workers.add(worker_url)
         if worker_url not in self.worker_request_counts:
             self.worker_request_counts[worker_url] = 0
+            self.worker_generations[worker_url] = self._next_generation
+            self._next_generation += 1
             self.worker_failure_counts[worker_url] = 0
             self.dead_workers.discard(worker_url)
             if self.verbose:
@@ -240,9 +256,37 @@ class MilesRouter:
 
     def _remove_worker_url(self, worker_url: str) -> None:
         self.worker_request_counts.pop(worker_url, None)
+        self.worker_generations.pop(worker_url, None)
         self.worker_failure_counts.pop(worker_url, None)
         self.dead_workers.discard(worker_url)
+        self.cordoned_workers.discard(worker_url)
         logger.info(f"[miles-router] Removed worker: {worker_url}")
+
+    async def cordon_worker(self, request: Request):
+        """Stop selecting a worker for new requests without deregistering it or dropping its in-flight count."""
+        return await self._set_cordon(request, cordoned=True)
+
+    async def uncordon_worker(self, request: Request):
+        return await self._set_cordon(request, cordoned=False)
+
+    async def _set_cordon(self, request: Request, *, cordoned: bool):
+        worker_url = await self._parse_worker_url(request)
+        if worker_url is None:
+            return JSONResponse(
+                status_code=400, content={"error": "worker_url is required (use query ?url=... or JSON body)"}
+            )
+        if worker_url not in self.worker_request_counts:
+            return JSONResponse(status_code=404, content={"error": f"worker {worker_url} is not registered"})
+        if cordoned:
+            self.cordoned_workers.add(worker_url)
+        else:
+            self.cordoned_workers.discard(worker_url)
+        logger.info(f"[miles-router] {'Cordoned' if cordoned else 'Uncordoned'} worker: {worker_url}")
+        return {"status": "success", "cordoned": sorted(self.cordoned_workers)}
+
+    async def get_worker_inflight(self, request: Request):
+        """Per-worker count of requests proxied and not yet finished, plus the cordoned set."""
+        return {"inflight": dict(self.worker_request_counts), "cordoned": sorted(self.cordoned_workers)}
 
     async def _parse_worker_url(self, request: Request) -> str | None:
         if worker_url := request.query_params.get("url") or request.query_params.get("worker_url"):
@@ -259,12 +303,14 @@ class MilesRouter:
     def _use_url(self):
         """Select worker URL with minimal active requests."""
 
-        if not self.dead_workers:
+        if not self.dead_workers and not self.cordoned_workers:
             # Healthy path: select from all workers
             url = min(self.worker_request_counts, key=self.worker_request_counts.get)
         else:
-            # Degraded path: select from workers not in dead_workers
-            valid_workers = (w for w in self.worker_request_counts if w not in self.dead_workers)
+            # Degraded path: select from workers neither dead nor cordoned
+            valid_workers = (
+                w for w in self.worker_request_counts if w not in self.dead_workers and w not in self.cordoned_workers
+            )
             try:
                 url = min(valid_workers, key=self.worker_request_counts.get)
             except ValueError:
@@ -273,8 +319,16 @@ class MilesRouter:
         self.worker_request_counts[url] += 1
         return url
 
-    def _finish_url(self, url: str) -> None:
-        """Mark the request to the given URL as finished"""
+    def _finish_url(self, url: str, *, generation: int | None = None) -> None:
+        """Mark the request to the given URL as finished.
+
+        ``generation`` is the registration the request was counted on: a request of an earlier registration of the
+        same URL (removed and added again meanwhile) does not decrement the new registration's count, so in-flight
+        counts, and hence drains, only cover requests routed to the current registration.
+        """
+        if generation is not None and self.worker_generations.get(url, 0) != generation:
+            logger.info(f"[miles-router] Request to an earlier registration of {url} finished; ignoring")
+            return
         if (count := self.worker_request_counts.get(url)) is None or count == 0:
             logger.info(f"[miles-router] Request to {url} finished after the worker was deregistered; ignoring")
             return

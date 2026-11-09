@@ -8,7 +8,9 @@ if TYPE_CHECKING:
 
 
 class ServingRegistry(Protocol):
-    async def register(self, *, worker_url: str, worker_type: WorkerType, bootstrap_port: int | None) -> None: ...
+    async def register(
+        self, *, worker_url: str, worker_type: WorkerType, bootstrap_port: int | None, cordoned: bool = False
+    ) -> None: ...
 
     async def unregister(self, *, worker_url: str) -> None: ...
 
@@ -17,11 +19,14 @@ class ServingRegistry(Protocol):
 class SGLangServingRegistry:
     client: "SGLangRouterApiClient"
 
-    async def register(self, *, worker_url: str, worker_type: WorkerType, bootstrap_port: int | None) -> None:
+    async def register(
+        self, *, worker_url: str, worker_type: WorkerType, bootstrap_port: int | None, cordoned: bool = False
+    ) -> None:
         await self.client.add_worker(
             worker_url=worker_url,
             worker_type=worker_type,
             bootstrap_port=bootstrap_port,
+            **({"cordoned": True} if cordoned else {}),
         )
 
     async def unregister(self, *, worker_url: str) -> None:
