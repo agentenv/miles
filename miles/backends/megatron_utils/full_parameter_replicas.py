@@ -1,10 +1,12 @@
 """Data-parallel replicas of full-parameter FP32 masters.
 
-At DP>1 every data-parallel rank keeps a whole FP32 master of each of its
-parameters (non-distributed optimizer).  Exactly one rank of each replica
-group owns a parameter: only it lists the parameter in its manifest and
-exports it (``full_parameter_state._replica_owners``).  Every other rank of
-the group holds a replica.  This module gives a replica rank:
+At DP>1 every data-parallel rank holds each of its parameters: with the
+non-distributed optimizer as a whole FP32 master, with Megatron's distributed
+optimizer as the whole model parameter plus the FP32 master of one range
+(``full_parameter_sharded_masters``).  Exactly one rank of each replica group
+owns a parameter: only it lists the parameter in its manifest and exports it
+(``full_parameter_state._replica_owners``).  Every other rank of the group
+holds a replica.  This module gives a replica rank:
 
 * a replica plan: for each owner it replicates, which members of the owner's
   fragments land in which flat ranges of its local parameters.  It is built
@@ -30,7 +32,7 @@ would be a cycle).
 from __future__ import annotations
 
 import os
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 
 import torch
@@ -348,6 +350,21 @@ def _live_resident(actor, replica_plan: ReplicaPlan, record: object) -> Mapping[
     return record.payload_hashes
 
 
+def replica_holds(
+    actor,
+    replica_plan: ReplicaPlan | None,
+    expected: Mapping[ReplicaFragmentKey, tuple[int, str]],
+) -> Callable[[FullParameterTopology, int], bool]:
+    """``holds(owner, fragment_id)``: the live replica record says this rank's
+    replicas hold that owner fragment with exactly ``expected``'s ``(numel,
+    payload hash)``."""
+
+    live = {} if replica_plan is None else _live_resident(actor, replica_plan, getattr(actor, _RESIDENT_ATTRIBUTE, None))
+    return lambda owner, fragment_id: (
+        (owner, fragment_id) in expected and live.get((owner, fragment_id)) == expected[(owner, fragment_id)]
+    )
+
+
 def require_live_replica_record(actor, prepared_record: object, resident: frozenset[ReplicaFragmentKey]) -> None:
     if resident and getattr(actor, _RESIDENT_ATTRIBUTE, None) is not prepared_record:
         raise RuntimeError("full-parameter replica resident fragments changed after prepare")
@@ -361,7 +378,7 @@ def note_replica_export(
     replica_plan: ReplicaPlan | None,
     states: Sequence[FullParameterChunkedShardState],
     *,
-    replica_masters: Mapping[str, torch.Tensor],
+    replica_masters: Mapping[str, torch.Tensor] | None,
     lazy: bool = False,
 ) -> dict[str, int]:
     """Record that the replicas hold what their owners just exported.
@@ -370,14 +387,17 @@ def note_replica_export(
     With ``MILES_FULL_PARAMETER_VERIFY_REPLICAS=1`` every owner chunk that lies
     wholly inside this rank's replicas is hashed from the replicas first;
     except after a ``lazy`` export, whose descriptors are labels, not content
-    hashes (the replicas are then checked at the next non-lazy export)."""
+    hashes (the replicas are then checked at the next non-lazy export).
+    ``replica_masters`` None: the masters are sharded (the distributed
+    optimizer at DP>1), so this rank holds no FP32 replica to compare; the
+    owners exported its ranges themselves (``full_parameter_sharded_masters``)."""
 
     installed, generation, exported, _anchor = _require_full_parameter_tracking(actor)
     if exported != generation:
         raise RuntimeError("full-parameter replica export note has unexported local progress")
     ordered = match_replica_states(replica_plan, states, policy_version=installed, local_step_generation=generation)
     verified = 0
-    if replica_plan is not None and not lazy and os.environ.get(VERIFY_REPLICAS_ENV, "0") == "1":
+    if replica_plan is not None and replica_masters is not None and not lazy and os.environ.get(VERIFY_REPLICAS_ENV, "0") == "1":
         verified = sum(
             _parallel_map(
                 lambda item: _verify_replica_fragment(
@@ -388,7 +408,10 @@ def note_replica_export(
         )
     record_replica_resident(actor, replica_plan, ordered)
     fragments = 0 if replica_plan is None else sum(len(source.fragments) for source in replica_plan.sources)
-    return {"fragments": fragments, "verified_chunks": verified, "lazy": int(lazy)}
+    stats = {"fragments": fragments, "verified_chunks": verified, "lazy": int(lazy)}
+    if replica_masters is None:
+        stats["sharded"] = 1
+    return stats
 
 
 def _verify_replica_fragment(
@@ -534,10 +557,14 @@ def copy_replica_chunks(
     states: Sequence[FullParameterChunkedShardState],
     *,
     skip: frozenset[ReplicaFragmentKey],
-    replica_masters: Mapping[str, torch.Tensor],
+    write: Callable[[str, int, torch.Tensor], None],
     ray_module,
 ) -> int:
-    """Copy the owner bytes of every non-resident replica fragment; returns fragments copied."""
+    """Copy the owner bytes of every non-resident replica fragment; returns fragments copied.
+
+    ``write(name, start, values)`` stores ``values`` at flat offsets
+    ``[start, start + len(values))`` of local parameter ``name``'s master
+    (``full_parameter_state._commit_writer``)."""
 
     if replica_plan is None:
         return 0
@@ -555,8 +582,10 @@ def copy_replica_chunks(
                 plan_hash=source.plan_hash,
             )
             for copy, start, stop in parts:
-                _replica_range(copy, start, stop, replica_masters).copy_(
-                    value[start - chunk.flat_offset : stop - chunk.flat_offset], non_blocking=False
+                write(
+                    copy.name,
+                    copy.start - copy.fragment_offset + start,
+                    value[start - chunk.flat_offset : stop - chunk.flat_offset],
                 )
             del value
         copied += 1

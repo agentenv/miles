@@ -21,6 +21,7 @@ _ROLE_OPERATIONS = {
     "export_full_parameter_chunked_shard": state.export_full_parameter_chunked_shard,
     "note_full_parameter_replica_export": state.note_full_parameter_replica_export,
     "materialize_full_parameter_fragments": state.materialize_full_parameter_fragments,
+    "full_parameter_master_contributions": state.full_parameter_master_contributions,
     "prepare_full_parameter_chunked_shard": state.prepare_full_parameter_chunked_shard,
     "commit_prepared_full_parameter_shard": state.commit_prepared_full_parameter_shard,
     "record_full_parameter_local_step": state.record_full_parameter_local_step,
