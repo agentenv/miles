@@ -37,11 +37,8 @@ class RayWorkerProvider(BaseWorkerProvider):
 
     async def describe_declared_cells(self) -> dict[str, dict]:
         """State and binding of every declared cell of the watched pools (``RayWorkerManager.describe_cells``)."""
-        infos = await self._worker_manager_handle.get_cell_infos.remote(
-            pool_ids=self._pool_ids, category=self._category
-        )
         return await self._worker_manager_handle.describe_cells.remote(
-            pool_ids=sorted({i.pool_id for i in infos.values()})
+            pool_ids=self._pool_ids, category=self._category
         )
 
     def get_worker_infos(self, *, cell_ids: list[str]) -> list[list[WorkerInfo]]:

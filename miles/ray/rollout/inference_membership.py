@@ -58,10 +58,12 @@ class MembershipWorkerProvider(Protocol):
 def _is_start_rollback_failure(error: BaseException) -> bool:
     """Whether a start failed *and* its rollback failed (``ray_worker_manager.StartRollbackFailedError``).
 
-    Matched by class name on the error and its ``__cause__``: a Ray task error is raised as a subclass of the remote
-    error type, and an RPC failure keeps the remote type (#3857), so this module does not import the worker manager.
+    Matched by class name on the error, its ``__cause__`` and a Ray task error's ``cause`` (an RPC failure keeps the
+    remote type, #3857), so this module does not import the worker manager.
     """
-    candidates = [error, *([error.__cause__] if error.__cause__ is not None else [])]
+    # a RayTaskError also carries the remote error as ``cause``
+    candidates = [error, error.__cause__, vars(error).get("cause")]
+    candidates = [c for c in candidates if isinstance(c, BaseException)]
     return any("StartRollbackFailedError" in {cls.__name__ for cls in type(c).__mro__} for c in candidates)
 
 
@@ -81,6 +83,10 @@ class InferenceMembershipMixin:
     _draining_cell_ids: frozenset[str] = frozenset()
 
     # -------------------------- status -----------------------------
+
+    @lock_exempt
+    async def get_membership_epoch(self) -> int:
+        return self._membership_epoch
 
     @lock_exempt
     async def get_membership_status(self) -> dict[str, Any]:
@@ -378,7 +384,7 @@ class InferenceMembershipMixin:
     def _membership_provider(self) -> MembershipWorkerProvider:
         provider = self._engine_provider
         if not isinstance(provider, MembershipWorkerProvider):
-            raise NotImplementedError(f"{type(provider).__name__} cannot start or stop declared cells on demand")
+            raise NotImplementedError(f"{type(provider).__name__} cannot start or stop cells on demand")
         return provider
 
 

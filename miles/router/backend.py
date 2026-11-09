@@ -143,3 +143,8 @@ _BACKEND_CLASSES: dict[RouterKind, type[RouterBackend]] = {
 
 def make_router_backend(args: Namespace) -> RouterBackend:
     return _BACKEND_CLASSES[RouterKind(args.router)](args)
+
+
+def router_features(args: Namespace) -> RouterFeatures:
+    """The features of the router ``--router`` selects, without building its backend."""
+    return _BACKEND_CLASSES[RouterKind(args.router)].features

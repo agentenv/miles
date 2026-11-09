@@ -10,11 +10,16 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_
 from miles.backends.sglang_utils.sglang_api_client import SGLangApiClient
 from miles.dashboard import hooks as dashboard_hooks
 from miles.ray.rollout.eval_fleet import EvalFleetInfo, EvalFleetPin, InferenceControllerEvalFleet
-from miles.ray.rollout.inference_membership import InferenceMembershipMixin
+from miles.ray.rollout.inference_membership import (  # noqa: F401 - the membership errors are part of this API
+    CellsNotTrackedError,
+    InferenceMembershipMixin,
+    MembershipEpochMismatchError,
+    MembershipIncompleteError,
+)
 from miles.ray.rollout.rollout_server import RolloutServer, create_rollout_servers
 from miles.ray.rollout.router_manager import resolve_router_addrs
 from miles.ray.rollout.server_cell import ServerCell, ServerCellMetadata
-from miles.router.backend import RouterKind, make_router_backend
+from miles.router.backend import RouterKind, router_features
 from miles.utils import async_utils
 from miles.utils.args.component_rollout import InferenceRuntimeImmutState
 from miles.utils.audit_utils.checksum_utils import ChecksumCollectionFailure
@@ -229,7 +234,7 @@ class InferenceController(InferenceMembershipMixin):
         ``end_update_weights`` register the cells it readies cordoned, until ``admit_cells``.
         """
         self._admit_cordoned = False
-        if admit_cordoned and not make_router_backend(self.args).features.cordon:
+        if admit_cordoned and not router_features(self.args).cordon:
             raise ValueError(f"admit_cordoned needs a router that cordons (--router {RouterKind.MILES.value})")
         if members is not None:
             return await self._start_member_update_weights(
@@ -328,7 +333,14 @@ class InferenceController(InferenceMembershipMixin):
         ready = [(cell_id, cell) for cell_id, cell in updated_cells if cell.is_pending_weights]
         admit_cordoned = self._admit_cordoned
         await asyncio.gather(
-            *[cell.mark_weights_ready(cordoned=self._registers_cordoned(cell_id)) for cell_id, cell in ready]
+            *[
+                (
+                    cell.mark_weights_ready(cordoned=True)
+                    if self._registers_cordoned(cell_id)
+                    else cell.mark_weights_ready()
+                )
+                for cell_id, cell in ready
+            ]
         )
         self._admit_cordoned = False
         if admit_cordoned:

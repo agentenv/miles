@@ -195,50 +195,64 @@ class RayWorkerManager:
             [c.cell_id for pool_id in pool_ids for c in self._pools[pool_id].cells if not c.deferred]
         )
 
-    async def replace_scaling(self, scaling: ScalingConfig, *, pool_ids: list[str]) -> None:
-        """Adopt ``scaling`` (e.g. a trainer with a new GPU count) and lay the fully stopped ``pool_ids`` out anew.
+    async def replace_pool_spec(self, spec: BaseSpec) -> list[str]:
+        """Swap the spec of a fully stopped pool (e.g. a trainer with a new GPU count); returns its new cell ids."""
+        return (await self.replace_pools([spec]))[spec.name]
 
-        Only those pools may change their cell layout: every other pool must schedule exactly as before. The new
-        cells start one generation above the old ones, so no workers_hash repeats.
+    async def replace_pools(
+        self, specs: list[BaseSpec], *, scaling: ScalingConfig | None = None
+    ) -> dict[str, list[str]]:
+        """Swap the specs of fully stopped pools and optionally adopt a new ``scaling``; returns the new cell ids.
+
+        A trainer resize changes both: its TrainerConfig (the spec) and the GPU counts its scheduling reads (the
+        scaling). Pools not named here must schedule exactly as before under the new scaling. The new cells start one
+        generation above the old ones, so no workers_hash repeats.
         """
         async with self._membership_lock:
-            if unknown := sorted(set(pool_ids) - set(self._pools)):
-                raise KeyError(f"unknown pools {unknown}; known: {sorted(self._pools)}")
-            if running := [c.cell_id for pool_id in pool_ids for c in self._pools[pool_id].cells if c.alive]:
-                raise AssertionError(f"cells {running} are running; stop their pools first")
+            names = [spec.name for spec in specs]
+            if unknown := sorted(set(names) - set(self._pools)):
+                raise AssertionError(f"unknown pool {unknown}; known: {sorted(self._pools)}")
+            if running := [c.cell_id for name in names for c in self._pools[name].cells if c.alive]:
+                raise AssertionError(f"cells {running} of {names} are running; stop the pool first")
+            new_scaling = scaling if scaling is not None else self.scaling
             changed = [
                 name
                 for name, pool in self._pools.items()
-                if name not in pool_ids and pool.spec.scheduling(scaling) != pool.spec.scheduling(self.scaling)
+                if name not in names and pool.spec.scheduling(new_scaling) != pool.spec.scheduling(self.scaling)
             ]
             assert not changed, f"the new scaling also changes pools {changed}, which are not replaced"
-            old_generations = {
-                pool_id: max((c.generation for c in self._pools[pool_id].cells), default=0) for pool_id in pool_ids
-            }
-            self.scaling = scaling
-            for pool_id in pool_ids:
-                pool = _PoolManager.initial(self._pools[pool_id].spec, self)
-                for cell in pool.cells:
-                    cell.generation = old_generations[pool_id] + 1
-                    if cell.binding is not None or not cell.all_slots():
-                        continue
-                    num_slots = len(self.pgs[cell.pg_name].pg_reordered_bundle_indices)
-                    bad = [slot for slot in cell.all_slots() if slot >= num_slots]
-                    assert not bad, f"cell {cell.cell_id} needs slots {bad} beyond the {num_slots} of {cell.pg_name!r}"
-                self._pools[pool_id] = pool
+            old_scaling, self.scaling = self.scaling, new_scaling
+            try:
+                new_pools = {spec.name: _PoolManager.initial(spec, self) for spec in specs}
+                for name, pool in new_pools.items():
+                    generation = max((c.generation for c in self._pools[name].cells), default=0) + 1
+                    for cell in pool.cells:
+                        # a new spec is a new generation even before launch, so nothing mistakes it for the old one
+                        cell.generation = generation
+                        if cell.pg_name is not None and (slots := cell.all_slots()):
+                            num_slots = len(self.pgs[cell.pg_name].pg_reordered_bundle_indices)
+                            bad = [slot for slot in slots if not 0 <= slot < num_slots]
+                            assert not bad, f"slots {bad} are outside {cell.pg_name!r}, which has {num_slots} bundles"
+            except BaseException:
+                self.scaling = old_scaling
+                raise
+            self._pools.update(new_pools)
+            return {name: [c.cell_id for c in pool.cells] for name, pool in new_pools.items()}
 
     def get_cell_bundles(self, cell_id: str) -> list[int]:
         return sorted(b for _, b in self._find_cell(cell_id).bundles())
 
-    def describe_cells(self, *, pool_ids: list[str] | None = None) -> dict[str, dict[str, Any]]:
-        """Every cell (of ``pool_ids``, default all) with its state and binding, read-only.
+    def describe_cells(
+        self, *, pool_ids: list[str] | None = None, category: str | None = None
+    ) -> dict[str, dict[str, Any]]:
+        """Every cell of the pools ``get_cell_infos`` would list, with its state and binding, read-only.
 
         ``alias`` is the caller's name for the cell (placement map ``rollout_cells``) or None; ``state`` is
         ``unbound`` (a deferred cell with no binding), ``stopped`` or ``running``; ``bundles`` / ``gpu_ids`` are the
         bundles of the startup placement group the cell uses or would use at its next start.
         """
-        pools = self._pools if pool_ids is None else {name: self._pools[name] for name in pool_ids}
-        return {c.cell_id: c.describe() for pool in pools.values() for c in pool.cells}
+        cell_ids = set(self.get_cell_infos(pool_ids=pool_ids, category=category))
+        return {c.cell_id: c.describe() for c in self._all_cells() if c.cell_id in cell_ids}
 
     def _validate_initial_bindings(self) -> None:
         owner: dict[tuple[Any, int], str] = {}
