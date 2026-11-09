@@ -16,6 +16,7 @@ from miles.utils.args.custom_view import compute_custom_function_config
 from miles.utils.audit_utils.event_logger.logger import get_event_logger, is_event_logger_initialized
 from miles.utils.audit_utils.event_logger.models import TrainAdvantageComputationEvent
 from miles.utils.lora.utils import is_multi_lora_enabled
+from miles.utils.sync_free import scalar_to_tensor, scalars_to_tensor
 from miles.utils.types import RolloutBatch
 
 
@@ -263,13 +264,15 @@ def loss_function(
             loss = loss / num_step_tokens * parallel_state.intra_dp.size
 
     per_datum = log.pop("per_datum", None) if batch.get("loss_fn") is not None else None
+    # scalar(s)_to_tensor = torch.tensor(...) built on the device: torch.tensor would read
+    # every GPU scalar on the host and copy the result back (one host wait per value).
     return (
         loss,
-        torch.tensor(num_tokens if args.backend.calculate_per_token_loss else 1, device=logits.device),
+        scalar_to_tensor(num_tokens if args.backend.calculate_per_token_loss else 1, device=logits.device),
         {
             **({"per_datum": per_datum} if per_datum is not None else {}),
             "keys": list(log.keys()),
-            "values": torch.tensor(
+            "values": scalars_to_tensor(
                 [num_samples if not args.backend.calculate_per_token_loss else num_tokens] + list(log.values()),
                 device=logits.device,
             ),

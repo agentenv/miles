@@ -17,6 +17,8 @@ from miles.utils.ft_utils.process_group_utils import GeneralPGUtil
 from miles.utils.object_store import ObjectStoreGetResult
 from miles.utils.ray_utils import Box
 from miles.utils.seqlen_balancing import get_seqlen_balanced_partitions
+from miles.utils.sync_free import enabled as host_sync_free_enabled
+from miles.utils.sync_free import to_device_async
 from miles.utils.types import RolloutBatch
 
 logger = logging.getLogger(__name__)
@@ -175,6 +177,25 @@ def _prepare_loss_masks(
     return loss_mask.unsqueeze(0)
 
 
+def thd_cu_seqlens_on_device(
+    cu_seqlens_host: tuple[int, ...], device: torch.device | str | int | None = None
+) -> tuple[torch.Tensor, int]:
+    """``(cu_seqlens on device as int32, max_seqlen)`` for a THD pack from its host boundaries.
+
+    The sync-free path reads max_seqlen from the host boundaries and copies cu_seqlens
+    without making the host wait; the old path (``MILES_HOST_SYNC_FREE=0``) copied first
+    and read max_seqlen back from the device. Both give the same values.
+    """
+
+    device = current_platform.current_device() if device is None else device
+    cu_seqlens_cpu = torch.tensor(cu_seqlens_host, dtype=torch.int)
+    if not host_sync_free_enabled():
+        cu_seqlens = cu_seqlens_cpu.to(device)
+        return cu_seqlens, (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+    max_seqlen = (cu_seqlens_cpu[1:] - cu_seqlens_cpu[:-1]).max().item()
+    return to_device_async(cu_seqlens_cpu, device), max_seqlen
+
+
 def get_batch(
     data_iterator: "DataIterator",
     keys: Sequence[str],
@@ -275,7 +296,6 @@ def get_batch(
                 cu_seqlens_list.append(cu_seqlens_list[-1] + pad)
 
             cu_seqlens_host = tuple(cu_seqlens_list)
-            cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int, device=current_platform.current_device())
             tokens = tokens.chunk(cp_size, dim=0)[cp_rank]
         else:
             tokens = [slice_with_cp(t, pad_token_id, qkv_format) for t in tokens]
@@ -295,9 +315,8 @@ def get_batch(
 
             # thd requires the cu_seqlens to be of the origin length
             cu_seqlens_host = tuple(boundary * cp_size for boundary in cu_seqlens)
-            cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int, device=current_platform.current_device()) * cp_size
 
-        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+        cu_seqlens, max_seqlen = thd_cu_seqlens_on_device(cu_seqlens_host)
 
         tokens = tokens.unsqueeze(0)
 
