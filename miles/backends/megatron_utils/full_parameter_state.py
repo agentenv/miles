@@ -29,6 +29,10 @@ _FP32_BYTES = 4
 
 _FRAGMENT_HASH_DOMAIN = b"miles-full-parameter-fragment-v1\0"
 _CHUNK_HASH_DOMAIN = b"miles-full-parameter-chunk-v1\0"
+# Labels of a lazy export (see ``_lazy_fragment_descriptor``).  Their own
+# domains keep a label from ever equalling a content hash.
+_LAZY_CHUNK_DOMAIN = b"miles-full-parameter-lazy-chunk-v1\0"
+_LAZY_FRAGMENT_DOMAIN = b"miles-full-parameter-lazy-fragment-v1\0"
 _SHARD_IDENTITY_DOMAIN = b"miles-full-parameter-chunked-shard-identity-v1\0"
 
 
@@ -188,14 +192,89 @@ class FullParameterOptimizerState:
             raise ValueError("optimizer-state fingerprint must be a lowercase SHA256")
 
 
+def _validate_rank_tuple(ranks: object, name: str) -> tuple[int, ...]:
+    if (
+        not isinstance(ranks, tuple)
+        or not ranks
+        or any(isinstance(rank, bool) or not isinstance(rank, int) or rank < 0 for rank in ranks)
+        or len(set(ranks)) != len(ranks)
+    ):
+        raise ValueError(f"full-parameter {name} must be a non-empty tuple of distinct global ranks")
+    return ranks
+
+
+@dataclass(frozen=True)
+class FullParameterReplication:
+    """The data-parallel groups whose ranks hold identical copies of this rank's parameters.
+
+    Megatron replicates a dense parameter across the data-parallel group with
+    context parallelism, and an expert parameter (``allreduce=False``) across
+    the expert data-parallel group; ``DistributedDataParallel.broadcast_params``
+    syncs the same two groups.  Ranks are global ``torch.distributed`` ranks in
+    group order.  ``expert_ranks`` is None when Megatron built no expert groups.
+    """
+
+    global_rank: int
+    dense_ranks: tuple[int, ...]
+    expert_ranks: tuple[int, ...] | None = None
+
+    def __post_init__(self) -> None:
+        _validate_non_negative_integer(self.global_rank, "global rank")
+        for name in ("dense_ranks", "expert_ranks"):
+            ranks = getattr(self, name)
+            if ranks is None and name == "expert_ranks":
+                continue
+            if self.global_rank not in _validate_rank_tuple(ranks, name.replace("_", " ")):
+                raise ValueError(f"full-parameter {name.replace('_', ' ')} do not contain this rank")
+
+    def ranks_for(self, name: str, parameter: torch.Tensor) -> tuple[int, ...]:
+        if getattr(parameter, "allreduce", True):
+            return self.dense_ranks
+        if self.expert_ranks is None:
+            raise RuntimeError(f"{name!r} is an expert parameter but Megatron has no expert data-parallel group")
+        return self.expert_ranks
+
+
+@dataclass(frozen=True, order=True)
+class FullParameterHolding:
+    """One local trainable parameter and the ranks that hold identical copies of it.
+
+    ``owner_rank`` exports the parameter and is the only rank whose manifest
+    lists a spec for it; every other rank of ``replica_ranks`` holds a replica
+    and writes the owner's bytes into it on every apply."""
+
+    name: str
+    shape: tuple[int, ...]
+    owner_rank: int
+    replica_ranks: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if not _PARAMETER_NAME.fullmatch(self.name) or "::" in self.name:
+            raise ValueError(f"invalid full-parameter name: {self.name!r}")
+        if not isinstance(self.shape, tuple) or not self.shape or any(
+            isinstance(dimension, bool) or not isinstance(dimension, int) or dimension <= 0 for dimension in self.shape
+        ):
+            raise ValueError(f"invalid shape for full-parameter holding {self.name!r}")
+        _validate_non_negative_integer(self.owner_rank, "owner rank")
+        if self.owner_rank not in _validate_rank_tuple(self.replica_ranks, "replica ranks"):
+            raise ValueError(f"full-parameter owner of {self.name!r} is not one of its replicas")
+
+
 @dataclass(frozen=True)
 class FullParameterShardManifest:
-    """Small immutable description of one topology-owned FP32 master shard."""
+    """Small immutable description of one topology-owned FP32 master shard.
+
+    ``specs`` are the parameters this rank owns (exports).  ``holdings``
+    lists every local parameter, owned or replicated, with its owner; it is
+    metadata for the group transport and is not part of the layout hash, so a
+    rank without data-parallel replicas keeps its pre-replica identity."""
 
     topology: FullParameterTopology
     role: str
     layout_hash: str
     specs: tuple[FullParameterShardSpec, ...]
+    global_rank: int = 0
+    holdings: tuple[FullParameterHolding, ...] = ()
 
     def __post_init__(self) -> None:
         if not _ROLE.fullmatch(self.role):
@@ -211,6 +290,20 @@ class FullParameterShardManifest:
             raise ValueError("full-parameter manifest mixes roles or topology shards")
         if self.layout_hash != _layout_hash(self.topology, self.specs):
             raise ValueError("full-parameter manifest layout hash changed")
+        _validate_non_negative_integer(self.global_rank, "global rank")
+        if self.holdings:
+            if self.holdings != tuple(sorted(self.holdings)) or len({holding.name for holding in self.holdings}) != len(self.holdings):
+                raise ValueError("full-parameter manifest holdings are not canonical")
+            if any(self.global_rank not in holding.replica_ranks for holding in self.holdings):
+                raise ValueError("full-parameter manifest holds a parameter outside its replica group")
+            owned = {holding.name: holding.shape for holding in self.holdings if holding.owner_rank == self.global_rank}
+            if owned != {spec.name: spec.shape for spec in self.specs}:
+                raise ValueError("full-parameter manifest specs differ from its owned holdings")
+
+    def replicated_holdings(self) -> tuple[FullParameterHolding, ...]:
+        """Holdings another rank owns: this rank writes their owner's bytes."""
+
+        return tuple(holding for holding in self.holdings if holding.owner_rank != self.global_rank)
 
 
 @dataclass(frozen=True, order=True)
@@ -383,6 +476,15 @@ class _PreparedFullParameterChunkedShard:
     # read them and commit does not copy them.
     resident_fragment_ids: frozenset[int] = frozenset()
     resident_record: object | None = None
+    # Data-parallel replicas (``full_parameter_replicas``): the owners' shards
+    # of this cut, in replica-plan order, and the owner fragments the replicas
+    # already hold.
+    replica_states: tuple[FullParameterChunkedShardState, ...] = ()
+    replica_resident_ids: frozenset = frozenset()
+    replica_resident_record: object | None = None
+    # Resident fragments whose descriptor is a lazy-export label; the commit
+    # keeps them labelled in the record it writes.
+    lazy_fragment_ids: frozenset[int] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -392,7 +494,12 @@ class _ResidentFullParameterFragments:
     Written by a chunked export (the bytes it hashed are the masters) and by a
     chunked commit (the masters now hold the target).  Valid only while the
     tracking state it was taken at is unchanged: a local step, a restore, a
-    legacy apply or the start of a commit drops it."""
+    legacy apply or the start of a commit drops it.
+
+    ``lazy_fragment_ids``: fragments whose recorded payload hash is a label of
+    a lazy export, not a content hash.  The label is fresh for every lazy
+    export and only this record vouches for it, so a row carrying it is
+    either resident or unusable (its stored bytes cannot be checked)."""
 
     parameter_layout_hash: str
     plan_hash: str
@@ -400,6 +507,7 @@ class _ResidentFullParameterFragments:
     local_step_generation: int
     scheduler_num_steps: int
     payload_hashes: Mapping[int, tuple[int, str]]
+    lazy_fragment_ids: frozenset[int] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -469,7 +577,8 @@ def _resolve_master(
     flat FP32 range per parameter (``main_param_sharded``); at DP=1 that range
     is the whole parameter, so ``master`` is a parameter-shaped view of it and
     writes through the view land in the tensor that is stepped. A partial
-    range (DP>1, or a rank owning none of the parameter) is refused.
+    range (DP>1, or a rank owning none of the parameter) is refused: at DP>1
+    every data-parallel replica keeps a whole master (``_local_layout``).
     """
 
     sharded = bool(getattr(parameter, "main_param_sharded", False))
@@ -487,13 +596,17 @@ def _resolve_master(
         elif sharded:
             raise RuntimeError(
                 f"{name!r} has no local FP32 master (DP-sharded optimizer, or precision-aware without "
-                "CPU offload); the initial DiLoCo profile requires DP=1 and FP32 masters"
+                "CPU offload); full-parameter sync needs a whole FP32 master of every parameter on "
+                "every rank (at DP>1: the non-distributed optimizer without CPU offload)"
             )
         else:
             raise RuntimeError(f"{name!r} has no FP32 optimizer master")
     if not isinstance(fp32, torch.Tensor) or fp32.dtype != torch.float32 or fp32.numel() != parameter.numel():
         if sharded:
-            raise RuntimeError(f"{name!r} optimizer master is a partial DP shard; the initial DiLoCo profile requires DP=1")
+            raise RuntimeError(
+                f"{name!r} optimizer master is a partial DP shard; full-parameter sync at DP>1 needs "
+                "the non-distributed optimizer without CPU offload (whole FP32 masters on every rank)"
+            )
         raise RuntimeError(f"{name!r} has an incomplete FP32 optimizer master")
     if sharded:
         if fp32.dim() != 1 or not fp32.is_contiguous():
@@ -554,6 +667,112 @@ def _specs_and_masters(
     if not specs:
         raise RuntimeError("full-parameter shard is empty")
     return tuple(specs), masters
+
+
+def full_parameter_replication() -> FullParameterReplication:
+    """This rank's data-parallel replica groups (one rank when not distributed)."""
+
+    import torch.distributed as dist
+
+    if not dist.is_available() or not dist.is_initialized():
+        return FullParameterReplication(global_rank=0, dense_ranks=(0,), expert_ranks=(0,))
+    from megatron.core import mpu
+
+    def ranks(group) -> tuple[int, ...]:
+        return tuple(int(rank) for rank in dist.get_process_group_ranks(group))
+
+    try:
+        expert_ranks = ranks(mpu.get_expert_data_parallel_group())
+    except (AssertionError, RuntimeError):  # Megatron built no expert groups
+        expert_ranks = None
+    return FullParameterReplication(
+        global_rank=int(dist.get_rank()),
+        dense_ranks=ranks(mpu.get_data_parallel_group(with_context_parallel=True)),
+        expert_ranks=expert_ranks,
+    )
+
+
+def _replica_owners(
+    named_parameters: Sequence[tuple[str, torch.nn.Parameter]],
+    replication: FullParameterReplication,
+) -> dict[str, tuple[int, tuple[int, ...]]]:
+    """``{name: (owner rank, replica ranks)}``, balanced within each replica group.
+
+    Every rank of a group holds the same parameters, so each computes the
+    same assignment without communication: largest parameter first (ties by
+    name) to the least-loaded rank (ties by group order).  The first
+    ``len(group)`` parameters go to distinct ranks, so every rank of a group
+    with at least that many parameters owns one.  A group of one rank owns
+    everything, which keeps a DP=1 layout unchanged."""
+
+    by_group: dict[tuple[int, ...], list[tuple[str, int]]] = {}
+    for name, parameter in named_parameters:
+        by_group.setdefault(replication.ranks_for(name, parameter), []).append((name, parameter.numel()))
+    owners: dict[str, tuple[int, tuple[int, ...]]] = {}
+    for ranks, members in by_group.items():
+        load = [0] * len(ranks)
+        for name, numel in sorted(members, key=lambda member: (-member[1], member[0])):
+            index = min(range(len(ranks)), key=lambda position: (load[position], position))
+            load[index] += numel
+            owners[name] = (ranks[index], ranks)
+    return owners
+
+
+@dataclass(frozen=True)
+class _LocalLayout:
+    """This rank's parameters split into the ones it owns and the replicas it holds."""
+
+    specs: tuple[FullParameterShardSpec, ...]
+    masters: dict[str, torch.Tensor]  # wire name -> FP32 master of an owned parameter
+    holdings: tuple[FullParameterHolding, ...]
+    replica_masters: dict[str, torch.Tensor]  # parameter name -> FP32 master of a replica
+
+
+def _local_layout(
+    named_parameters: Iterable[tuple[str, torch.nn.Parameter]],
+    *,
+    role: str,
+    topology: FullParameterTopology,
+    replication: FullParameterReplication,
+    optimizer_owned_parameter_ids: frozenset[int] | None = None,
+) -> _LocalLayout:
+    ordered = tuple(sorted(named_parameters, key=lambda value: value[0]))
+    owners = _replica_owners(ordered, replication)
+    specs, masters, holdings, replica_masters = [], {}, [], {}
+    for name, parameter in ordered:
+        if not isinstance(parameter, torch.nn.Parameter):
+            raise TypeError(f"{name!r} is not a trainable parameter")
+        master = _master_parameter(parameter, name, optimizer_owned_parameter_ids=optimizer_owned_parameter_ids)
+        shape = tuple(int(dimension) for dimension in master.shape)
+        owner, ranks = owners[name]
+        holdings.append(FullParameterHolding(name=name, shape=shape, owner_rank=owner, replica_ranks=ranks))
+        if owner != replication.global_rank:
+            replica_masters[name] = master
+            continue
+        spec = FullParameterShardSpec(role, topology.shard_id, name, shape, "float32", master.numel())
+        specs.append(spec)
+        masters[spec.wire_name] = master
+    if not specs:
+        raise RuntimeError(
+            "this rank owns no full-parameter tensor: its data-parallel group has more ranks than parameters"
+        )
+    return _LocalLayout(specs=tuple(specs), masters=masters, holdings=tuple(holdings), replica_masters=replica_masters)
+
+
+def _actor_local_layout(actor, *, role: str, topology: FullParameterTopology) -> tuple[
+    tuple[tuple[str, torch.nn.Parameter], ...],
+    frozenset[int],
+    _LocalLayout,
+]:
+    named_parameters, optimizer_owned = _actor_parameter_context(actor)
+    layout = _local_layout(
+        named_parameters,
+        role=role,
+        topology=topology,
+        replication=full_parameter_replication(),
+        optimizer_owned_parameter_ids=optimizer_owned,
+    )
+    return named_parameters, optimizer_owned, layout
 
 
 def _layout_hash(
@@ -794,6 +1013,8 @@ def _deferred_fragment_ids(state: FullParameterChunkedShardState) -> frozenset[i
 
 
 _RESIDENT_SKIP_ENV = "MILES_FULL_PARAMETER_SKIP_RESIDENT"
+# The owner fragments a rank's data-parallel replicas hold (``full_parameter_replicas``).
+_REPLICA_RESIDENT_ATTRIBUTE = "_external_full_parameter_replica_resident"
 
 
 def _resident_skip_enabled() -> bool:
@@ -807,6 +1028,7 @@ def forget_full_parameter_resident_fragments(actor) -> None:
     export/commit path (a checkpoint or peer snapshot restore)."""
 
     actor._external_full_parameter_resident = None
+    setattr(actor, _REPLICA_RESIDENT_ATTRIBUTE, None)
 
 
 def _record_resident_fragments(
@@ -817,6 +1039,7 @@ def _record_resident_fragments(
     policy_version: int,
     local_step_generation: int,
     fragments: Sequence[FullParameterFragmentDescriptor],
+    lazy_fragment_ids: frozenset[int] = frozenset(),
 ) -> None:
     actor._external_full_parameter_resident = _ResidentFullParameterFragments(
         parameter_layout_hash=parameter_layout_hash,
@@ -825,6 +1048,7 @@ def _record_resident_fragments(
         local_step_generation=local_step_generation,
         scheduler_num_steps=_scheduler_num_steps(actor),
         payload_hashes={fragment.fragment_id: (fragment.numel, fragment.payload_hash) for fragment in fragments},
+        lazy_fragment_ids=frozenset(lazy_fragment_ids),
     )
 
 
@@ -858,6 +1082,23 @@ def _resident_fragment_ids(
         if record.payload_hashes.get(fragment.fragment_id) == (fragment.numel, fragment.payload_hash)
     )
     return resident, record
+
+
+def _lazy_fragment_ids(actor, state: FullParameterChunkedShardState) -> frozenset[int]:
+    """Fragments of ``state`` whose descriptor is a label the live record minted.
+
+    Only the label is compared here; whether the record still describes the
+    masters is :func:`_resident_fragment_ids`' check."""
+
+    record = getattr(actor, "_external_full_parameter_resident", None)
+    if not isinstance(record, _ResidentFullParameterFragments) or not record.lazy_fragment_ids:
+        return frozenset()
+    return frozenset(
+        fragment.fragment_id
+        for fragment in state.fragments
+        if fragment.fragment_id in record.lazy_fragment_ids
+        and record.payload_hashes.get(fragment.fragment_id) == (fragment.numel, fragment.payload_hash)
+    )
 
 
 def _note_apply_stats(actor, phase: str, **values) -> None:
@@ -1040,8 +1281,8 @@ def require_full_parameter_actor(args, action: str) -> None:
     """Refuse a LoRA actor unless it opted into the LoRA hybrid profile.
 
     A hybrid actor streams every ``requires_grad`` parameter (adapters plus
-    recipe-unfrozen base parameters); the rest of the profile (DP=1, FP32
-    optimizer masters for every trainable parameter) is unchanged.
+    recipe-unfrozen base parameters); the rest of the profile (a whole FP32
+    optimizer master of every trainable parameter on every rank) is unchanged.
     """
 
     from miles.utils.lora.utils import full_parameter_lora_hybrid_enabled, is_lora_enabled
@@ -1159,7 +1400,7 @@ def _distributed_masters(optimizer) -> dict[int, tuple[torch.Tensor, torch.Tenso
 
 
 @torch.no_grad()
-def _propagate_master_writes(actor) -> int:
+def _propagate_master_writes(actor, *, owned_ids: frozenset[int] | set[int] | None = None) -> int:
     """Make the tensors Megatron's HybridDeviceOptimizer steps agree with written masters.
 
     Under ``--optimizer-cpu-offload`` each base-optimizer parameter may have an
@@ -1173,6 +1414,9 @@ def _propagate_master_writes(actor) -> int:
       its FP32 inner copy, which is the master.
 
     Adam moments are left as they are (the non-distributed path keeps them too).
+
+    ``owned_ids``: only the pairs whose optimizer-owned tensor is one of these
+    (the masters a commit wrote); None propagates every pair.
     """
 
     pairs = 0
@@ -1181,7 +1425,7 @@ def _propagate_master_writes(actor) -> int:
         if inner is None:
             continue
         for owned, copy in inner.items():
-            if copy is owned:
+            if copy is owned or (owned_ids is not None and id(owned) not in owned_ids):
                 continue
             if copy.numel() != owned.numel():
                 raise RuntimeError("hybrid optimizer inner copy has a different size")
@@ -1218,18 +1462,32 @@ def full_parameter_shard_manifest(
 
     require_full_parameter_actor(actor.args, "describe")
     topology = full_parameter_topology()
+    replication = full_parameter_replication()
     named_parameters, optimizer_owned = _actor_parameter_context(actor)
-    specs, _masters = _specs_and_masters(
+    layout = _local_layout(
         named_parameters,
         role=role,
         topology=topology,
+        replication=replication,
         optimizer_owned_parameter_ids=optimizer_owned,
     )
+    return _manifest_from_layout(layout, topology=topology, role=role, global_rank=replication.global_rank)
+
+
+def _manifest_from_layout(
+    layout: _LocalLayout,
+    *,
+    topology: FullParameterTopology,
+    role: str,
+    global_rank: int,
+) -> FullParameterShardManifest:
     return FullParameterShardManifest(
         topology=topology,
         role=role,
-        layout_hash=_layout_hash(topology, specs),
-        specs=specs,
+        layout_hash=_layout_hash(topology, layout.specs),
+        specs=layout.specs,
+        global_rank=global_rank,
+        holdings=layout.holdings,
     )
 
 
@@ -1271,32 +1529,54 @@ def install_full_parameter_fragment_plan(
     plan: FullParameterOwnerFragmentPlan,
     *,
     role: str = "actor",
+    replica_sources: Sequence[tuple[FullParameterShardManifest, FullParameterOwnerFragmentPlan]] = (),
 ) -> int:
-    """Install one immutable exact-coverage owner plan on an actor rank."""
+    """Install one immutable exact-coverage owner plan on an actor rank.
+
+    ``replica_sources``: ``(manifest, plan)`` of every owner of a parameter
+    this rank holds a data-parallel replica of (``full_parameter_replicas``)."""
+
+    from miles.backends.megatron_utils import full_parameter_replicas as replicas  # import cycle
 
     if getattr(actor, "_external_full_parameter_prepared_cut", None) is not None:
         raise RuntimeError("cannot change a full-parameter plan with a prepared cut")
     manifest = full_parameter_shard_manifest(actor, role=role)
     _validate_fragment_plan_against_manifest(plan, manifest)
+    replica_plan = replicas.build_replica_plan(manifest, plan, tuple(replica_sources))
     installed = getattr(actor, "_external_full_parameter_fragment_plan", None)
-    if installed is None:
-        actor._external_full_parameter_fragment_plan = plan
-    elif installed != plan:
+    if installed is not None and installed != plan:
         raise RuntimeError("full-parameter owner plan is already installed")
+    replicas.install_replica_plan(actor, replica_plan)
+    actor._external_full_parameter_fragment_plan = plan
     return len(plan.fragments)
 
 
-def _require_full_parameter_fragment_plan(
-    actor,
-    *,
-    role: str,
-) -> tuple[FullParameterOwnerFragmentPlan, FullParameterShardManifest]:
+def _require_installed_layout(actor, *, role: str):
+    """``(plan, manifest, replica plan, named parameters, optimizer-owned IDs, local layout)``.
+
+    Refuses when the owned specs or the replica holdings changed since the
+    plan was installed."""
+
+    from miles.backends.megatron_utils import full_parameter_replicas as replicas  # import cycle
+
     plan = getattr(actor, "_external_full_parameter_fragment_plan", None)
     if not isinstance(plan, FullParameterOwnerFragmentPlan):
         raise RuntimeError("full-parameter owner plan is not installed")
-    manifest = full_parameter_shard_manifest(actor, role=role)
+    require_full_parameter_actor(actor.args, "describe")
+    topology = full_parameter_topology()
+    replication = full_parameter_replication()
+    named_parameters, optimizer_owned = _actor_parameter_context(actor)
+    layout = _local_layout(
+        named_parameters,
+        role=role,
+        topology=topology,
+        replication=replication,
+        optimizer_owned_parameter_ids=optimizer_owned,
+    )
+    manifest = _manifest_from_layout(layout, topology=topology, role=role, global_rank=replication.global_rank)
     _validate_fragment_plan_against_manifest(plan, manifest)
-    return plan, manifest
+    replica_plan = replicas.require_replica_plan(actor, manifest)
+    return plan, manifest, replica_plan, named_parameters, optimizer_owned, layout
 
 
 # HybridDeviceOptimizer (param_update_in_fp32) mirrors each inner FP32 copy
@@ -1381,13 +1661,7 @@ def full_parameter_optimizer_state(
             raise RuntimeError(f"full-parameter {name} is unavailable")
 
     topology = full_parameter_topology()
-    named_parameters, optimizer_owned = _actor_parameter_context(actor)
-    specs, masters = _specs_and_masters(
-        named_parameters,
-        role=role,
-        topology=topology,
-        optimizer_owned_parameter_ids=optimizer_owned,
-    )
+    named_parameters, optimizer_owned, layout = _actor_local_layout(actor, role=role, topology=topology)
     if check_model:
         model_count = _validate_model_matches_masters(
             named_parameters,
@@ -1397,12 +1671,14 @@ def full_parameter_optimizer_state(
         model_count = len(tuple(named_parameters))
         if model_count < 1:
             raise RuntimeError("full-parameter model/master check is empty")
-    spec_by_name = {spec.name: spec for spec in specs}
-    spec_by_master = {
-        id(_resolve_master(parameter, name, optimizer_owned_parameter_ids=optimizer_owned)[0]): spec_by_name[name]
+    # A data-parallel replica has no spec on this rank (its owner exports it);
+    # its state counts, but the fingerprint is taken from an owned parameter.
+    spec_by_name = {spec.name: spec for spec in layout.specs}
+    name_by_master = {
+        id(_resolve_master(parameter, name, optimizer_owned_parameter_ids=optimizer_owned)[0]): name
         for name, parameter in named_parameters
     }
-    populated: dict[str, tuple[FullParameterShardSpec, Mapping[str, object]]] = {}
+    populated: dict[str, Mapping[str, object]] = {}
     tensor_count = 0
     scalar_count = 0
     for base in _optimizer_bases(actor.optimizer):
@@ -1413,20 +1689,21 @@ def full_parameter_optimizer_state(
             state = _adam_state(state)
             if not state:
                 continue
-            spec = spec_by_master.get(id(parameter))
-            if spec is None:
+            name = name_by_master.get(id(parameter))
+            if name is None:
                 raise RuntimeError("optimizer state belongs to an unknown parameter")
-            if spec.wire_name in populated or not isinstance(state, Mapping):
+            if name in populated or not isinstance(state, Mapping):
                 raise RuntimeError("optimizer parameter state is malformed")
-            populated[spec.wire_name] = (spec, state)
+            populated[name] = state
             for value in state.values():
                 if isinstance(value, torch.Tensor):
                     tensor_count += 1
                     scalar_count += value.numel()
-    if not populated:
+    owned = [(spec_by_name[name], state) for name, state in populated.items() if name in spec_by_name]
+    if not owned:
         raise RuntimeError("full-parameter optimizer has not completed a step")
     selected_spec, selected_state = min(
-        populated.values(),
+        owned,
         key=lambda item: (item[0].numel, item[0].wire_name),
     )
     return FullParameterOptimizerState(
@@ -1620,8 +1897,14 @@ def record_full_parameter_local_step(
     base_policy_version: int,
     rollout_id: int,
     role: str = "actor",
+    check_model: bool = True,
 ) -> FullParameterLocalStepReceipt:
-    """Commit one local-step generation after exact scheduler progress."""
+    """Commit one local-step generation after exact scheduler progress.
+
+    ``check_model=False`` skips the whole-model model/master comparison.  A
+    caller does so only when its next export is lazy: that export reads no
+    master, and every fragment it later materializes compares its own
+    parameters with their masters."""
 
     require_full_parameter_actor(actor.args, "record")
     _reject_prepared_full_parameter_boundary_mutation(actor)
@@ -1653,11 +1936,12 @@ def record_full_parameter_local_step(
     end = _scheduler_num_steps(actor)
     if end != start + scheduler_increment:
         raise RuntimeError("full-parameter local step lacks exact optimizer progress")
-    named_parameters, optimizer_owned = _actor_parameter_context(actor)
-    _validate_model_matches_masters(
-        named_parameters,
-        optimizer_owned_parameter_ids=optimizer_owned,
-    )
+    if check_model:
+        named_parameters, optimizer_owned = _actor_parameter_context(actor)
+        _validate_model_matches_masters(
+            named_parameters,
+            optimizer_owned_parameter_ids=optimizer_owned,
+        )
     generation += 1
     # The local step changed the masters.
     forget_full_parameter_resident_fragments(actor)
@@ -2023,6 +2307,70 @@ def _describe_fragment(
     )
 
 
+def _lazy_fragment_descriptor(
+    fragment: FullParameterFragmentPlan,
+    *,
+    max_chunk_numel: int,
+    parameter_layout_hash: str,
+    plan_hash: str,
+    nonce: bytes,
+) -> FullParameterFragmentDescriptor:
+    """``fragment``'s chunk geometry with label hashes; no master is read.
+
+    Each chunk and the fragment get a SHA-256 over their own lazy domain, the
+    same identity fields as the content hash and ``nonce``, which is fresh for
+    every lazy export.  The label therefore names one export of the masters
+    and never equals a content hash; ``materialize_full_parameter_fragments``
+    computes the content descriptor when a fragment leaves the actor."""
+
+    chunks = []
+    flat_offset = 0
+    while flat_offset < fragment.numel:
+        chunk_numel = min(max_chunk_numel, fragment.numel - flat_offset)
+        digest = hashlib.sha256(_LAZY_CHUNK_DOMAIN)
+        digest.update(parameter_layout_hash.encode("ascii"))
+        digest.update(plan_hash.encode("ascii"))
+        digest.update(fragment.fragment_id.to_bytes(8, "little"))
+        digest.update(len(chunks).to_bytes(8, "little"))
+        digest.update(flat_offset.to_bytes(8, "little"))
+        digest.update(nonce)
+        chunks.append(
+            FullParameterChunkDescriptor(
+                chunk_index=len(chunks),
+                flat_offset=flat_offset,
+                numel=chunk_numel,
+                payload_hash=digest.hexdigest(),
+            )
+        )
+        flat_offset += chunk_numel
+    digest = hashlib.sha256(_LAZY_FRAGMENT_DOMAIN)
+    digest.update(parameter_layout_hash.encode("ascii"))
+    digest.update(plan_hash.encode("ascii"))
+    digest.update(fragment.fragment_id.to_bytes(8, "little"))
+    digest.update(nonce)
+    return FullParameterFragmentDescriptor(
+        fragment_id=fragment.fragment_id,
+        numel=fragment.numel,
+        payload_hash=digest.hexdigest(),
+        chunks=tuple(chunks),
+    )
+
+
+def _same_fragment_geometry(
+    first: FullParameterFragmentDescriptor,
+    second: FullParameterFragmentDescriptor,
+) -> bool:
+    return (
+        first.fragment_id == second.fragment_id
+        and first.numel == second.numel
+        and len(first.chunks) == len(second.chunks)
+        and all(
+            (a.chunk_index, a.flat_offset, a.numel) == (b.chunk_index, b.flat_offset, b.numel)
+            for a, b in zip(first.chunks, second.chunks, strict=True)
+        )
+    )
+
+
 class _Done:
     """A finished future (``_hash_pool().submit`` without the pool)."""
 
@@ -2075,6 +2423,7 @@ def export_full_parameter_chunked_shard(
     role: str = "actor",
     ray_module=None,
     defer_payload: bool = False,
+    lazy: bool = False,
 ) -> FullParameterChunkedShardState:
     """Export bounded owner chunks without materializing a rank or global cut.
 
@@ -2082,9 +2431,18 @@ def export_full_parameter_chunked_shard(
     does (same descriptors, same hashes, same NaN/Inf refusal) but store no
     bytes in Ray; every chunk ref is ``DEFERRED_FULL_PARAMETER_CHUNK``.
     ``materialize_full_parameter_fragments`` stores the fragments a caller
-    needs while the masters still hold them."""
+    needs while the masters still hold them.
+
+    ``lazy`` (with ``defer_payload``): read no master at all.  Every
+    descriptor carries the real chunk geometry and label hashes
+    (``_lazy_fragment_descriptor``), so the cut is a unique name for this
+    export, not a content proof, and no NaN/Inf check runs.  The content
+    descriptor, the NaN/Inf check and the model/master check of a fragment
+    run when ``materialize_full_parameter_fragments`` stores it."""
 
     require_full_parameter_actor(actor.args, "export")
+    if lazy and not defer_payload:
+        raise ValueError("a lazy full-parameter export must defer its payload")
     assert_full_parameter_boundary_clear(actor)
     _validate_scheduler_tracking_congruence(actor, role=role)
     _validate_non_negative_integer(policy_version, "policy version")
@@ -2100,19 +2458,26 @@ def export_full_parameter_chunked_shard(
     started = time.monotonic()
     max_chunk_numel = _validate_chunk_byte_limit(max_chunk_bytes)
     ray_module = _resolve_ray_module(ray_module)
-    plan, manifest = _require_full_parameter_fragment_plan(actor, role=role)
-    named_parameters, optimizer_owned = _actor_parameter_context(actor)
-    specs, masters = _specs_and_masters(
-        named_parameters,
-        role=role,
-        topology=manifest.topology,
-        optimizer_owned_parameter_ids=optimizer_owned,
-    )
-    if specs != manifest.specs:
-        raise RuntimeError("full-parameter local specs changed after plan installation")
+    plan, manifest, _replica_plan, _named, _owned, layout = _require_installed_layout(actor, role=role)
+    masters = layout.masters
     fragment_descriptors = []
     chunk_refs = []
-    if defer_payload:
+    lazy_ids: frozenset[int] = frozenset()
+    if lazy:
+        nonce = os.urandom(32)
+        fragment_descriptors = [
+            _lazy_fragment_descriptor(
+                fragment,
+                max_chunk_numel=max_chunk_numel,
+                parameter_layout_hash=plan.parameter_layout_hash,
+                plan_hash=plan.plan_hash,
+                nonce=nonce,
+            )
+            for fragment in plan.fragments
+        ]
+        lazy_ids = frozenset(fragment.fragment_id for fragment in plan.fragments)
+        chunk_refs = [[DEFERRED_FULL_PARAMETER_CHUNK] * len(descriptor.chunks) for descriptor in fragment_descriptors]
+    elif defer_payload:
         fragment_descriptors = _parallel_map(
             lambda fragment: _describe_fragment(
                 fragment,
@@ -2152,15 +2517,48 @@ def export_full_parameter_chunked_shard(
         policy_version=policy_version,
         local_step_generation=local_step_generation,
         fragments=fragment_descriptors,
+        lazy_fragment_ids=lazy_ids,
     )
     _note_apply_stats(
         actor,
         "export",
         fragments=len(fragment_descriptors),
         deferred=bool(defer_payload),
+        lazy=bool(lazy),
         seconds=time.monotonic() - started,
     )
     return state
+
+
+def note_full_parameter_replica_export(
+    actor,
+    *,
+    states: Sequence[FullParameterChunkedShardState],
+    role: str = "actor",
+    lazy: bool = False,
+) -> int:
+    """Record that this rank's data-parallel replicas hold what their owners exported.
+
+    ``states``: the exported shards of the owners this rank replicates, at
+    this rank's tracking state (the group transport calls this right after
+    every chunked export).  A later skip-resident apply then reads only the
+    owner fragments that changed, as the owners do; a deferred owner fragment
+    is readable only through this record.  ``lazy``: the owners' export was
+    lazy (labels, no content hashes), so the replicas are not hashed against
+    it.  Returns the replica fragments recorded."""
+
+    from miles.backends.megatron_utils import full_parameter_replicas as replicas  # import cycle
+
+    require_full_parameter_actor(actor.args, "note")
+    assert_full_parameter_boundary_clear(actor)
+    _validate_scheduler_tracking_congruence(actor, role=role)
+    started = time.monotonic()
+    _plan, _manifest, replica_plan, _named, _owned, layout = _require_installed_layout(actor, role=role)
+    stats = replicas.note_replica_export(
+        actor, replica_plan, tuple(states), replica_masters=layout.replica_masters, lazy=lazy
+    )
+    _note_apply_stats(actor, "replica_export", **stats, seconds=time.monotonic() - started)
+    return stats["fragments"]
 
 
 def materialize_full_parameter_fragments(
@@ -2170,7 +2568,8 @@ def materialize_full_parameter_fragments(
     fragment_ids: Sequence[int],
     role: str = "actor",
     ray_module=None,
-) -> tuple[tuple[int, list[object]], ...]:
+    return_descriptors: bool = False,
+) -> tuple[tuple, ...]:
     """Store the bytes of deferred fragments of ``state`` while the masters hold them.
 
     Each requested fragment must be resident: its payload hash equals the one
@@ -2180,7 +2579,15 @@ def materialize_full_parameter_fragments(
     chunk geometry and its descriptor must come out identical, so the stored
     bytes are exactly the bytes the deferred export hashed.  Returns
     ``(fragment_id, chunk refs)`` in fragment order; the masters, the record
-    and the tracking state do not change."""
+    and the tracking state do not change.
+
+    A fragment of a lazy export carries labels instead of content hashes:
+    the record proves the masters still hold the exported bytes, the export
+    here computes the content descriptor (with the NaN/Inf check) and its
+    model parameters are compared with their masters.  Its descriptor then
+    differs from the label, so the caller must ask for it
+    (``return_descriptors``: rows are ``(fragment_id, chunk refs,
+    descriptor)``) and read the stored chunks through it."""
 
     require_full_parameter_actor(actor.args, "materialize")
     assert_full_parameter_boundary_clear(actor)
@@ -2196,7 +2603,7 @@ def materialize_full_parameter_fragments(
         return ()
     started = time.monotonic()
     ray_module = _resolve_ray_module(ray_module)
-    plan, manifest = _require_full_parameter_fragment_plan(actor, role=role)
+    plan, manifest, _replica_plan, named_parameters, optimizer_owned, layout = _require_installed_layout(actor, role=role)
     _validate_chunked_shard_against_plan(state, plan, manifest)
     descriptors = {descriptor.fragment_id: descriptor for descriptor in state.fragments}
     fragments = {fragment.fragment_id: fragment for fragment in plan.fragments}
@@ -2206,17 +2613,12 @@ def materialize_full_parameter_fragments(
     stale = sorted(fragment_id for fragment_id in requested if fragment_id not in resident)
     if stale:
         raise RuntimeError(f"full-parameter fragments {stale} are no longer held by the masters; a deferred export cannot be materialized after they changed")
-    named_parameters, optimizer_owned = _actor_parameter_context(actor)
-    specs, masters = _specs_and_masters(
-        named_parameters,
-        role=role,
-        topology=manifest.topology,
-        optimizer_owned_parameter_ids=optimizer_owned,
-    )
-    if specs != manifest.specs:
-        raise RuntimeError("full-parameter local specs changed after plan installation")
+    lazy = _lazy_fragment_ids(actor, state) & frozenset(requested)
+    if lazy and not return_descriptors:
+        raise RuntimeError(f"full-parameter fragments {sorted(lazy)} come from a lazy export: materialize them with return_descriptors=True")
+    masters = layout.masters
 
-    def store(fragment_id: int) -> tuple[int, list[object]]:
+    def store(fragment_id: int) -> tuple[int, list[object], FullParameterFragmentDescriptor]:
         expected = descriptors[fragment_id]
         descriptor, references = _export_fragment_chunks(
             fragments[fragment_id],
@@ -2227,18 +2629,48 @@ def materialize_full_parameter_fragments(
             ray_module=ray_module,
             overlap_checks=len(requested) <= 1,
         )
-        if descriptor != expected:
+        if fragment_id in lazy:
+            if not _same_fragment_geometry(descriptor, expected):
+                raise RuntimeError(f"full-parameter fragment {fragment_id} geometry changed since its lazy export")
+        elif descriptor != expected:
             raise RuntimeError(f"full-parameter fragment {fragment_id} bytes changed since its deferred export")
-        return fragment_id, references
+        return fragment_id, references, descriptor
 
     stored = _parallel_map(store, sorted(requested))
+    checked = 0
+    if lazy:
+        # A lazy export compared no model parameter with its master: the
+        # parameters of every fragment that leaves the actor are compared now.
+        by_wire_name = _parameters_by_wire_name(named_parameters, layout.specs)
+        names = dict.fromkeys(name for fragment_id in sorted(lazy) for name in fragments[fragment_id].wire_names)
+        checked = _validate_model_matches_masters(
+            (by_wire_name[name] for name in names),
+            optimizer_owned_parameter_ids=optimizer_owned,
+        )
     _note_apply_stats(
         actor,
         "materialize",
         fragments=len(stored),
+        lazy_fragments=len(lazy),
+        model_checked_parameters=checked,
         seconds=time.monotonic() - started,
     )
-    return tuple(stored)
+    if return_descriptors:
+        return tuple(stored)
+    return tuple((fragment_id, references) for fragment_id, references, _descriptor in stored)
+
+
+def _parameters_by_wire_name(
+    named_parameters: Iterable[tuple[str, torch.nn.Parameter]],
+    specs: Sequence[FullParameterShardSpec],
+) -> dict[str, tuple[str, torch.nn.Parameter]]:
+    """``wire name -> (name, parameter)`` for this rank's ``specs`` (every local
+    parameter at DP=1; the owned ones with data-parallel replicas)."""
+
+    by_name = dict(named_parameters)
+    if any(spec.name not in by_name for spec in specs):
+        raise RuntimeError("full-parameter specs do not match the named parameters")
+    return {spec.wire_name: (spec.name, by_name[spec.name]) for spec in specs}
 
 
 def _validate_chunked_shard_against_plan(
@@ -2266,6 +2698,7 @@ def prepare_full_parameter_chunked_shard(
     role: str = "actor",
     ray_module=None,
     skip_resident: bool = False,
+    replica_states: Sequence[FullParameterChunkedShardState] = (),
 ) -> int:
     """Validate every immutable chunk and stage only its refs for later commit.
 
@@ -2274,7 +2707,13 @@ def prepare_full_parameter_chunked_shard(
     fragment whose payload hash equals the one the actor recorded for its
     masters at that export/commit is then neither read nor copied: the masters
     already hold those bytes.  The record is dropped by every local step,
-    restore rebase and legacy apply, so the skip never applies across one."""
+    restore rebase and legacy apply, so the skip never applies across one.
+
+    ``replica_states``: the cut's shards of the owners whose parameters this
+    rank replicates (data-parallel replicas); the chunks a commit copies into
+    the replicas are checked here the same way, and the same skip applies."""
+
+    from miles.backends.megatron_utils import full_parameter_replicas as replicas  # import cycle
 
     require_full_parameter_actor(actor.args, "prepare")
     token = _validate_commit_token(commit_token)
@@ -2309,23 +2748,31 @@ def prepare_full_parameter_chunked_shard(
     if state.policy_version <= installed:
         raise RuntimeError("full-parameter policy version is stale")
     ray_module = _resolve_ray_module(ray_module)
-    plan, manifest = _require_full_parameter_fragment_plan(actor, role=role)
+    plan, manifest, replica_plan, _named, _owned, _layout = _require_installed_layout(actor, role=role)
     _validate_chunked_shard_against_plan(state, plan, manifest)
+    replica_states = replicas.match_replica_states(
+        replica_plan,
+        tuple(replica_states),
+        policy_version=state.policy_version,
+        local_step_generation=state.local_step_generation,
+    )
     started = time.monotonic()
+    # A deferred fragment has no stored bytes and a lazy one has no content
+    # hash to check stored bytes against: only the masters hold them, so
+    # their residency does not depend on the skip switch.
     deferred = _deferred_fragment_ids(state)
+    lazy = _lazy_fragment_ids(actor, state)
     resident, resident_record = (
         _resident_fragment_ids(actor, state) if skip_resident else (frozenset(), None)
     )
-    if deferred - resident:
-        # A deferred fragment has no stored bytes: only the masters hold them.
-        # Its residency does not depend on the skip switch.
+    if (deferred | lazy) - resident:
         forced, forced_record = _resident_fragment_ids(actor, state, honor_kill_switch=False)
-        missing = sorted(deferred - forced)
+        missing = sorted((deferred | lazy) - forced)
         if missing:
-            raise RuntimeError(f"deferred full-parameter fragments {missing} are not held by the masters and have no stored bytes")
+            raise RuntimeError(f"deferred or lazy full-parameter fragments {missing} are not held by the masters and have no checkable stored bytes")
         if resident_record is None:
             resident_record = forced_record
-        resident = resident | deferred
+        resident = resident | deferred | lazy
     rows = [
         (fragment, references)
         for fragment, references in zip(state.fragments, state.chunk_refs, strict=True)
@@ -2365,12 +2812,18 @@ def prepare_full_parameter_chunked_shard(
     # Resident fragments: the masters already hold these exact bytes; commit
     # skips them.  The others are independent; verify them concurrently.
     _parallel_map(verify, rows)
+    replica_resident, replica_record = replicas.resident_replica_fragments(
+        actor, replica_plan, replica_states, skip_resident=skip_resident
+    )
+    replica_read = replicas.verify_replica_chunks(replica_plan, replica_states, skip=replica_resident, ray_module=ray_module)
     _note_apply_stats(
         actor,
         "prepare",
         fragments=len(state.fragments),
         resident_fragments=len(resident),
         read_fragments=len(state.fragments) - len(resident),
+        replica_resident_fragments=len(replica_resident),
+        replica_read_fragments=replica_read,
         seconds=time.monotonic() - started,
     )
     parameter_count = len(manifest.specs)
@@ -2386,6 +2839,10 @@ def prepare_full_parameter_chunked_shard(
         commit_started=False,
         resident_fragment_ids=resident,
         resident_record=resident_record,
+        replica_states=replica_states,
+        replica_resident_ids=replica_resident,
+        replica_resident_record=replica_record,
+        lazy_fragment_ids=lazy,
     )
     return parameter_count
 
@@ -2467,6 +2924,7 @@ def commit_prepared_full_parameter_shard(
 ) -> int:
     """Commit a fully prepared cut while retaining Adam state objects."""
 
+    from miles.backends.megatron_utils import full_parameter_replicas as replicas  # import cycle
 
     token = _validate_commit_token(commit_token)
     committed = getattr(actor, "_external_full_parameter_committed_cut", None)
@@ -2496,17 +2954,9 @@ def commit_prepared_full_parameter_shard(
     if installed != prepared.base_policy_version or generation != prepared.base_local_step_generation or exported != prepared.base_exported_local_step_generation or exported != generation or _scheduler_num_steps(actor) != prepared.scheduler_num_steps or state.policy_version <= installed:
         raise RuntimeError("prepared full-parameter cut became stale")
     ray_module = _resolve_ray_module(ray_module)
-    plan, manifest = _require_full_parameter_fragment_plan(actor, role=role)
+    plan, manifest, replica_plan, named_parameters, optimizer_owned, layout = _require_installed_layout(actor, role=role)
     _validate_chunked_shard_against_plan(state, plan, manifest)
-    named_parameters, optimizer_owned = _actor_parameter_context(actor)
-    specs, masters = _specs_and_masters(
-        named_parameters,
-        role=role,
-        topology=manifest.topology,
-        optimizer_owned_parameter_ids=optimizer_owned,
-    )
-    if specs != manifest.specs:
-        raise RuntimeError("full-parameter local specs changed after prepare")
+    specs, masters = layout.specs, layout.masters
     if not prepared.commit_started:
         # Resident fragments are skipped only while the masters provably hold
         # them: the record taken at prepare must still be the live one.  A
@@ -2516,6 +2966,7 @@ def commit_prepared_full_parameter_shard(
             getattr(actor, "_external_full_parameter_resident", None) is not prepared.resident_record
         ):
             raise RuntimeError("full-parameter resident fragments changed after prepare")
+        replicas.require_live_replica_record(actor, prepared.replica_resident_record, prepared.replica_resident_ids)
         prepared = replace(prepared, commit_started=True)
         actor._external_full_parameter_prepared_cut = prepared
     # From here the masters may be partly written: no record describes them.
@@ -2523,6 +2974,7 @@ def commit_prepared_full_parameter_shard(
     started = time.monotonic()
     count = 0
     copied_fragments = 0
+    written: dict[str, None] = {}
     for fragment, descriptor, references in zip(
         plan.fragments,
         state.fragments,
@@ -2533,6 +2985,7 @@ def commit_prepared_full_parameter_shard(
             count += _fragment_completed_parameters(fragment, masters)
             continue
         copied_fragments += 1
+        written.update(dict.fromkeys(fragment.wire_names))
         count += _copy_fragment_chunks_to_masters(
             fragment,
             descriptor,
@@ -2544,17 +2997,29 @@ def commit_prepared_full_parameter_shard(
         )
     if count != prepared.parameter_tensor_count or count != len(specs):
         raise RuntimeError("full-parameter chunked apply is incomplete")
-    copied_seconds = time.monotonic() - started
-    _propagate_master_writes(actor)
-    _copy_masters_to_model(actor)
-    model_count = _validate_model_matches_masters(
-        named_parameters,
-        optimizer_owned_parameter_ids=optimizer_owned,
+    replica_copied = replicas.copy_replica_chunks(
+        replica_plan,
+        prepared.replica_states,
+        skip=prepared.replica_resident_ids,
+        replica_masters=layout.replica_masters,
+        ray_module=ray_module,
     )
-    if model_count != count:
-        raise RuntimeError("full-parameter model/master check is incomplete")
-    if role == "actor":
-        actor.weights_backuper.backup("actor")
+    copied_seconds = time.monotonic() - started
+    by_wire_name = _parameters_by_wire_name(named_parameters, specs)
+    written_names = dict.fromkeys(by_wire_name[wire_name][0] for wire_name in written)
+    written_names.update(
+        dict.fromkeys(
+            replicas.replica_names_to_copy(replica_plan, prepared.replica_states, skip=prepared.replica_resident_ids)
+        )
+    )
+    finish_stats = _finish_commit_writes(
+        actor,
+        named_parameters,
+        optimizer_owned,
+        written=tuple(written_names),
+        expected_count=count + len(layout.replica_masters),
+        role=role,
+    )
     actor._external_full_policy_version = state.policy_version
     actor._external_full_local_step_generation = 0
     actor._external_full_exported_local_step_generation = 0
@@ -2574,18 +3039,184 @@ def commit_prepared_full_parameter_shard(
         policy_version=state.policy_version,
         local_step_generation=0,
         fragments=state.fragments,
+        # A lazy row was resident, so the commit did not write it: its label
+        # still names the masters' bytes.
+        lazy_fragment_ids=prepared.lazy_fragment_ids,
     )
+    replicas.record_replica_resident(actor, replica_plan, prepared.replica_states)
     _note_apply_stats(
         actor,
         "commit",
         fragments=len(state.fragments),
         copied_fragments=copied_fragments,
         resident_fragments=len(prepared.resident_fragment_ids),
+        replica_copied_fragments=replica_copied,
+        replica_resident_fragments=len(prepared.replica_resident_ids),
         copy_seconds=copied_seconds,
         seconds=time.monotonic() - started,
+        **finish_stats,
     )
     del actor._external_full_parameter_prepared_cut
     return count
+
+
+_PARTIAL_COMMIT_ENV = "MILES_FULL_PARAMETER_PARTIAL_COMMIT"
+_DENSE_MODEL_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
+
+
+def _partial_commit_refusal(
+    actor,
+    named_parameters: Sequence[tuple[str, torch.nn.Parameter]],
+    optimizer_owned: frozenset[int],
+    written: Sequence[str],
+    parameter_count: int,
+) -> str | None:
+    """Why a commit must finish over the whole model; None when it may finish
+    over the parameters it wrote only.
+
+    The per-parameter path copies a master into its model parameter with a
+    plain ``copy_`` (what Megatron's main-to-model copy does for a dense
+    parameter whose master is whole on this rank: DP=1, or the
+    non-distributed optimizer that data-parallel replicas run with) and
+    propagates only the hybrid-optimizer copies of
+    the written masters, so it needs dense model tensors, no Megatron-FSDP or
+    quantized parameter gather, and every hybrid inner copy reachable from a
+    named parameter's master."""
+
+    if os.environ.get(_PARTIAL_COMMIT_ENV, "1") == "0":
+        return f"{_PARTIAL_COMMIT_ENV}=0"
+    if len(written) >= parameter_count:
+        return "every parameter written"
+    for _name, parameter in named_parameters:
+        if type(parameter.data) is not torch.Tensor or parameter.dtype not in _DENSE_MODEL_DTYPES:
+            return "a model parameter is not a dense tensor"
+    for child in getattr(actor.optimizer, "chained_optimizers", (actor.optimizer,)):
+        ddp_config = getattr(child, "ddp_config", None)
+        if getattr(ddp_config, "use_megatron_fsdp", False) or getattr(ddp_config, "fp4_param_gather", False):
+            return "Megatron-FSDP or a quantized parameter gather"
+        if getattr(child, "_layer_wise_non_distopt_child", False):
+            return "layer-wise FP8 optimizer"
+    owned = {
+        id(_resolve_master(parameter, name, optimizer_owned_parameter_ids=optimizer_owned)[0])
+        for name, parameter in named_parameters
+    }
+    for base in _optimizer_bases(actor.optimizer):
+        inner = getattr(base, "param_to_inner_param", None) or {}
+        if any(key is not copy and id(key) not in owned for key, copy in inner.items()):
+            return "a hybrid optimizer copy belongs to no named parameter"
+    return None
+
+
+@torch.no_grad()
+def _copy_masters_to_written_parameters(
+    rows: Sequence[tuple[str, torch.nn.Parameter]],
+    optimizer_owned: frozenset[int],
+) -> None:
+    """The main-to-model copy of Megatron for ``rows`` only (dense, whole masters).
+
+    A parameter whose optimizer owns its model view (precision-aware) got its
+    master from the hybrid copy in ``_propagate_master_writes``; a native-FP32
+    parameter is its own master."""
+
+    for name, parameter in rows:
+        owned, master = _resolve_master(parameter, name, optimizer_owned_parameter_ids=optimizer_owned)
+        if owned.dtype != torch.float32 or master.data_ptr() == parameter.data_ptr():
+            continue
+        parameter.data.copy_(master.view(parameter.shape), non_blocking=False)
+
+
+def _backup_written_actor_weights(actor, written: Sequence[torch.nn.Parameter] | None) -> str:
+    """Bring the actor's weight backup up to date after a commit.
+
+    Only when the actor keeps one (Miles backs up after a train step only when
+    ``_enable_weight_backup``).  ``written``: the parameters the commit
+    changed; a backuper that updates a subset in place takes only those, any
+    other backs up every weight.  Returns what was done (for the stats)."""
+
+    if getattr(actor, "_enable_weight_backup", True) is False:
+        return "off"
+    backuper = actor.weights_backuper
+    backup_tensors = getattr(backuper, "backup_tensors", None)
+    if written is not None and callable(backup_tensors):
+        expected = {id(parameter) for parameter in written}
+        if backup_tensors("actor", expected) == len(expected):
+            return "written"
+    backuper.backup("actor")
+    return "all"
+
+
+def _finish_commit_writes(
+    actor,
+    named_parameters: Sequence[tuple[str, torch.nn.Parameter]],
+    optimizer_owned: frozenset[int],
+    *,
+    written: Sequence[str],
+    expected_count: int,
+    role: str,
+) -> dict[str, object]:
+    """After the commit copied chunks into masters: make the hybrid optimizer
+    copies, the model and the weight backup agree with the masters, and check
+    model == master.
+
+    The parameters the commit did not write are untouched on both sides, so
+    only ``written`` (local parameter names: owned and data-parallel replica
+    parameters) needs this when ``_partial_commit_refusal`` allows; otherwise
+    the whole model, as before (``expected_count`` local parameters).  Returns
+    timing stats."""
+
+    refusal = _partial_commit_refusal(actor, named_parameters, optimizer_owned, written, len(named_parameters))
+    stats: dict[str, object] = {"partial": refusal is None, "written_parameters": len(written)}
+    if refusal is not None:
+        stats["partial_refusal"] = refusal
+    clock = time.monotonic()
+
+    def lap(name: str) -> None:
+        nonlocal clock
+        now = time.monotonic()
+        stats[name] = now - clock
+        clock = now
+
+    if refusal is None:
+        by_name = dict(named_parameters)
+        rows = [(name, by_name[name]) for name in written]
+        owned_ids = {
+            id(_resolve_master(parameter, name, optimizer_owned_parameter_ids=optimizer_owned)[0])
+            for name, parameter in rows
+        }
+        _propagate_master_writes(actor, owned_ids=owned_ids)
+        lap("propagate_seconds")
+        _assert_masters_resident(actor)
+        _copy_masters_to_written_parameters(rows, optimizer_owned)
+        lap("model_copy_seconds")
+        if rows:
+            _validate_model_matches_masters(rows, optimizer_owned_parameter_ids=optimizer_owned)
+        lap("check_seconds")
+        backup = _backup_written_actor_weights(actor, [parameter for _name, parameter in rows]) if role == "actor" and rows else "none"
+    else:
+        _propagate_master_writes(actor)
+        lap("propagate_seconds")
+        _copy_masters_to_model(actor)
+        lap("model_copy_seconds")
+        model_count = _validate_model_matches_masters(
+            named_parameters,
+            optimizer_owned_parameter_ids=optimizer_owned,
+        )
+        if model_count != expected_count:
+            raise RuntimeError("full-parameter model/master check is incomplete")
+        lap("check_seconds")
+        backup = _backup_written_actor_weights(actor, None) if role == "actor" else "none"
+    lap("backup_seconds")
+    stats["backup"] = backup
+    return stats
+
+
+def _assert_masters_resident(actor) -> None:
+    """Megatron's precondition of a main-to-model copy (no-op without an
+    optimizer-state offloader)."""
+
+    check = getattr(actor.optimizer, "assert_master_weights_resident", None)
+    if callable(check):
+        check("full-parameter partial commit")
 
 
 def finalize_full_parameter_commit(actor, *, commit_token: str) -> int:

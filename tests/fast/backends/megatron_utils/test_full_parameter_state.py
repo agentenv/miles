@@ -1250,7 +1250,7 @@ def test_distributed_optimizer_partial_or_missing_master_is_refused():
             named_parameters=(("module.w", parameter),),
         )
     parameter.main_param = None  # a rank owning none of it, or precision-aware without offload
-    with pytest.raises(RuntimeError, match="DP=1"):
+    with pytest.raises(RuntimeError, match="whole FP32 master"):
         make_full_parameter_shard_state(
             policy_version=0,
             role="actor",
