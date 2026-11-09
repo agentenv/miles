@@ -5,12 +5,23 @@ import torch
 import torch.distributed as dist
 
 from miles.platforms import current_platform
+from miles.utils import sync_free
 
 logger = logging.getLogger(__name__)
 
 
 def _get_rank():
     return dist.get_rank() if dist.is_initialized() else 0
+
+
+def _to_current_device(top_indices: torch.Tensor) -> torch.Tensor:
+    # record() keeps each replay buffer in pinned host memory until clear() (dynamic-shape
+    # platforms), so the copy need not make the host wait for the device queue: kernels queued
+    # after it on the current stream see the data, and PyTorch's pinned allocator does not
+    # reuse a buffer before its pending copies finish. A pageable buffer (the host-side ids of
+    # static-shape platforms, or one set by the debug replay tools) is staged synchronously by
+    # the driver, so non_blocking stays safe for it.
+    return top_indices.to(current_platform.current_device(), non_blocking=sync_free.enabled())
 
 
 class Replay:
@@ -44,12 +55,12 @@ class Replay:
             )
         top_indices = self.top_indices_list[self.forward_index]
         self.forward_index += 1
-        return top_indices.to(current_platform.current_device())
+        return _to_current_device(top_indices)
 
     def pop_backward(self) -> torch.Tensor:
         top_indices = self.top_indices_list[self.backward_index]
         self.backward_index += 1
-        return top_indices.to(current_platform.current_device())
+        return _to_current_device(top_indices)
 
     def clear(self):
         self.forward_index = 0
