@@ -4,7 +4,7 @@ import json
 from argparse import Namespace
 
 import pytest
-from tests.fast.fixtures.args_fixtures import parser_defaults
+from tests.fast.fixtures.args_fixtures import parser_defaults, resolve_parse_boundary_configs
 
 from miles.ray import placement_group as placement_group_module
 from miles.ray.placement_group import (
@@ -30,11 +30,10 @@ def _args(**overrides) -> Namespace:
         actor_num_gpus_per_node=2,
         rollout_num_gpus=3,
         eval_num_gpus=0,
-        megatron_config=None,
         deploy_component="all",
     )
     defaults.update(overrides)
-    return Namespace(**{**parser_defaults(), **defaults})
+    return resolve_parse_boundary_configs(Namespace(**{**parser_defaults(), **defaults}))
 
 
 @pytest.fixture
@@ -122,7 +121,7 @@ class TestExplicitPlacementMap:
             validate_placement_map(pm, trainer_num_gpus=2, rollout_num_gpus=2)
 
     def test_unknown_roles_and_non_int_indices_are_rejected(self):
-        with pytest.raises(AssertionError, match="unknown roles"):
+        with pytest.raises(AssertionError, match="unknown keys"):
             parse_placement_map({"trainer": [0], "eval": [1]})
         with pytest.raises(AssertionError, match="list of ints"):
             parse_placement_map({"trainer": ["0"]})
@@ -189,8 +188,7 @@ class TestRolloutCells:
 
 class TestSlicePgInfo:
     def test_the_public_slicer_keeps_the_given_order(self):
-        from miles.ray.placement_group import _slice_pg_info, slice_pg_info
+        from miles.ray.placement_group import slice_pg_info
 
         info = PlacementGroupInfo(pg="pg", pg_reordered_bundle_indices=[7, 8, 9], pg_reordered_gpu_ids=[0, 1, 2])
         assert slice_pg_info(info, [2, 0]) == PlacementGroupInfo("pg", [9, 7], [2, 0])
-        assert _slice_pg_info is slice_pg_info

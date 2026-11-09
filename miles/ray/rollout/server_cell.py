@@ -22,7 +22,7 @@ from miles.ray.rollout.cell_state import (
 )
 from miles.ray.rollout.engine_env_reporter import EngineEnvReporter
 from miles.ray.rollout.serving_registry import ServingRegistry, SGLangServingRegistry
-from miles.router.backend import RouterKind, make_router_backend
+from miles.router.backend import RouterKind, router_features
 from miles.utils.ft_utils.api_server.models import CellCondition, CellStatus, TriState
 from miles.utils.ft_utils.health_checker import (
     ActiveAndEpoch,
@@ -279,7 +279,7 @@ class ServerCell:
             )
 
     def _assert_router_cordons(self) -> None:
-        if not make_router_backend(self.args).features.cordon:
+        if not router_features(self.args).cordon:
             raise CordonUnsupportedError(f"cordon and in-flight counts need --router {RouterKind.MILES.value}")
 
     @property

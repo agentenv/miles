@@ -135,15 +135,23 @@ class TestCordonedRegistration:
         requests.post(f"{router_env.url}/uncordon_worker", params={"url": url}, timeout=5.0).raise_for_status()
         assert router._use_url() == url
 
-    async def test_the_client_passes_cordoned_on_the_legacy_api_only(self, router_env: RouterEnv):  # noqa: F811
+    async def test_the_client_registers_a_worker_cordoned_over_post_workers(self, router_env: RouterEnv):  # noqa: F811
+        from miles.backends.sglang_utils.sglang_api_client import WorkerType
         from miles.backends.sglang_utils.sglang_router_api_client import SGLangRouterApiClient
 
         client = SGLangRouterApiClient(router_url=router_env.url)
         url = "http://127.0.0.1:30053"
-        await client.add_worker(worker_url=url, worker_type="regular", use_legacy_api=True, cordoned=True)
+        await client.add_worker(worker_url=url, worker_type=WorkerType.REGULAR, cordoned=True)
         assert router_env.router.cordoned_workers == {url}
-        with pytest.raises(ValueError, match="Miles router"):
-            await client.add_worker(worker_url=url, worker_type="regular", use_legacy_api=False, cordoned=True)
+        assert url in router_env.router.worker_request_counts
+
+    def test_a_plain_post_workers_registration_is_selectable(self, router_env: RouterEnv):  # noqa: F811
+        url = "http://127.0.0.1:30055"
+        requests.post(
+            f"{router_env.url}/workers", json={"url": url, "worker_type": "regular"}, timeout=5.0
+        ).raise_for_status()
+        assert router_env.router.cordoned_workers == set()
+        assert router_env.router._use_url() == url
 
 
 class TestRejoinInFlightSemantics:

@@ -1,0 +1,172 @@
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from tests.fast.ray.rollout.test_inference_controller import _make_controller, _RecordingServer
+
+from miles.ray.rollout.inference_controller import MembershipEpochMismatchError, UpdatableEngines
+
+
+class _Cell:
+    def __init__(self, cell_id: str, *, gpu_offset: int, workers_hash: str = "h", ready: bool = True) -> None:
+        self.meta = SimpleNamespace(
+            cell_id=cell_id, gpu_offset=gpu_offset, num_gpus_per_engine=1, workers_hash=workers_hash
+        )
+        self.api_client = f"client-{cell_id}"
+        self.is_pending_weights = True
+        self.is_pending_weights_or_serving = ready
+        self.is_uninitialized = False
+        self.is_errored = False
+        self.marked_ready = 0
+
+    async def mark_weights_ready(self) -> None:
+        self.marked_ready += 1
+        self.is_pending_weights = False
+
+
+def _setup():
+    cells = {
+        "e0": _Cell("e0", gpu_offset=0, workers_hash="h0"),
+        "e1": _Cell("e1", gpu_offset=1, workers_hash="h1"),
+        "e2": _Cell("e2", gpu_offset=2, workers_hash="h2", ready=False),
+    }
+    srv = _RecordingServer(dict(cells), model_name="actor", update_weights=True)
+    return _make_controller({"actor": srv}), srv, cells
+
+
+class TestMemberFilteredUpdateWeights:
+    async def test_only_the_named_members_are_returned_in_gpu_offset_order(self):
+        """A not-ready cell outside the member set must not block the publish either."""
+        controller, _, cells = _setup()
+
+        info = await controller.start_update_weights(members=["e1", "e0"], expected_epoch=0)
+        await controller.end_update_weights(
+            snapshot_cell_id_to_hashes=info.snapshot_cell_id_to_hashes, failed_cell_ids=()
+        )
+
+        assert info == UpdatableEngines(
+            rollout_engines=["client-e0", "client-e1"],
+            engine_gpu_counts=[1, 1],
+            engine_gpu_offsets=[0, 1],
+            engine_cell_ids=["e0", "e1"],
+            snapshot_cell_id_to_hashes={"e0": "h0", "e1": "h1"},
+        )
+
+    async def test_end_marks_only_members_ready_and_leaves_the_rest_untouched(self):
+        controller, _, cells = _setup()
+        cells["e2"].is_pending_weights_or_serving = True
+
+        info = await controller.start_update_weights(members=["e2"], expected_epoch=0)
+        await controller.end_update_weights(
+            snapshot_cell_id_to_hashes=info.snapshot_cell_id_to_hashes, failed_cell_ids=()
+        )
+
+        assert {cid: c.marked_ready for cid, c in cells.items()} == {"e0": 0, "e1": 0, "e2": 1}
+
+    async def test_an_unknown_member_is_refused_and_releases_the_lock(self):
+        controller, _, _ = _setup()
+
+        with pytest.raises(KeyError, match="e9"):
+            await controller.start_update_weights(members=["e0", "e9"], expected_epoch=0)
+
+        assert not controller.context_lock._lock.locked()
+
+    async def test_without_members_every_cell_is_used_as_before(self, monkeypatch):
+        controller, srv, _ = _setup()
+        waited: list = []
+
+        async def _ready(model_id=None, cell_ids=None):
+            waited.append(cell_ids)
+
+        monkeypatch.setattr(controller, "_ensure_cells_ready", _ready)
+        info = await controller.start_update_weights()
+        await controller.end_update_weights(
+            snapshot_cell_id_to_hashes=info.snapshot_cell_id_to_hashes, failed_cell_ids=()
+        )
+
+        assert waited == [None]
+        assert info.rollout_engines == ["client-e0", "client-e1", "client-e2"]
+        assert set(info.snapshot_cell_id_to_hashes) == {"e0", "e1", "e2"}
+
+
+class TestMemberPublishEpoch:
+    async def test_a_member_publish_needs_an_epoch(self):
+        controller, _, _ = _setup()
+        with pytest.raises(ValueError, match="expected_epoch"):
+            await controller.start_update_weights(members=["e0"])
+        assert not controller.context_lock._lock.locked()
+
+    async def test_a_stale_epoch_is_refused(self):
+        controller, _, cells = _setup()
+        controller._membership_epoch = 2
+
+        with pytest.raises(MembershipEpochMismatchError, match="expected membership epoch 1, but it is 2"):
+            await controller.start_update_weights(members=["e0"], expected_epoch=1)
+        assert not controller.context_lock._lock.locked()
+        assert cells["e0"].marked_ready == 0
+
+
+class TestUpdateMemberWeightsForwardsMembers:
+    """``update_member_weights`` is the member publish; ``placement_group.update_weights`` keeps the upstream path."""
+
+    async def test_members_epoch_and_admission_reach_the_controller(self):
+        from miles.ray.rollout.member_publish import update_member_weights
+        from miles.ray.train_actor import WeightUpdateOutput
+
+        info = UpdatableEngines(
+            rollout_engines=["client-e1"],
+            engine_gpu_counts=[1],
+            engine_gpu_offsets=[1],
+            engine_cell_ids=["e1"],
+            snapshot_cell_id_to_hashes={"e1": "h1"},
+        )
+        actor = MagicMock(
+            update_weights=AsyncMock(return_value=WeightUpdateOutput(weight_version=9, failed_cell_ids=()))
+        )
+        controller = MagicMock(start_update_weights=AsyncMock(return_value=info), end_update_weights=AsyncMock())
+
+        version = await update_member_weights(
+            actor, controller, members=["e1"], expected_epoch=3, admit_cordoned=True, rollout_id=7
+        )
+
+        assert version == 9
+        assert controller.start_update_weights.await_args.kwargs == {
+            "model_id": None,
+            "members": ["e1"],
+            "expected_epoch": 3,
+            "admit_cordoned": True,
+        }
+        actor.update_weights.assert_awaited_once_with(info=info, rollout_id=7)
+        assert controller.end_update_weights.await_args.kwargs == {
+            "snapshot_cell_id_to_hashes": {"e1": "h1"},
+            "failed_cell_ids": (),
+        }
+
+    async def test_a_failed_member_is_reported_after_the_controller_took_it_out_of_service(self):
+        from miles.ray.rollout.member_publish import MemberPublishFailedError, update_member_weights
+        from miles.ray.train_actor import WeightUpdateOutput
+
+        info = UpdatableEngines(
+            rollout_engines=["client-e1"],
+            engine_gpu_counts=[1],
+            engine_gpu_offsets=[1],
+            engine_cell_ids=["e1"],
+            snapshot_cell_id_to_hashes={"e1": "h1"},
+        )
+        actor = MagicMock(
+            update_weights=AsyncMock(return_value=WeightUpdateOutput(weight_version=9, failed_cell_ids=("e1",)))
+        )
+        controller = MagicMock(start_update_weights=AsyncMock(return_value=info), end_update_weights=AsyncMock())
+
+        with pytest.raises(MemberPublishFailedError, match="e1"):
+            await update_member_weights(actor, controller, members=["e1"], expected_epoch=0)
+        assert controller.end_update_weights.await_args.kwargs["failed_cell_ids"] == ("e1",)
+
+    async def test_a_member_publish_has_no_executor_to_move(self):
+        """Non-members may still serve the old weights, so the run-wide version is committed separately."""
+        import inspect
+
+        from miles.ray.rollout.member_publish import commit_weight_version, update_member_weights
+
+        assert "rollout_executor" not in inspect.signature(update_member_weights).parameters
+        assert "rollout_executor" in inspect.signature(commit_weight_version).parameters

@@ -284,9 +284,12 @@ class MilesRouter:
         logger.info(f"[miles-router] {'Cordoned' if cordoned else 'Uncordoned'} worker: {worker_url}")
         return {"status": "success", "cordoned": sorted(self.cordoned_workers)}
 
+    def worker_inflight(self) -> dict[str, int]:
+        return dict(self.worker_request_counts)
+
     async def get_worker_inflight(self, request: Request):
         """Per-worker count of requests proxied and not yet finished, plus the cordoned set."""
-        return {"inflight": dict(self.worker_request_counts), "cordoned": sorted(self.cordoned_workers)}
+        return {"inflight": self.worker_inflight(), "cordoned": sorted(self.cordoned_workers)}
 
     async def _parse_worker_url(self, request: Request) -> str | None:
         if worker_url := request.query_params.get("url") or request.query_params.get("worker_url"):

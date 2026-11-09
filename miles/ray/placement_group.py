@@ -529,3 +529,11 @@ async def create_rollout_components(
         rollout_executor=rollout_executor,
         num_rollout_per_epoch=num_rollout_per_epoch,
     )
+
+
+# member publish lives in its own module; re-exported here next to update_weights
+from miles.ray.rollout.member_publish import (  # noqa: E402,F401
+    MemberPublishFailedError,
+    commit_weight_version,
+    update_member_weights,
+)

@@ -2,14 +2,18 @@
 
 A process rebuild for elastic placement, not fault tolerance: the old trainer controllers are disposed, every
 trainer pool (controllers and engines) is stopped, the "actor" view is optionally re-pointed, the worker manager
-optionally adopts a new ScalingConfig for those pools (a trainer with another GPU count), the pools start again and
+replaces the trainer pool specs and adopts the ScalingConfig of the given args (a trainer with another GPU
+count), the pools start again and
 ``create_training_models`` restores state through the normal load path. There is no rollback to the old trainer;
 a failure stops the trainer pools again, puts the previous view back and raises ``TrainerRebuildError``.
 """
 
 import logging
 
+from ray.actor import ActorMethod
+
 from miles.ray.placement_group import PlacementGroupInfo, create_trainer_handles, create_training_models
+from miles.ray.specs.entrypoint import compute_specs
 from miles.ray.specs.train import compute_trainer_configs, compute_trainer_controller_pool_id, compute_trainer_pool_id
 from miles.ray.wiring import compute_backend_capability
 from miles.utils.args.configs.scaling import ScalingConfig
@@ -79,16 +83,17 @@ async def rebuild_training_models(
     ]
     stage, previous_view = "stop_pools", None
     try:
-        await worker_manager.stop_pools.remote(pool_ids)
+        await _call(worker_manager.stop_pools, pool_ids)
         if trainer_pg_view is not None:
             stage = "set_pg_view"
-            previous_view = await worker_manager.get_pg_view.remote("actor")
+            previous_view = await _call(worker_manager.get_pg_view, "actor")
             # every trainer pool (actor and critic) schedules on the "actor" view; their layout is replaced next
-            await worker_manager.set_pg_view.remote("actor", trainer_pg_view, replacing_pools=pool_ids)
-        stage = "replace_scaling"
-        await worker_manager.replace_scaling.remote(ScalingConfig.slice_from(args), pool_ids=pool_ids)
+            await _call(worker_manager.set_pg_view, "actor", trainer_pg_view, replacing_pools=pool_ids)
+        stage = "replace_pools"
+        specs = [spec for spec in compute_specs(args) if spec.name in pool_ids]
+        await _call(worker_manager.replace_pools, specs, scaling=ScalingConfig.slice_from(args))
         stage = "start_pools"
-        await worker_manager.start_pools.remote(pool_ids)
+        await _call(worker_manager.start_pools, pool_ids)
         stage = "create_training_models"
         handles = create_trainer_handles(
             args, trainer_configs=trainer_configs, capability=compute_backend_capability(args)
@@ -97,13 +102,13 @@ async def rebuild_training_models(
     except BaseException as error:
         cleanup_error = None
         try:
-            await worker_manager.stop_pools.remote(pool_ids)
+            await _call(worker_manager.stop_pools, pool_ids)
         except Exception as stop_error:  # noqa: BLE001
             cleanup_error = stop_error
         view_restored = False
         if previous_view is not None and cleanup_error is None:
             try:
-                await worker_manager.set_pg_view.remote("actor", previous_view, replacing_pools=pool_ids)
+                await _call(worker_manager.set_pg_view, "actor", previous_view, replacing_pools=pool_ids)
                 view_restored = True
             except Exception:  # noqa: BLE001
                 logger.warning("Restoring the previous actor view after a failed rebuild failed", exc_info=True)
@@ -116,3 +121,10 @@ async def rebuild_training_models(
             previous_view=previous_view,
             view_restored=view_restored,
         ) from error
+
+
+async def _call(method, *args, **kwargs):
+    # the RayWorkerManager actor handle, or an object with the same async methods (tests)
+    if isinstance(method, ActorMethod):
+        return await method.remote(*args, **kwargs)
+    return await method(*args, **kwargs)
