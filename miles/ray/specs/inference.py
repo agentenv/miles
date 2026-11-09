@@ -8,6 +8,7 @@ from miles.backends.sglang_utils.sglang_api_client import WorkerType
 from miles.backends.sglang_utils.sglang_config import ModelConfig, ServerGroupConfig
 from miles.backends.sglang_utils.sglang_engine import compute_engine_launch_cmd
 from miles.backends.sglang_utils.sglang_scaling_config import ServerGroupScalingConfig
+from miles.ray.placement_map import parse_placement_map, rollout_cell_binding
 from miles.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
 from miles.rollout.session.config import compute_session_server_config
 from miles.router.backend import make_router_backend
@@ -292,30 +293,48 @@ class InferenceEngineSpec(BaseCommandSpec):
     server_group_config: ServerGroupConfig
     group_index: int
     interpreter_prefix: list[str]
+    # placement map ``rollout_cells`` of the single engine pool: (alias, binding) per cell, started cells first
+    declared_cells: tuple[tuple[str, tuple[str, int] | None, bool], ...] = ()
 
     @classmethod
     def create(cls, config: Any) -> list[Self]:
         if config.rollout_external:
             return []
-        return [
-            _compute_spec_inference_engine(
-                config,
-                model_idx=model_idx,
-                group_index=group_index,
-                model_cfg=model_cfg,
-                server_group_config=server_group_config,
-                group_scaling=config.sglang_scaling.group(model_name=model_cfg.name, group_index=group_index),
-            )
-            for model_idx, model_cfg in enumerate(config.sglang.models)
-            for group_index, server_group_config in enumerate(model_cfg.server_groups)
-            if server_group_config.worker_type != WorkerType.PLACEHOLDER
-        ]
+        return _with_declared_rollout_cells(
+            config,
+            [
+                _compute_spec_inference_engine(
+                    config,
+                    model_idx=model_idx,
+                    group_index=group_index,
+                    model_cfg=model_cfg,
+                    server_group_config=server_group_config,
+                    group_scaling=config.sglang_scaling.group(model_name=model_cfg.name, group_index=group_index),
+                )
+                for model_idx, model_cfg in enumerate(config.sglang.models)
+                for group_index, server_group_config in enumerate(model_cfg.server_groups)
+                if server_group_config.worker_type != WorkerType.PLACEHOLDER
+            ],
+        )
 
     def scheduling(self, scaling: ScalingConfig) -> SchedulingSpec:
-        return _compute_inference_engine_scheduling(
+        scheduling = _compute_inference_engine_scheduling(
             self.args,
             server_group_config=self.server_group_config,
             group_scaling=scaling.sglang_scaling.group(model_name=self.model_cfg.name, group_index=self.group_index),
+        )
+        if not self.declared_cells:
+            return scheduling
+        num_started = sum(start for _, _, start in self.declared_cells)
+        assert (
+            num_started == scheduling.num_cells
+        ), f"placement map starts {num_started} rollout cells but the rollout GPUs make {scheduling.num_cells} engines"
+        return scheduling.model_copy(
+            update=dict(
+                num_deferred_cells=len(self.declared_cells) - num_started,
+                cell_aliases=tuple(alias for alias, _, _ in self.declared_cells),
+                initial_bindings=tuple(binding for _, binding, _ in self.declared_cells),
+            )
         )
 
     def compute_static_meta(self, scaling: ScalingConfig) -> StaticMeta:
@@ -440,6 +459,27 @@ def _compute_spec_inference_engine(
             ),
         ),
     )
+
+
+def _with_declared_rollout_cells(args, specs: list[InferenceEngineSpec]) -> list[InferenceEngineSpec]:
+    """Lay the single engine pool's cells out as the placement map's ``rollout_cells`` declare them.
+
+    Cell ``i`` of the pool is ``rollout_cells[i]``: it keeps its Miles cell id and carries the caller's name as its
+    alias, is bound to the declared bundles (or unbound), and the cells declared with ``start: false`` are deferred.
+    """
+    pm = parse_placement_map(args.yeto_placement_map)
+    if pm is None or not pm.rollout_cells:
+        return specs
+    assert len(specs) == 1, (
+        f"placement map rollout_cells need exactly one inference engine pool to declare them in, got "
+        f"{[spec.name for spec in specs]}"
+    )
+    (spec,) = specs
+    gpus_per_engine = spec.server_group_config.num_gpus_per_engine
+    wrong = [(c.name, len(c.bundles)) for c in pm.rollout_cells if c.bundles and len(c.bundles) != gpus_per_engine]
+    assert not wrong, f"rollout cells {wrong} do not name the {gpus_per_engine} bundles of one engine"
+    declared = tuple((c.name, rollout_cell_binding(pm, c), c.start) for c in pm.rollout_cells)
+    return [spec.model_copy(update=dict(declared_cells=declared))]
 
 
 def compute_inference_engine_env_vars(args) -> dict[str, str]:
