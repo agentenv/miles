@@ -14,6 +14,8 @@ from .mxfp4_experts import (
     hf_checkpoint_has_mxfp4_experts,
 )
 from .ops import situ_and_mul
+from .permute import load_slot_layout
+from .split_moe import partial_experts_spec
 
 KIMI_K3_KDA_LAYERS = tuple(
     layer_number for layer_number in range(1, 94) if layer_number % 4 != 0 and layer_number != 93
@@ -38,7 +40,14 @@ def configure_kimi_k3(config) -> None:
     config.use_te_activation_func = False
 
 
-def build_kimi_k3_spec(config, vp_stage=None, mla_attention=KimiK3Attention, *, mxfp4_experts: bool = False):
+def build_kimi_k3_spec(
+    config,
+    vp_stage=None,
+    mla_attention=KimiK3Attention,
+    *,
+    mxfp4_experts: bool = False,
+    num_local_trainable_experts: int | None = None,
+):
     assert config.virtual_pipeline_model_parallel_size is None, "Kimi K3 does not support VPP yet"
 
     block_spec = get_gpt_decoder_block_spec(
@@ -61,6 +70,10 @@ def build_kimi_k3_spec(config, vp_stage=None, mla_attention=KimiK3Attention, *, 
         if not config.moe_layer_freq[layer_offset + len(layer_specs)]:
             # The dense MLP spec is partial(MLP.as_mlp_submodule, submodules=...).
             layer_spec.submodules.mlp.keywords["submodules"].linear_fc1 = TEColumnParallelLinear
+        elif num_local_trainable_experts is not None:
+            # --partial-experts-selection: the first local slots train in BF16, the rest stay MXFP4 bytes
+            moe = layer_spec.submodules.mlp.keywords["submodules"]
+            moe.experts = partial_experts_spec(moe.experts, num_local_trainable_experts)
         elif mxfp4_experts:
             # partial(MoELayer, submodules=MoESubmodules(experts=partial(TEGroupedMLP, submodules=...)))
             experts = layer_spec.submodules.mlp.keywords["submodules"].experts.keywords["submodules"]
@@ -93,6 +106,22 @@ def frozen_experts_are_mxfp4(args) -> bool:
 def get_kimi_k3_spec(args, config, vp_stage, mla_attention=KimiK3Attention):
     _check_cp_layout(args)
     configure_kimi_k3(config)
+    mxfp4 = frozen_experts_are_mxfp4(args)
+    num_local_trainable = None
+    if args.partial_experts_selection is not None:
+        assert mxfp4, "--partial-experts-selection loads the frozen experts from a compressed-tensors MXFP4 checkpoint"
+        layout = load_slot_layout(
+            args.partial_experts_selection,
+            num_experts=config.num_moe_experts,
+            ep_size=args.backend.expert_model_parallel_size,
+        )
+        # the mbridge loader reads the table from the model config; the converter and R3 read the active layout
+        config.partial_experts_layout = layout
+        num_local_trainable = layout.num_local_trainable
     return build_kimi_k3_spec(
-        config, vp_stage=vp_stage, mla_attention=mla_attention, mxfp4_experts=frozen_experts_are_mxfp4(args)
+        config,
+        vp_stage=vp_stage,
+        mla_attention=mla_attention,
+        mxfp4_experts=mxfp4,
+        num_local_trainable_experts=num_local_trainable,
     )
