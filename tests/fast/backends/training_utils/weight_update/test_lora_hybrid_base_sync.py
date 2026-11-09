@@ -25,6 +25,7 @@ def _lora_updater(*, hybrid: bool) -> tuple[WeightUpdater, MagicMock]:
         after_base_weights=MagicMock(),
         finalize=MagicMock(),
         after_engines_resumed=MagicMock(),
+        cell_updaters_of_cell_id={},
     )
     iterator = MagicMock()
     iterator.iter_hf_weights.return_value = iter([])
