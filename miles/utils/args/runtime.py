@@ -30,6 +30,7 @@ from miles.utils.args.configs.on_policy_distillation import (
     OnPolicyDistillationConfig,
     OnPolicyDistillationRolloutOnlyConfig,
 )
+from miles.utils.args.configs.partial_experts import PartialExpertsConfig
 from miles.utils.args.configs.prefill_decode_disaggregation import PrefillDecodeDisaggregationConfig
 from miles.utils.args.configs.prometheus import PrometheusConfig
 from miles.utils.args.configs.reward_model import RewardModelConfig, RewardModelRolloutOnlyConfig
@@ -63,6 +64,7 @@ class OrchestratorConfig(
     AlgoConfig,
     OnPolicyDistillationConfig,
     LoraConfig,
+    PartialExpertsConfig,
     RouterConfig,
     DebugConfig,
     NetworkConfig,
@@ -99,6 +101,7 @@ class TrainerConfig(
     AlgoConfig,
     OnPolicyDistillationConfig,
     LoraConfig,
+    PartialExpertsConfig,
     RouterConfig,
     DebugConfig,
     NetworkConfig,
@@ -182,6 +185,7 @@ class InferenceControllerConfig(
     AlgoConfig,
     OnPolicyDistillationConfig,
     LoraConfig,
+    PartialExpertsConfig,
     RouterConfig,
     DebugConfig,
     NetworkConfig,
@@ -230,6 +234,7 @@ class RolloutConfig(
     AlgoConfig,
     OnPolicyDistillationConfig,
     LoraConfig,
+    PartialExpertsConfig,
     RouterConfig,
     DebugConfig,
     NetworkConfig,
@@ -267,6 +272,7 @@ class MultiLoraConfig(
     AlgoConfig,
     OnPolicyDistillationConfig,
     LoraConfig,
+    PartialExpertsConfig,
     RouterConfig,
     DebugConfig,
     NetworkConfig,
@@ -309,6 +315,7 @@ class AllConfig(
     OnPolicyDistillationConfig,
     OnPolicyDistillationRolloutOnlyConfig,
     LoraConfig,
+    PartialExpertsConfig,
     WandbConfig,
     WandbRolloutOnlyConfig,
     MlflowConfig,
