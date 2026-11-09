@@ -9,13 +9,17 @@ from miles.backends.training_utils.loss.hub.corrections import vanilla_tis_funct
 from miles.backends.training_utils.loss.hub.logit_processors import get_log_probs_and_entropy, get_values
 from miles.backends.training_utils.loss.hub.math_utils import (
     compute_approx_kl,
+    compute_cispo_loss,
+    compute_gmpo_loss,
     compute_gspo_kl,
     compute_opsm_mask,
     compute_policy_loss,
+    compute_sapo_loss,
 )
 from miles.backends.training_utils.loss.hub.response_layout import response_layout
 from miles.backends.training_utils.loss.hub.score_centering_loss import score_centering_loss_function
 from miles.backends.training_utils.parallel import get_parallel_state
+from miles.utils.args.configs.yeto_algo import yeto_algo_option
 from miles.utils.args.custom_view import compute_custom_function_config
 from miles.utils.function_registry import load_function
 from miles.utils.types import RolloutBatch
@@ -131,7 +135,8 @@ def policy_loss_function(
     train_log_probs = log_probs
 
     # Pre-gather log probs if needed by OPSM or GSPO to avoid duplicate gathering
-    need_full_log_probs = args.use_opsm or args.advantage_estimator == "gspo"
+    variant = yeto_algo_option(args, "policy_loss_variant")
+    need_full_log_probs = args.use_opsm or args.advantage_estimator == "gspo" or variant == "gmpo"
 
     full_log_probs = None
     full_old_log_probs = None
@@ -189,9 +194,35 @@ def policy_loss_function(
         advantages.new_zeros(()),
     )
 
-    pg_loss, pg_clipfrac = compute_policy_loss(
-        ppo_kl, clean_advantages, args.eps_clip, args.eps_clip_high, args.eps_clip_c
-    )
+    if variant == "policy_loss":
+        pg_loss, pg_clipfrac = compute_policy_loss(
+            ppo_kl, clean_advantages, args.eps_clip, args.eps_clip_high, args.eps_clip_c
+        )
+    elif variant == "cispo":
+        # log_probs is already zero outside the loss mask
+        pg_loss, pg_clipfrac = compute_cispo_loss(
+            ppo_kl, log_probs, clean_advantages, args.eps_clip, args.eps_clip_high
+        )
+    elif variant == "sapo":
+        pg_loss, pg_clipfrac = compute_sapo_loss(ppo_kl, clean_advantages, args.sapo_tau_pos, args.sapo_tau_neg)
+    elif variant == "gmpo":
+        full_advantages = [
+            all_gather_with_cp(advantage, total_length, response_length)
+            for advantage, total_length, response_length in zip(
+                layout.per_sample(advantages), total_lengths, response_lengths, strict=False
+            )
+        ]
+        pg_loss, pg_clipfrac, gmpo_clip_stats = compute_gmpo_loss(
+            full_log_probs,
+            full_old_log_probs,
+            full_advantages,
+            batch["loss_masks"],
+            layout.per_sample(clean_advantages),
+            args.gmpo_log_clip_low,
+            args.gmpo_log_clip_high,
+        )
+    else:
+        raise ValueError(f"Unknown --policy-loss-variant: {variant}")
 
     if args.dump_details is not None:
         from miles.backends.training_utils.metrics.debug_dump import maybe_dump_policy_loss_debug
@@ -269,6 +300,19 @@ def policy_loss_function(
     # means the per-token weights are highly concentrated.
     ess_ratio_sum = layout.ess_ratio(ppo_kl)
 
+    gmpo_clip_num = gmpo_clip_den = None
+    if variant == "gmpo":
+        # Global ratio over tokens that are valid under the *final* mask (after TIS/RS) and have A != 0;
+        # numerator and denominator share the mask. Computed on full sequences, so under CP every CP rank
+        # adds the same counts: only the ratio num / den of the aggregated metrics is meaningful.
+        final_masks = modified_response_masks if (args.get_mismatch_metrics or args.use_tis) else batch["loss_masks"]
+        gmpo_clip_num = pg_loss.new_zeros(())
+        gmpo_clip_den = pg_loss.new_zeros(())
+        for (is_clipped, nonzero_adv), m in zip(gmpo_clip_stats, final_masks, strict=True):
+            m = m.to(device=is_clipped.device, dtype=is_clipped.dtype)
+            gmpo_clip_num = gmpo_clip_num + (is_clipped * m).sum()
+            gmpo_clip_den = gmpo_clip_den + (nonzero_adv * m).sum()
+
     pg_loss = pg_loss_reducer(pg_loss)
     pg_clipfrac = sum_of_sample_mean(pg_clipfrac)
     ppo_kl = sum_of_sample_mean(ppo_kl)
@@ -340,6 +384,10 @@ def policy_loss_function(
         "ppo_kl": ppo_kl.clone().detach(),
         "ess_ratio": ess_ratio_sum.squeeze(),
     }
+
+    if gmpo_clip_num is not None:
+        reported_loss["gmpo_clip_num"] = gmpo_clip_num.detach()
+        reported_loss["gmpo_clip_den"] = gmpo_clip_den.detach()
 
     if train_rollout_logprob_abs_diff is not None:
         reported_loss["train_rollout_logprob_abs_diff"] = train_rollout_logprob_abs_diff.clone().detach()
