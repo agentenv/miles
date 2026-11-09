@@ -80,11 +80,12 @@ def _check_cp_layout(args) -> None:
 
 def frozen_experts_are_mxfp4(args) -> bool:
     """The trainer keeps the routed experts as the checkpoint's MXFP4 bytes when it loads a compressed-tensors
-    MXFP4 checkpoint. Only a LoRA run can: the frozen experts have no BF16 master to update."""
+    MXFP4 checkpoint. Only a run whose experts stay frozen can: LoRA, or partial expert training, where the
+    selected experts get a BF16 master and every other expert stays MXFP4."""
     mxfp4 = hf_checkpoint_has_mxfp4_experts(args.backend.load)
-    assert not mxfp4 or is_lora_enabled(args), (
-        f"{args.backend.load} keeps its routed experts as MXFP4, which only a LoRA run (frozen experts) trains from; "
-        "convert it with tools/convert_mxfp4_to_bf16.py for full-parameter training"
+    assert not mxfp4 or is_lora_enabled(args) or args.partial_experts_selection is not None, (
+        f"{args.backend.load} keeps its routed experts as MXFP4, which only a LoRA run or --partial-experts-selection "
+        "(frozen experts) trains from; convert it with tools/convert_mxfp4_to_bf16.py for full-parameter training"
     )
     return mxfp4
 
