@@ -13,14 +13,39 @@ from collections.abc import Callable
 import pytest
 from tests.ci.ci_register import register_cpu_ci
 
+from miles.utils import megatron_bridge_utils
 from miles.utils.megatron_bridge_utils import (
-    BRIDGE_MOE_RUNTIME_ARG_DEFAULTS,
+    BRIDGE_MOE_RUNTIME_ARGS,
     apply_bridge_moe_runtime_args,
+    bridge_moe_runtime_overrides,
     describe_bridge_moe_runtime_config,
 )
 from miles.utils.replay_base import reject_router_fusion_with_routing_replay
 
 register_cpu_ci(est_time=1, suite="stage-a-cpu", labels=[])
+
+# The CLI defaults of radixark/Megatron-LM a84b105, the version the RL island runs used. Production reads
+# them from the installed parser (megatron_cli_defaults); these tests pin them so they run without Megatron.
+_CLI_DEFAULTS = {
+    "moe_flex_dispatcher_backend": "deepep",
+    "moe_flex_dispatcher_num_sms": None,
+    "moe_deepep_num_sms": None,
+    "moe_hybridep_num_sms": None,
+    "moe_enable_deepep": False,
+    "moe_permute_fusion": False,
+    "moe_router_fusion": False,
+    "moe_shared_expert_overlap": False,
+    "overlap_moe_expert_parallel_comm": False,
+    "delay_wgrad_compute": False,
+    "cuda_graph_impl": "none",
+}
+assert set(BRIDGE_MOE_RUNTIME_ARGS) < set(_CLI_DEFAULTS)
+_PARSER_CLI_DEFAULTS = megatron_bridge_utils.megatron_cli_defaults  # the real reader, before the fixture pins it
+
+
+@pytest.fixture(autouse=True)
+def _pinned_cli_defaults(monkeypatch):
+    monkeypatch.setattr(megatron_bridge_utils, "megatron_cli_defaults", lambda: _CLI_DEFAULTS)
 
 
 @dataclasses.dataclass
@@ -85,8 +110,8 @@ def _megatron_args(**overrides) -> argparse.Namespace:
         decoder_last_pipeline_num_layers=None,
         moe_router_bias_update_rate=None,
         moe_aux_loss_coeff=None,
-        cuda_graph_impl="none",
-        **dict(BRIDGE_MOE_RUNTIME_ARG_DEFAULTS),
+        mamba_training_ssm_states_dtype=None,
+        **_CLI_DEFAULTS,
     )
     backend.moe_permute_fusion = True
     args = argparse.Namespace(
@@ -149,9 +174,7 @@ def test_a_store_true_flag_turns_a_provider_setting_on(apply_bridge_runtime_conf
 def test_router_fusion_reaches_the_provider_without_routing_replay(apply_bridge_runtime_config: Callable) -> None:
     provider = _NemotronHProvider()
 
-    apply_bridge_runtime_config(
-        provider, _megatron_args(moe_router_fusion=True, use_routing_replay=False, use_rollout_routing_replay=False)
-    )
+    apply_bridge_runtime_config(provider, _megatron_args(moe_router_fusion=True, use_routing_replay=False, use_rollout_routing_replay=False))
 
     assert provider.moe_router_fusion is True
 
@@ -159,7 +182,7 @@ def test_router_fusion_reaches_the_provider_without_routing_replay(apply_bridge_
 def test_args_without_the_moe_flags_leave_the_provider_unchanged(apply_bridge_runtime_config: Callable) -> None:
     """Callers that register only part of the arguments (the other bridge tests) must keep working."""
     args = _megatron_args(use_routing_replay=False, use_rollout_routing_replay=False)
-    for name in (*BRIDGE_MOE_RUNTIME_ARG_DEFAULTS, "cuda_graph_impl"):
+    for name in _CLI_DEFAULTS:
         delattr(args.backend, name)
     provider = _NemotronHProvider()
 
@@ -183,9 +206,7 @@ def test_a_set_flag_without_a_provider_field_raises(apply_bridge_runtime_config:
     [(True, True), (True, False), (False, True)],
     ids=["r3", "r2", "r3-before-validation"],
 )
-def test_router_fusion_with_routing_replay_is_rejected(
-    apply_bridge_runtime_config: Callable, use_routing_replay: bool, use_rollout_routing_replay: bool
-) -> None:
+def test_router_fusion_with_routing_replay_is_rejected(apply_bridge_runtime_config: Callable, use_routing_replay: bool, use_rollout_routing_replay: bool) -> None:
     """The fused top-k returns before the replay hook, so replay would be skipped without an error."""
     args = _megatron_args(
         moe_router_fusion=True,
@@ -224,23 +245,48 @@ def test_the_log_line_names_the_effective_values_and_the_copied_flags() -> None:
     assert line["effective"]["cuda_graph_impl"] == "none"
 
 
-def test_the_table_holds_megatrons_cli_defaults() -> None:
-    """A flag counts as set when args differ from this table, so the table must be the parser's default."""
-    megatron_arguments = pytest.importorskip("megatron.training.arguments")
-    parser = megatron_arguments.add_megatron_arguments(argparse.ArgumentParser(allow_abbrev=False))
+def test_a_flag_counts_as_set_against_the_installed_parsers_default() -> None:
+    """--moe-deepep-num-sms defaults to None in one Megatron and 20 in another; the parser decides, not a table."""
+    args = _megatron_args(moe_deepep_num_sms=20, moe_permute_fusion=False)
 
-    assert {name: parser.get_default(name) for name in BRIDGE_MOE_RUNTIME_ARG_DEFAULTS} == dict(
-        BRIDGE_MOE_RUNTIME_ARG_DEFAULTS
-    )
+    assert bridge_moe_runtime_overrides(args, cli_defaults=_CLI_DEFAULTS) == {"moe_deepep_num_sms": 20}
+    assert bridge_moe_runtime_overrides(args, cli_defaults={**_CLI_DEFAULTS, "moe_deepep_num_sms": 20}) == {}
+    assert bridge_moe_runtime_overrides(
+        _megatron_args(moe_deepep_num_sms=24, moe_permute_fusion=False),
+        cli_defaults={**_CLI_DEFAULTS, "moe_deepep_num_sms": 20},
+    ) == {"moe_deepep_num_sms": 24}
+
+
+def test_a_flag_the_installed_megatron_lacks_is_never_copied() -> None:
+    """An older parser declares no default for the flag, so a stray value in args does not reach the provider."""
+    defaults = {name: value for name, value in _CLI_DEFAULTS.items() if name != "moe_hybridep_num_sms"}
+
+    args = _megatron_args(moe_hybridep_num_sms=16, moe_permute_fusion=False)
+
+    assert bridge_moe_runtime_overrides(args, cli_defaults=defaults) == {}
+
+
+def test_the_defaults_come_from_megatrons_parser() -> None:
+    """Where Megatron is importable: the parser's own defaults are read, and a backend at those defaults sets nothing."""
+    pytest.importorskip("megatron.training.arguments")
+    try:
+        defaults = _PARSER_CLI_DEFAULTS()
+    except (AttributeError, TypeError) as exc:  # a stubbed megatron package in CPU-only test environments
+        pytest.skip(f"megatron.training.arguments is not a real parser here: {exc}")
+
+    assert defaults["num_experts"] is None and "moe_token_dispatcher_type" in defaults
+    declared = [name for name in BRIDGE_MOE_RUNTIME_ARGS if name in defaults]
+    assert declared, "the installed Megatron declares none of the MoE runtime flags"
+    backend = argparse.Namespace(**{name: defaults[name] for name in declared})
+    args = argparse.Namespace(backend=backend)
+    assert bridge_moe_runtime_overrides(args, cli_defaults=defaults) == {}
 
 
 @pytest.mark.parametrize(
     ("router_fusion", "routing_replay", "rejected"),
     [(True, True, True), (True, False, False), (False, True, False)],
 )
-def test_the_validation_check_rejects_only_fusion_with_replay(
-    router_fusion: bool, routing_replay: bool, rejected: bool
-) -> None:
+def test_the_validation_check_rejects_only_fusion_with_replay(router_fusion: bool, routing_replay: bool, rejected: bool) -> None:
     """miles_validate_args calls this before any worker starts; the bridge path calls it on the provider."""
     if rejected:
         with pytest.raises(ValueError, match="cannot be used with routing replay"):
