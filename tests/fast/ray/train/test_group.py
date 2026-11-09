@@ -865,7 +865,7 @@ class TestUpdateWeightsExternalFailure:
         for handle in handles:
             ray.get(handle.set_external_failure_methods.remote(["update_weights"]))
 
-        with pytest.raises(NonRetryableError, match="rollout engine side.*Injected external failure"):
+        with pytest.raises(NonRetryableError, match=r"(?s)rollout engine side.*Injected external failure"):
             await group.update_weights(info=_make_engines(1), rollout_id=1)
 
         assert _cell(group, 0).is_alive
