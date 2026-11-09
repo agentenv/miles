@@ -18,19 +18,49 @@ ROUTER_REQUEST_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 class SGLangRouterApiClient:
     router_url: str
 
-    async def add_worker(self, worker_url: str, worker_type: WorkerType, bootstrap_port: int | None = None):
+    async def add_worker(
+        self,
+        worker_url: str,
+        worker_type: WorkerType,
+        bootstrap_port: int | None = None,
+        *,
+        cordoned: bool = False,
+    ):
+        """Register a worker; ``cordoned`` (miles router only) registers it without making it selectable."""
         payload = {
             "url": worker_url,
             "worker_type": worker_type.value,
         }
         if worker_type == WorkerType.PREFILL:
             payload["bootstrap_port"] = bootstrap_port
+        if cordoned:
+            payload["cordoned"] = True
         response = await GeneralHttpClientProvider.client().post(
             f"{self.router_url}/workers",
             json=payload,
             timeout=ROUTER_REQUEST_TIMEOUT,
         )
         response.raise_for_status()
+
+    # Cordon and in-flight counts are miles router endpoints (see miles/router/router.py); sgl-router has neither.
+    async def cordon_worker(self, worker_url: str) -> None:
+        response = await GeneralHttpClientProvider.client().post(
+            f"{self.router_url}/cordon_worker", json={"url": worker_url}, timeout=ROUTER_REQUEST_TIMEOUT
+        )
+        response.raise_for_status()
+
+    async def uncordon_worker(self, worker_url: str) -> None:
+        response = await GeneralHttpClientProvider.client().post(
+            f"{self.router_url}/uncordon_worker", json={"url": worker_url}, timeout=ROUTER_REQUEST_TIMEOUT
+        )
+        response.raise_for_status()
+
+    async def get_worker_inflight(self) -> dict[str, int]:
+        response = await GeneralHttpClientProvider.client().get(
+            f"{self.router_url}/worker_inflight", timeout=ROUTER_REQUEST_TIMEOUT
+        )
+        response.raise_for_status()
+        return response.json()["inflight"]
 
     async def remove_worker(self, worker_url: str) -> None:
         response = None

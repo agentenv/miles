@@ -35,6 +35,8 @@ class RouterFeatures:
     pd_disaggregation: bool
     # header that carries a request's routing key; None = the router never routes by key
     routing_key_header: str | None
+    # cordon / uncordon / per-worker in-flight counts and cordoned registration
+    cordon: bool = False
 
 
 class RouterBackend(ABC):
@@ -120,7 +122,7 @@ class SGLangRouterBackend(RouterBackend):
 
 class MilesRouterBackend(RouterBackend):
     kind = RouterKind.MILES
-    features = RouterFeatures(pd_disaggregation=False, routing_key_header=None)
+    features = RouterFeatures(pd_disaggregation=False, routing_key_header=None, cordon=True)
 
     def _launch_argv(
         self, ctx: LaunchCommandContext, *, model_cfg: "ModelConfig", interpreter_prefix: list[str]
