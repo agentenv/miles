@@ -258,6 +258,7 @@ class KimiK3Bridge(LinearAttentionBridgeMixin, DeepseekV3Bridge):
                 if not layer.is_moe_layer:
                     continue
                 hf_layer = layer.layer_number - 1
+                assert hf_layer in layout.perm, f"selection has no entry for MoE layer {hf_layer}"
                 experts = layer.mlp.experts
                 trainable_half, frozen_half = getattr(experts, TRAINABLE_HALF), getattr(experts, FROZEN_HALF)  # config-access-exempt: the split module names its halves by these constants
                 for local_slot in range(n_local):
