@@ -23,6 +23,11 @@ def is_lora_enabled(args: Namespace) -> bool:
     return args.lora_rank > 0 or args.lora_adapter_path is not None
 
 
+def full_parameter_lora_hybrid_enabled(args: Namespace) -> bool:
+    """LoRA actor whose full trainable set rides the full-parameter transport."""
+    return args.full_parameter_lora_hybrid
+
+
 def exports_hf_snapshots(args: Namespace) -> bool:
     """The trainer writes HF snapshots: --save-hf and eval snapshots."""
     return args.save_hf is not None or (args.eval_uses_snapshots and args.eval_hf_dir is not None)

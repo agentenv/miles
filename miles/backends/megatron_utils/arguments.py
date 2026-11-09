@@ -27,6 +27,12 @@ def set_default_megatron_args(args):
     # Multi-LoRA: per-slot LayerWise optimizers require plain DDP all-reduce.
     if args.multi_lora_n_adapters > 0:
         args.use_distributed_optimizer = False
+    # Full-parameter LoRA hybrid: the transport streams complete FP32 masters,
+    # which the distributed optimizer only holds as DP-owned shards.  This runs on
+    # the parse-time argparse namespace (before the frozen config exists), so a
+    # plain assignment is right here; no ``.mutable()``.
+    if args.full_parameter_lora_hybrid:
+        args.use_distributed_optimizer = False
     # TODO: maybe change this after megatron has good fp8 support
     args.bf16 = not args.fp16
     # placeholders

@@ -88,6 +88,19 @@ class LoraConfig(BaseConfig):
             )
         ),
     ] = False
+    full_parameter_lora_hybrid: A[
+        bool,
+        Arg(
+            help=(
+                "Let the full-parameter transport stream a LoRA actor: every trainable parameter "
+                "(the LoRA adapters plus any base parameters a recipe unfroze, e.g. DeepSeek V4 "
+                "clone experts) is one full-parameter shard. Requires LoRA and is incompatible "
+                "with --lora-base-cpu-backup (a restored base backup would undo applied cuts). "
+                "Cost: every weight update then also sends base weights, by default all of them; "
+                "a model recipe should narrow the base export to its trainable parameters."
+            )
+        ),
+    ] = False
     lora_train_only: A[
         bool,
         Arg(

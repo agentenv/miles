@@ -10,6 +10,7 @@ from uuid import uuid4
 
 from miles.backends.megatron_utils.megatron_config import CRITIC_ROLE
 from miles.backends.training_utils.types import TrainStepOutcome, TrainStepOutput
+from miles.ray import full_parameter_transport
 from miles.ray.rollout.inference_controller import UpdatableEngines
 from miles.ray.specs.train import compute_trainer_pool_id
 from miles.ray.train.cell import TrainerCell
@@ -624,6 +625,69 @@ class TrainerController:
             [cell.execute("run_plugin", fn_path=fn_path, kwargs=kwargs) for cell in self._cells]
         )
         return [item for sublist in cell_results for item in sublist]
+
+    # -- full-parameter transport (yeto full-parameter DiLoCo) ----------------
+    # Every rank is reached through ``run_plugin``; see
+    # ``miles.ray.full_parameter_transport`` for the transaction protocol.
+
+    async def full_parameter_shard_manifests(self) -> tuple:
+        """Topology/spec metadata of every rank, without parameter payloads."""
+        return await full_parameter_transport.shard_manifests(self)
+
+    async def install_full_parameter_fragment_plans(self, plans: tuple) -> int:
+        """Install one exact-coverage fragment plan on every owner rank."""
+        return await full_parameter_transport.install_fragment_plans(self, plans)
+
+    async def export_full_parameter_chunked_cut(
+        self,
+        policy_version: int,
+        local_step_generation: int = 0,
+        *,
+        max_chunk_bytes: int,
+        defer_payload: bool = False,
+    ):
+        """Export small descriptors and nested Ray ObjectRefs only.
+
+        ``defer_payload``: descriptors only, no Ray objects; see
+        ``materialize_full_parameter_fragments``."""
+        return await full_parameter_transport.export_chunked_cut(
+            self,
+            policy_version,
+            local_step_generation,
+            max_chunk_bytes=max_chunk_bytes,
+            defer_payload=defer_payload,
+        )
+
+    async def materialize_full_parameter_fragments(self, cut, fragment_ids) -> dict:
+        """Store deferred fragments of ``cut`` while the masters hold them."""
+        return await full_parameter_transport.materialize_chunked_fragments(self, cut, tuple(fragment_ids))
+
+    async def apply_full_parameter_chunked_cut(
+        self,
+        cut,
+        *,
+        commit_token: str | None = None,
+        max_commit_attempts: int = 3,
+        skip_resident_fragments: bool = False,
+    ) -> int:
+        """Prepare, idempotently converge, then finalize every rank."""
+        return await full_parameter_transport.apply_chunked_cut(
+            self,
+            cut,
+            commit_token=commit_token,
+            max_commit_attempts=max_commit_attempts,
+            skip_resident_fragments=skip_resident_fragments,
+        )
+
+    async def record_full_parameter_local_step(self, *, base_policy_version: int, rollout_id: int) -> tuple:
+        """Record exact successful scheduler progress on every rank."""
+        return await full_parameter_transport.record_local_step(
+            self, base_policy_version=base_policy_version, rollout_id=rollout_id
+        )
+
+    async def full_parameter_optimizer_states(self, *, check_model: bool = True) -> tuple:
+        """One bounded optimizer-progress proof from every rank."""
+        return await full_parameter_transport.optimizer_states(self, check_model=check_model)
 
     async def get_cell_statuses(self) -> dict[str, CellStatus]:
         return {cell_id: cell.cell_status() for cell_id, cell in list(self._cells_by_id.items())}
