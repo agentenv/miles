@@ -45,6 +45,9 @@ def get_hf_atomic_update_groups(
     if q_lora_rank is not None:
         # sglang's deepseek family cache-and-concats q_a_proj + kv_a_proj_with_mqa
         # into fused_qkv_a_proj_with_mqa; a half-arrived pair is a silent no-op.
+        # Kimi K3 interleaves MLA with linear-attention (KDA) layers, and a cut-down
+        # checkpoint can hold KDA layers only: no pair at all is valid there (a
+        # half-arrived one still fails at the end of the stream).
         return [
             AtomicUpdateGroup(
                 key="q_lora_a_proj",
@@ -52,6 +55,7 @@ def get_hf_atomic_update_groups(
                     ".self_attn.q_a_proj.weight",
                     ".self_attn.kv_a_proj_with_mqa.weight",
                 ),
+                optional="kimik3" in normalized_model_name,
             )
         ]
     return []
