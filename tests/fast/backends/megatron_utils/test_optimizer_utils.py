@@ -48,7 +48,7 @@ def _chained_optimizer(*members) -> object:
     optimizer_module = pytest.importorskip("megatron.core.optimizer.optimizer")
     optimizer = optimizer_module.ChainedOptimizer.__new__(optimizer_module.ChainedOptimizer)
     optimizer.chained_optimizers = list(members)
-    optimizer.config = SimpleNamespace(offload_optimizer_states=False, fp16=False)
+    optimizer.config = SimpleNamespace(offload_optimizer_states=False, fp16=False, optimizer_cpu_offload=False)
     return optimizer
 
 
@@ -266,3 +266,76 @@ class TestWhatAResetRefusesToWalk:
             optimizer_utils.reset_optimizer_state(
                 optimizer, stream_optimizer_state_to_disk=False, chunked_optimizer_state_offload=False
             )
+
+
+def _hybrid_device_optimizer(*, steps: int):
+    """A HybridDeviceOptimizer with every parameter offloaded, built without the CUDA streams its constructor opens."""
+    hybrid_module = pytest.importorskip("megatron.core.optimizer.cpu_offloading.hybrid_optimizer")
+    hdo_cls = hybrid_module.HybridDeviceOptimizer
+    param = torch.nn.Parameter(torch.ones(4))
+    hdo = hdo_cls.__new__(hdo_cls)
+    torch.optim.Optimizer.__init__(hdo, [param], defaults={"lr": 0.1})
+    hdo.param_update_in_fp32 = True
+    master = param.detach().clone().float()
+    hdo.cpu_optimizers = [torch.optim.AdamW([master], lr=0.1)]
+    hdo.gpu_optimizer = None
+    hdo.inner_param_to_orig_param = {master: param}
+    for _ in range(steps):
+        master.grad = torch.full_like(master, 0.5)
+        hdo.cpu_optimizers[0].step()
+        hdo._sync_sub_optimizers_state_to_hdo()
+    return hdo, master
+
+
+def _reset_offloaded(monkeypatch, hdo) -> None:
+    optimizer_utils = pytest.importorskip("miles.backends.megatron_utils.optimizer_utils")
+    monkeypatch.setattr(optimizer_utils, "USING_PYTORCH_OPTIMIZER", False)
+    optimizer = _chained_optimizer(_RealChainedMember(hdo))
+    optimizer.config = SimpleNamespace(offload_optimizer_states=False, fp16=False, optimizer_cpu_offload=True)
+    optimizer_utils.reset_optimizer_state(
+        optimizer, stream_optimizer_state_to_disk=False, chunked_optimizer_state_offload=False
+    )
+
+
+class TestResettingACpuOffloadedOptimizer:
+    def test_the_moments_the_cpu_sub_optimizer_owns_are_dropped(self, monkeypatch):
+        """HybridDeviceOptimizer only mirrors the sub-optimizer state, so clearing the mirror alone keeps the moments."""
+        hdo, master = _hybrid_device_optimizer(steps=3)
+        assert hdo.cpu_optimizers[0].state[master]
+
+        _reset_offloaded(monkeypatch, hdo)
+
+        assert hdo.state == {} and hdo.cpu_optimizers[0].state == {}
+
+    def test_a_freshly_built_offloaded_optimizer_passes_the_reset(self, monkeypatch):
+        """First launch from HF weights resets an optimizer that never stepped; it has no init_state_fn to refill."""
+        hdo, _ = _hybrid_device_optimizer(steps=0)
+
+        _reset_offloaded(monkeypatch, hdo)
+
+        assert hdo.cpu_optimizers[0].state == {}
+
+    def test_the_sub_optimizer_then_steps_like_a_fresh_one(self, monkeypatch):
+        """The next step after a reset must start the Adam bias correction from step 1 again."""
+        hdo, master = _hybrid_device_optimizer(steps=3)
+        _reset_offloaded(monkeypatch, hdo)
+        fresh_hdo, fresh_master = _hybrid_device_optimizer(steps=0)
+        master.data.copy_(fresh_master)
+
+        for opt, p in ((hdo, master), (fresh_hdo, fresh_master)):
+            p.grad = torch.full_like(p, 0.5)
+            opt.cpu_optimizers[0].step()
+
+        _assert_same_optimizer_state(hdo.cpu_optimizers[0], fresh_hdo.cpu_optimizers[0])
+        assert torch.equal(master, fresh_master)
+
+    def test_a_moment_left_in_a_sub_optimizer_is_caught(self, monkeypatch):
+        """The self-check has to look inside the sub-optimizers, not just at the mirror."""
+        optimizer_utils = pytest.importorskip("miles.backends.megatron_utils.optimizer_utils")
+        hdo, master = _hybrid_device_optimizer(steps=1)
+        optimizer = _chained_optimizer(_RealChainedMember(hdo))
+        optimizer.config = SimpleNamespace(offload_optimizer_states=False, fp16=False, optimizer_cpu_offload=True)
+        hdo.state.clear()
+
+        with pytest.raises(AssertionError):
+            optimizer_utils._check_optimizer_state_empty(optimizer)

@@ -1,5 +1,6 @@
 import torch
 from megatron.core.optimizer import USING_PYTORCH_OPTIMIZER
+from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
 from megatron.core.optimizer.optimizer import ChainedOptimizer, MegatronOptimizer
 
 
@@ -25,9 +26,13 @@ def reset_optimizer_state(
             continue
 
         inner = chained.optimizer
-        inner.state.clear()
-        for param_group in inner.param_groups:
-            param_group.pop("step", None)
+        # HybridDeviceOptimizer (--optimizer-cpu-offload) steps sub-optimizers that own the real moments and
+        # only mirrors them into its own state after each step, so clearing the mirror alone would keep them.
+        # Its FP32 masters are refreshed from the loaded weights by reload_model_params after the reset.
+        for leaf in _leaf_optimizers(inner):
+            leaf.state.clear()
+            for param_group in leaf.param_groups:
+                param_group.pop("step", None)
 
         if chained.init_state_fn is not None and not USING_PYTORCH_OPTIMIZER:
             chained.init_state_fn(inner, chained.config)
@@ -54,15 +59,26 @@ def _check_optimizer_state_empty(optimizer: MegatronOptimizer) -> None:
                 checked_params += 1
                 assert param.grad is None
 
-        for state in inner.state.values():
-            checked_state_keys |= set(state)
-            for value in state.values():
-                if isinstance(value, torch.Tensor):
-                    assert torch.count_nonzero(value) == 0
-                else:
-                    assert value == 0
+        for leaf in _leaf_optimizers(inner):
+            for state in leaf.state.values():
+                checked_state_keys |= set(state)
+                for value in state.values():
+                    if isinstance(value, torch.Tensor):
+                        assert torch.count_nonzero(value) == 0
+                    else:
+                        assert value == 0
+            if leaf is not inner:
+                assert all("step" not in param_group for param_group in leaf.param_groups)
 
     assert checked_optimizers > 0
     assert checked_params > 0
     # if you use a non-adam optimizer, add the asserts for its state keys here
-    assert checked_state_keys == (set() if USING_PYTORCH_OPTIMIZER else {"exp_avg", "exp_avg_sq"})
+    # HybridDeviceOptimizer has no init_state_fn: its sub-optimizers allocate the moments on their first step
+    lazy = USING_PYTORCH_OPTIMIZER or optimizer.config.optimizer_cpu_offload
+    assert checked_state_keys == (set() if lazy else {"exp_avg", "exp_avg_sq"})
+
+
+def _leaf_optimizers(inner: torch.optim.Optimizer) -> list[torch.optim.Optimizer]:
+    if isinstance(inner, HybridDeviceOptimizer):
+        return [inner, *inner.sub_optimizers]
+    return [inner]
