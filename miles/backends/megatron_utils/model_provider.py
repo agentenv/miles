@@ -85,6 +85,11 @@ def _apply_bridge_runtime_config(provider, args: TrainerConfig) -> None:
     ):  # config-access-exempt: Megatron creates this flag only when CPU offload is enabled
         provider.cpu_offloading = args.backend.cpu_offloading
 
+    # Mamba: the inter-chunk SSM state dtype of training (None = params dtype, bf16; SGLang keeps fp32
+    # states). Copied only when set, so the default provider is unchanged.
+    if args.backend.mamba_training_ssm_states_dtype is not None:
+        provider.mamba_training_ssm_states_dtype = args.backend.mamba_training_ssm_states_dtype
+
     # communication overlap
     provider.tp_comm_overlap = args.backend.tp_comm_overlap
 
