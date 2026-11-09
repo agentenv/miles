@@ -52,7 +52,7 @@ def test_lora_publish_carries_base_weights_only_for_the_hybrid(hybrid):
         patch(f"{_UPDATER_MODULE}.get_gloo_group", return_value=MagicMock()),
     ):
         dist_mock.get_rank.return_value = 0
-        updater.update_weights()
+        updater.update_weights(weight_version=1)
 
     assert iterator.iter_hf_weights.call_args.kwargs["include_base"] is hybrid
     assert iterator.iter_hf_weights.call_args.kwargs["adapters"]
