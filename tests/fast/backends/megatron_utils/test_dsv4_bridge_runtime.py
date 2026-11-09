@@ -43,6 +43,8 @@ def _runtime_args(**overrides):
         backend=SimpleNamespace(**values),
         enable_mtp_training=False,
         dsa_attention_backend=values.get("dsa_attention_backend"),
+        use_routing_replay=False,
+        use_rollout_routing_replay=False,
     )
 
 
