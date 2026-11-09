@@ -81,7 +81,13 @@ def runtime_args() -> argparse.Namespace:
         moe_router_bias_update_rate=None,
         moe_aux_loss_coeff=None,
     )
-    return argparse.Namespace(backend=backend, dsa_attention_backend=None, enable_mtp_training=False)
+    return argparse.Namespace(
+        backend=backend,
+        dsa_attention_backend=None,
+        enable_mtp_training=False,
+        use_routing_replay=False,
+        use_rollout_routing_replay=False,
+    )
 
 
 @pytest.fixture

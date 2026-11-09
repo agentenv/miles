@@ -107,4 +107,6 @@ def bridge_args(tmp_path: Path) -> Namespace:
         lora_type="lora",
         offload_train=False,
         dsa_attention_backend="megatron",
+        use_routing_replay=False,
+        use_rollout_routing_replay=False,
     )

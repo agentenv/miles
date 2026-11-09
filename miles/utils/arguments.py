@@ -58,6 +58,7 @@ from miles.utils.object_store_config import (
     compute_mooncake_init_kwargs_vanilla,
 )
 from miles.utils.output_store.config import check_output_store_args
+from miles.utils.replay_base import reject_router_fusion_with_routing_replay
 from miles.utils.rollout_data_config import RolloutDatasetConfig, check_dataset_length_limits, load_rollout_data_config
 from miles.utils.rollout_topk_logprobs import validate_rollout_topk_logprobs_args
 from miles.utils.run_uuid import generate_run_uuid, validate_run_uuid
@@ -1848,6 +1849,12 @@ def miles_validate_args(args):
 
     if args.use_rollout_routing_replay:
         args.use_routing_replay = True
+    if args.train_backend == "megatron":
+        # the bridge path checks the provider again: a bridge can turn router fusion on by itself
+        # Megatron versions and partial parsers without --moe-router-fusion leave it out of args
+        reject_router_fusion_with_routing_replay(
+            router_fusion=bool(vars(args).get("moe_router_fusion", False)), routing_replay=args.use_routing_replay
+        )
 
     args.rollout_external = _compute_rollout_external(args)
     args.custom_inference_engine_provider_path = _compute_custom_inference_engine_provider_path(args)
