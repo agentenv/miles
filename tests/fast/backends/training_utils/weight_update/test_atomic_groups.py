@@ -57,3 +57,10 @@ class TestHfAtomicUpdateGroups:
 
     def test_inkling_registers_none(self):
         assert get_hf_atomic_update_groups("inkling") == []
+
+    @pytest.mark.parametrize("model_name", ["kimi_k3", "kimi_k31"])
+    def test_kimi_k3_q_lora_pair_is_optional(self, model_name):
+        """KDA-only layers carry no MLA pair; the deepseek pair stays required."""
+        (group,) = get_hf_atomic_update_groups(model_name, q_lora_rank=1536)
+        assert group.optional
+        assert not get_hf_atomic_update_groups("deepseekv3", q_lora_rank=1024)[0].optional
