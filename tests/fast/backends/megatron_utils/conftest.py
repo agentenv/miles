@@ -80,6 +80,7 @@ def runtime_args() -> argparse.Namespace:
         decoder_last_pipeline_num_layers=None,
         moe_router_bias_update_rate=None,
         moe_aux_loss_coeff=None,
+        mamba_training_ssm_states_dtype=None,
     )
     return argparse.Namespace(
         backend=backend,

@@ -37,6 +37,7 @@ def _runtime_args(**overrides):
         "decoder_last_pipeline_num_layers": 3,
         "moe_router_bias_update_rate": None,
         "moe_aux_loss_coeff": None,
+        "mamba_training_ssm_states_dtype": None,
     }
     values.update(overrides)
     return SimpleNamespace(

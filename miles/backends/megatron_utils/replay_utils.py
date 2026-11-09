@@ -5,8 +5,8 @@ from miles_plugins.models.kimi_k3.partial_experts import map_replay_ids_to_slots
 from miles_plugins.models.kimi_k3.permute import get_active_slot_layout
 
 
-def register_replay_list_moe(replay_list, replay_data, *, models, **_kwargs):
-    """Map replay streams to Megatron MoE layers using the local model layout."""
+def _layer_ids_from_moe_layer_freq(models) -> list[int]:
+    """Global layer ids of the local MoE layers by ``config.moe_layer_freq``."""
     layer_indices = []
     for vp_stage, model in enumerate(models):
         config = model.module.config
@@ -21,6 +21,46 @@ def register_replay_list_moe(replay_list, replay_data, *, models, **_kwargs):
                 if config.moe_layer_freq[layer_id] == 0:
                     continue
             layer_indices.append(layer_id)
+    return layer_indices
+
+
+def _layer_ids_from_routers(models) -> list[int] | None:
+    """Global layer ids of the routers that registered a replay stream, in module (= construction = stream)
+    order; None when a router lacks its layer number.
+
+    A hybrid model (e.g. Nemotron-H: Mamba, attention and MoE layers from a ``hybrid_layer_pattern``) has MoE
+    routers on only some layers, and its bridge config keeps ``moe_layer_freq = 1``, so the frequency rule
+    would map every layer. Each router knows its 1-based global ``layer_number``.
+    """
+    layer_indices = []
+    for model in models:
+        for module in model.modules():
+            if getattr(module, "routing_replay", None) is None:  # config-access-exempt: only Megatron routers hook replay
+                continue
+            layer_number = getattr(module, "layer_number", None)  # config-access-exempt: Megatron router field
+            if not isinstance(layer_number, int) or layer_number < 1:
+                return None
+            layer_indices.append(layer_number - 1)
+    return layer_indices
+
+
+def register_replay_list_moe(replay_list, replay_data, *, models, **_kwargs):
+    """Map replay streams to Megatron MoE layers using the local model layout.
+
+    ``replay_data[:, layer]`` is indexed by the global layer id (SGLang records routed experts per absolute
+    layer). The frequency rule decides when it yields one layer per stream; otherwise (hybrid models) the
+    routers' own layer numbers do. A layer count that still differs from the stream count is an error, never
+    a silent misalignment.
+    """
+    layer_indices = _layer_ids_from_moe_layer_freq(models)
+    if len(layer_indices) != len(replay_list):
+        from_routers = _layer_ids_from_routers(models)
+        if from_routers is not None and len(from_routers) == len(replay_list):
+            layer_indices = from_routers
+    if len(layer_indices) != len(replay_list):
+        raise RuntimeError(f"routing replay: {len(replay_list)} replay streams but {len(layer_indices)} local MoE layers ({layer_indices[:8]}...); the layer mapping does not fit this model")
+    if layer_indices and max(layer_indices) >= replay_data.shape[1]:
+        raise RuntimeError(f"routing replay: MoE layer {max(layer_indices)} is outside the rollout's {replay_data.shape[1]} recorded layers")
 
     # inference engines report original expert ids; a partial-experts trainer routes in slot ids
     layout = get_active_slot_layout()
