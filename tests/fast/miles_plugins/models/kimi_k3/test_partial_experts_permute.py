@@ -26,7 +26,9 @@ def _no_active_layout():
 def _latent_moe(params, x, *, replay_ids=None):
     """K3-style layer: sigmoid router + expert bias for selection, renormalized top-k scores,
     latent down-proj -> per-expert gated MLP -> latent up-proj, plus a shared expert."""
-    logits = x @ params["router"].T
+    # one mat-vec per router row: a blocked GEMM may round a row differently depending on its
+    # position in the weight (host BLAS kernel choice), which a slot permutation moves
+    logits = torch.stack([x @ row for row in params["router"]], dim=-1)
     scores = torch.sigmoid(logits)
     ids = torch.topk(scores + params["bias"], TOPK, dim=-1).indices if replay_ids is None else replay_ids
     probs = scores.gather(-1, ids)
