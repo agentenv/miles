@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -1597,9 +1598,40 @@ def _optimizer_owned_parameter_ids(optimizer) -> frozenset[int]:
     )
 
 
+_LOGGER = logging.getLogger(__name__)
+_LOGGED_OPTIMIZER_LAYOUTS: set[tuple] = set()
+
+
 def _optimizer_wrappers(optimizer) -> tuple[object, ...]:
+    """The non-stub children of ``optimizer`` (itself when not chained).
+
+    Megatron puts a stub child (``is_stub_optimizer``, no inner optimizer and no
+    parameters) into a ChainedOptimizer for a parameter group a rank does not
+    own; it carries no state, so every traversal skips it.
+    """
+
     wrappers = getattr(optimizer, "chained_optimizers", None)  # config-access-exempt: chained_optimizers exists only on Megatron ChainedOptimizer
-    return tuple((optimizer,) if wrappers is None else wrappers)
+    children = tuple((optimizer,) if wrappers is None else wrappers)
+    _log_optimizer_layout(children)
+    return tuple(child for child in children if not getattr(child, "is_stub_optimizer", False))  # config-access-exempt: is_stub_optimizer exists only on Megatron optimizer wrappers
+
+
+def _log_optimizer_layout(children: tuple[object, ...]) -> None:
+    layout = tuple(
+        (
+            type(child).__name__,
+            bool(getattr(child, "is_stub_optimizer", False)),  # config-access-exempt: Megatron wrapper flag
+            len(getattr(getattr(child, "optimizer", child), "param_groups", None) or ()),  # config-access-exempt: duck-typed torch optimizer
+        )
+        for child in children
+    )
+    if layout in _LOGGED_OPTIMIZER_LAYOUTS:
+        return
+    _LOGGED_OPTIMIZER_LAYOUTS.add(layout)
+    _LOGGER.warning(
+        "[full-parameter-optimizer] children: %s",
+        ", ".join(f"{name}(stub={stub}, param_groups={groups})" for name, stub, groups in layout),
+    )
 
 
 def _paired_groups(wrapper, model_attribute: str, shard_attribute: str):
