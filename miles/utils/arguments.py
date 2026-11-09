@@ -1131,6 +1131,13 @@ def miles_validate_args(args):
         args.use_session_server and args.partial_rollout
     ), "--use-session-server does not support --partial-rollout"
 
+    if args.agentic_suspend_between_turns:
+        assert not args.partial_rollout, "--agentic-suspend-between-turns is exclusive with --partial-rollout"
+        assert not args.fully_async, "--agentic-suspend-between-turns is exclusive with --fully-async"
+        assert args.custom_agent_function_path, "--agentic-suspend-between-turns requires --custom-agent-function-path"
+        assert args.use_session_server, "--agentic-suspend-between-turns requires --use-session-server"
+        assert args.agentic_suspend_max_rounds >= 1, "--agentic-suspend-max-rounds must be >= 1"
+
     if args.use_session_server == "v2":
         unsupported = [
             flag

@@ -67,16 +67,7 @@ async def call_agent_abort_hook(args) -> None:
     """
     from miles.utils.args.custom_view import compute_custom_function_config
 
-    agent_functions = [args.custom_agent_function_path] if args.custom_agent_function_path else []
-    # resolved at startup and carried by both rollout and orchestrator configs, so abort never rereads the YAML
-    agent_functions += args.rollout_dataset_agent_functions
-    # one abort per (module, config): two agents in one module with different typed configs each get theirs
-    called: list[tuple[str, Any]] = []
-    for agent_function in agent_functions:
-        module_path, _, _ = agent_function.path.rpartition(".")
-        if not module_path or (module_path, agent_function.config) in called:
-            continue
-        called.append((module_path, agent_function.config))
+    for module_path, agent_function in _distinct_agent_functions(args):
         try:
             abort_hook = load_function(f"{module_path}.abort")
         except (AttributeError, ModuleNotFoundError):
@@ -87,6 +78,33 @@ async def call_agent_abort_hook(args) -> None:
             await abort_hook(fn_args)
         except Exception as e:
             logger.warning(f"Agent abort hook {module_path}.abort failed: {e}")
+
+
+async def call_agent_hook(args, name: str) -> None:
+    """Invoke the required sibling ``name`` hook of every agent function the run can call.
+
+    The ``suspend`` / ``resume`` hooks of --agentic-suspend-between-turns are not optional like
+    ``abort``: a module that lacks one, or a hook that fails, fails the rollout (fail closed),
+    since a trajectory the agent did not pause would keep generating while the engines train.
+    """
+    from miles.utils.args.custom_view import compute_custom_function_config
+
+    for module_path, agent_function in _distinct_agent_functions(args):
+        hook = load_function(f"{module_path}.{name}")
+        await hook(compute_custom_function_config(args, agent_function))
+
+
+def _distinct_agent_functions(args) -> list[tuple[str, Any]]:
+    agent_functions = [args.custom_agent_function_path] if args.custom_agent_function_path else []
+    # resolved at startup and carried by both rollout and orchestrator configs, so a hook never rereads the YAML
+    agent_functions += args.rollout_dataset_agent_functions
+    # one call per (module, config): two agents in one module with different typed configs each get theirs
+    distinct: list[tuple[str, Any]] = []
+    for agent_function in agent_functions:
+        module_path, _, _ = agent_function.path.rpartition(".")
+        if module_path and all((module_path, agent_function.config) != (m, f.config) for m, f in distinct):
+            distinct.append((module_path, agent_function))
+    return distinct
 
 
 class SingletonMeta(type):

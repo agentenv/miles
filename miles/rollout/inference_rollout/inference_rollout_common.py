@@ -32,6 +32,10 @@ logger = logging.getLogger(__name__)
 
 
 class GenerateState:
+    # set while samples that have not started yet must wait for the next rollout instead of being aborted
+    # (--agentic-suspend-between-turns); a class default, so a state built without __init__ never holds samples
+    new_samples_released: asyncio.Event | None = None
+
     def __init__(self, args: Namespace) -> None:
         # persistent state for the generation process
         self.args = args
@@ -53,6 +57,9 @@ class GenerateState:
 
         self.generate_function = load_generate_function(args.custom_generate_function_path) or generate
         self.sample_generate_functions: dict[str, Any] = {}
+        # --agentic-suspend-between-turns: groups suspended at a cut-off, keyed to the rollout that started them;
+        # the tasks run on the persistent rollout event loop, so they cross the rollout boundary here
+        self.suspended_groups: dict[asyncio.Task, int] = {}
 
         self.reset()
 
@@ -66,6 +73,16 @@ class GenerateState:
 
     def reset(self) -> None:
         self.aborted = False
+
+    def hold_new_samples(self) -> None:
+        """--agentic-suspend-between-turns: samples that have not started yet wait (instead of being aborted)
+        until :meth:`release_new_samples`."""
+        self.new_samples_released = asyncio.Event()
+
+    def release_new_samples(self) -> None:
+        if self.new_samples_released is not None:
+            self.new_samples_released.set()
+        self.new_samples_released = None
 
 
 async def generate_and_rm(
@@ -100,6 +117,8 @@ async def generate_and_rm(
     logger.debug(f"{log_prefix} Waiting for semaphore...")
     try:
         async with state.generate_fn_semaphore:
+            if (held := state.new_samples_released) is not None and not evaluation:
+                await held.wait()
             if state.aborted:
                 sample.status = Sample.Status.ABORTED
                 return sample
