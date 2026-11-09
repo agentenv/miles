@@ -19,16 +19,20 @@ def _same(a: torch.Tensor, b: torch.Tensor) -> bool:
     return torch.equal(a.reshape(-1).view(torch.uint8), b.reshape(-1).view(torch.uint8))
 
 
-@pytest.mark.parametrize(
-    "value,expected",
-    [(None, True), ("1", True), ("0", False), ("off", False), (" False ", False), ("no", False), ("yes", True)],
-)
-def test_enabled_reads_the_switch(monkeypatch, value, expected):
-    if value is None:
-        monkeypatch.delenv(sync_free.ENV_VAR, raising=False)
-    else:
-        monkeypatch.setenv(sync_free.ENV_VAR, value)
-    assert sync_free.enabled() is expected
+def test_the_switch_defaults_on_and_follows_configure(monkeypatch):
+    monkeypatch.setattr(sync_free, "_ENABLED", True)
+    assert sync_free.enabled() is True
+    sync_free.configure(False)
+    assert sync_free.enabled() is False
+    sync_free.configure(True)
+    assert sync_free.enabled() is True
+
+
+def test_debug_config_declares_the_switch_on_by_default():
+    from miles.utils.args.configs.debug import DebugConfig
+
+    field = DebugConfig.model_fields["host_sync_free"]
+    assert field.default is True and field.annotation is bool
 
 
 # Lists shaped like loss_function's logging values: a count followed by 0-d metrics.
@@ -58,7 +62,7 @@ def test_scalars_to_tensor_matches_torch_tensor(values):
 
 @pytest.mark.parametrize("values", LISTS, ids=range(len(LISTS)))
 def test_scalars_to_tensor_switch_off_is_torch_tensor(values, monkeypatch):
-    monkeypatch.setenv(sync_free.ENV_VAR, "0")
+    monkeypatch.setattr(sync_free, "_ENABLED", False)
     assert _same(sync_free.scalars_to_tensor(values, device="cpu"), torch.tensor(values, device="cpu"))
 
 

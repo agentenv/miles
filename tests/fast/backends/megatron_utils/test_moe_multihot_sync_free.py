@@ -176,9 +176,25 @@ def test_missing_method_warns(caplog):
     assert "has no _indices_to_multihot" in caplog.text
 
 
-def test_install_respects_the_switch(monkeypatch):
-    monkeypatch.setenv(sync_free.ENV_VAR, "0")
-    assert multihot.install() is False
+def test_the_patched_method_defers_to_megatron_when_the_switch_is_off(monkeypatch):
+    """install() runs at import, before the actor reads --no-host-sync-free; the switch is read per call."""
+    calls = []
+
+    class Manager:
+        num_local_experts = 4
+
+        def _indices_to_multihot(self, indices, probs):
+            calls.append((indices, probs))
+            return "original"
+
+    known = frozenset({sync_free.source_sha256(Manager._indices_to_multihot)})
+    assert multihot.patch_manager_class(Manager, known_sha256=known)
+    indices, probs = _routing(8, 4, 2, seed=1)
+    monkeypatch.setattr(sync_free, "_ENABLED", False)
+    assert Manager()._indices_to_multihot(indices, probs) == "original" and len(calls) == 1
+    monkeypatch.setattr(sync_free, "_ENABLED", True)
+    routing_map, _ = Manager()._indices_to_multihot(indices, probs)
+    assert routing_map.shape == (8, 4) and len(calls) == 1
 
 
 def test_real_megatron_class_is_recognised_and_bitwise():

@@ -61,9 +61,9 @@ PACKS = [([3, 2, 4], 3), ([5, 1], 0), ([8192], 0), ([1], 127), ([700, 1, 1, 2000
 
 @pytest.mark.parametrize("lengths,pad", PACKS)
 def test_host_seq_idx_gives_the_same_params(lengths, pad, monkeypatch):
-    monkeypatch.setenv(sync_free.ENV_VAR, "1")
+    monkeypatch.setattr(sync_free, "_ENABLED", True)
     new = parallel.get_packed_seq_params(_batch(lengths, pad), ARGS)
-    monkeypatch.setenv(sync_free.ENV_VAR, "0")
+    monkeypatch.setattr(sync_free, "_ENABLED", False)
     old = parallel.get_packed_seq_params(_batch(lengths, pad), ARGS)
     assert new.total_tokens == sum(lengths) + pad and new.seq_idx is not None
     _assert_same_params(new, old)
@@ -87,7 +87,7 @@ def test_thd_seq_idx_clamps_like_post_init():
 
 
 def test_unknown_post_init_falls_back_and_warns(monkeypatch, caplog):
-    monkeypatch.setenv(sync_free.ENV_VAR, "1")
+    monkeypatch.setattr(sync_free, "_ENABLED", True)
     monkeypatch.setattr(parallel.sync_free, "source_sha256", lambda _fn: "0" * 64)
     calls = []
     monkeypatch.setattr(parallel, "thd_seq_idx", lambda *a: calls.append(a))
@@ -102,8 +102,8 @@ def test_unknown_post_init_falls_back_and_warns(monkeypatch, caplog):
 def test_context_parallel_gives_the_same_params(cp_size, monkeypatch):
     """With CP the boundaries describe the global stream; both paths still derive seq_idx from them."""
     batch = _batch([3 * cp_size, 2 * cp_size], cp_size)
-    monkeypatch.setenv(sync_free.ENV_VAR, "1")
+    monkeypatch.setattr(sync_free, "_ENABLED", True)
     new = parallel.get_packed_seq_params(dict(batch), ARGS)
-    monkeypatch.setenv(sync_free.ENV_VAR, "0")
+    monkeypatch.setattr(sync_free, "_ENABLED", False)
     old = parallel.get_packed_seq_params(dict(batch), ARGS)
     _assert_same_params(new, old)

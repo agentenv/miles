@@ -51,7 +51,7 @@ from miles.dashboard import hooks as dashboard_hooks
 from miles.ray.rollout.inference_controller import UpdatableEngines
 from miles.ray.specs.train import compute_trainer_pool_id
 from miles.ray.train_actor import TrainRayActor, WeightUpdateOutput
-from miles.utils import object_store
+from miles.utils import object_store, sync_free
 from miles.utils.argparse_utils import inplace_modify_args
 from miles.utils.args.custom_view import compute_custom_function_config
 from miles.utils.audit_utils.config_snapshot.dumper import ConfigSnapshotDumper
@@ -154,6 +154,8 @@ class MegatronTrainRayActor(TrainRayActor):
         self.snapshot_publisher: SnapshotPublisher | None = None
         self.adapter_slots: BridgeAdapterSlots | NativeAdapterSlots | None = None
         monkey_patch_torch_dist()
+        # The sync-free helpers run deep inside replay, loss and batch code; they read this process-wide switch.
+        sync_free.configure(args.host_sync_free)
 
         self._last_rollout_id: int | None = None
         # Per-rank state of the full-parameter transport (yeto DiLoCo).

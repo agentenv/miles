@@ -26,7 +26,7 @@ def _topk(scores, topk):
 
 
 def _replayed(top_indices, scores, *, stage, return_probs, switch, monkeypatch):
-    monkeypatch.setenv(sync_free.ENV_VAR, switch)
+    monkeypatch.setattr(sync_free, "_ENABLED", switch == "1")
     manager = BaseReplayManager()
     manager.enable_check_replay_result = False
     manager.enabled = True
@@ -88,7 +88,7 @@ class _CopySpy:
 
 @pytest.mark.parametrize("switch,non_blocking", [("1", True), ("0", False)])
 def test_pop_copies_without_blocking_when_on(switch, non_blocking, monkeypatch):
-    monkeypatch.setenv(sync_free.ENV_VAR, switch)
+    monkeypatch.setattr(sync_free, "_ENABLED", switch == "1")
     monkeypatch.setattr(replay_base.current_platform, "current_device", lambda: 3)
     replay = Replay()
     replay.top_indices_list = [_CopySpy(), _CopySpy()]

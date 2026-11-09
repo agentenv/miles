@@ -1,6 +1,6 @@
 """loss_function's normalizer and logging values are bit-identical with and without host syncs (CPU).
 
-Runs the dispatcher of every snapshot configuration twice (MILES_HOST_SYNC_FREE=1 and
+Runs the dispatcher of every snapshot configuration twice (host_sync_free on and
 =0) and also against ``torch.tensor`` built from the same logging dict.
 """
 
@@ -30,7 +30,7 @@ def _same(a, b) -> bool:
 
 
 def _run(config, *, switch, per_token, monkeypatch):
-    monkeypatch.setenv(sync_free.ENV_VAR, switch)
+    monkeypatch.setattr(sync_free, "_ENABLED", switch == "1")
     _name, overrides, batch_size, prompt_lens, response_lens = config
     args = make_args(global_batch_size=batch_size, calculate_per_token_loss=per_token, **overrides)
     make_parallel_state()

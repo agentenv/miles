@@ -65,6 +65,18 @@ class DebugConfig(BaseConfig):
             )
         ),
     ] = None
+    host_sync_free: A[
+        bool,
+        Arg(
+            action=argparse.BooleanOptionalAction,
+            help=(
+                "Megatron training step without host-GPU synchronizations in routing replay, loss logging, "
+                "THD packing and the DeepEP dispatcher (same values bit for bit; sizes come from host copies, "
+                "tensors are built on the device, host data is copied without waiting). --no-host-sync-free "
+                "restores the previous code paths for A/B measurements or as an escape hatch."
+            ),
+        ),
+    ] = True
     dump_details: A[
         str | None,
         Arg(help="Dump all details of training for post-hoc analysis and visualization."),

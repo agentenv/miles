@@ -31,8 +31,9 @@ replacement drops it with the ``-1`` slots) and negative indices other than ``-1
 a84b105 source of it (SHA-256 of the dedented source).  Any other source, a missing
 class or unreadable source logs a WARNING and keeps Megatron's method.  Other
 dtypes or shapes than DeepEP's (int64 ``[tokens, topk]`` indices, float32 probs)
-call the original method.  ``MILES_HOST_SYNC_FREE=0`` (see :mod:`miles.utils.sync_free`)
-skips the install.
+call the original method.  The patched method consults the switch of
+:mod:`miles.utils.sync_free` on every call, so ``--no-host-sync-free`` (set by the
+trainer actor after this module was installed at import) runs Megatron's own code.
 """
 
 from __future__ import annotations
@@ -88,7 +89,7 @@ def _handles(indices: torch.Tensor, probs: torch.Tensor) -> bool:
 def _make_method(original: Callable) -> Callable:
     @functools.wraps(original)
     def _indices_to_multihot(self, indices, probs):
-        if not _handles(indices, probs):
+        if not sync_free.enabled() or not _handles(indices, probs):
             return original(self, indices, probs)
         return indices_to_multihot(indices, probs, num_local_experts=self.num_local_experts)
 
@@ -127,11 +128,12 @@ def patch_manager_class(manager_cls, *, known_sha256: frozenset[str] = KNOWN_SOU
 
 
 def install() -> bool:
-    """Patch Megatron's ``_DeepepManager`` once per process; False when not patched."""
+    """Patch Megatron's ``_DeepepManager`` once per process; False when not patched.
 
-    if not sync_free.enabled():
-        logger.info("%s=0: keeping Megatron's _indices_to_multihot", sync_free.ENV_VAR)
-        return False
+    Installed at import (``runtime_patches``), before the actor reads its configuration;
+    the patched method itself defers to Megatron's when ``host_sync_free`` is off.
+    """
+
     try:
         from megatron.core.transformer.moe.token_dispatcher import _DeepepManager
     except ImportError as exc:

@@ -25,7 +25,7 @@ def _rollout(lengths):
 
 
 def _get_batch(lengths, *, cp_size, cp_rank, allgather_cp, switch, monkeypatch):
-    monkeypatch.setenv(sync_free.ENV_VAR, switch)
+    monkeypatch.setattr(sync_free, "_ENABLED", switch == "1")
     state = SimpleNamespace(cp=SimpleNamespace(rank=cp_rank, size=cp_size), tp=SimpleNamespace(rank=0, size=1))
     monkeypatch.setattr(data_utils, "get_parallel_state", lambda: state)
     monkeypatch.setattr(context_parallel, "get_parallel_state", lambda: state)
@@ -66,7 +66,7 @@ def test_get_batch_same_with_and_without_host_syncs(lengths, cp_size, cp_rank, a
 @pytest.mark.parametrize("cp_size", [1, 2, 4])
 @pytest.mark.parametrize("switch", ["1", "0"])
 def test_thd_cu_seqlens_on_device_matches_the_device_read(cu_list, cp_size, switch, monkeypatch):
-    monkeypatch.setenv(sync_free.ENV_VAR, switch)
+    monkeypatch.setattr(sync_free, "_ENABLED", switch == "1")
     expected_cu, expected_max = _device_read_max_seqlen(cu_list, cp_size)
     host = tuple(boundary * cp_size for boundary in cu_list)
     cu_seqlens, max_seqlen = data_utils.thd_cu_seqlens_on_device(host, "cpu")

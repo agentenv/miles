@@ -183,7 +183,7 @@ def thd_cu_seqlens_on_device(
     """``(cu_seqlens on device as int32, max_seqlen)`` for a THD pack from its host boundaries.
 
     The sync-free path reads max_seqlen from the host boundaries and copies cu_seqlens
-    without making the host wait; the old path (``MILES_HOST_SYNC_FREE=0``) copied first
+    without making the host wait; the old path (``--no-host-sync-free``) copied first
     and read max_seqlen back from the device. Both give the same values.
     """
 
