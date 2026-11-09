@@ -298,13 +298,22 @@ def parse_args_and_get_parser(
                     getattr(text_config, "indexer_rope_interleave", False)
                 )  # config-access-exempt: model-family schemas differ in optional indexer_rope_interleave metadata
                 logger.info(f"Setting indexer_rope_interleave: {args.indexer_rope_interleave} into args")
-                # one indexer top-k stream per DSA layer; GLM-5.3-Flash's KDA layers have none
-                layer_types = (
-                    getattr(text_config, "layer_types", None) or []
-                )  # config-access-exempt: HF model families may omit layer_types metadata
-                args.rollout_indexer_topk_num_streams = text_config.num_hidden_layers - layer_types.count(
-                    "linear_attention"
+                # one indexer top-k stream per DSA layer; GLM-5.3-Flash's KDA layers have none, and Kimi-K3.1
+                # lists its DSA layers (1-based, the full model's list even in a partial checkpoint)
+                dsa_layers = (
+                    getattr(text_config, "dsa_config", None) or {}
+                ).get(  # config-access-exempt: only Kimi-K3.1 configs carry dsa_config
+                    "dsa_layers"
                 )
+                if dsa_layers is not None:
+                    args.rollout_indexer_topk_num_streams = sum(n <= text_config.num_hidden_layers for n in dsa_layers)
+                else:
+                    layer_types = (
+                        getattr(text_config, "layer_types", None) or []
+                    )  # config-access-exempt: HF model families may omit layer_types metadata
+                    args.rollout_indexer_topk_num_streams = text_config.num_hidden_layers - layer_types.count(
+                        "linear_attention"
+                    )
                 # ids per stream and token; sizes the output store buffer
                 args.rollout_indexer_topk_width = text_config.index_topk
 
