@@ -355,6 +355,7 @@ def get_model_provider_func(
             model = GPTModel(**kwargs)
 
         _maybe_freeze_native_dsa_indexer(args, model)
+        _maybe_freeze_for_partial_experts(args, model)
 
         if post_process and role == "critic":
             model.output_layer = LinearForLastLayer(input_size=config.hidden_size, output_size=1, config=config)
@@ -373,6 +374,27 @@ def _maybe_freeze_native_dsa_indexer(args: TrainerConfig, model: GPTModel) -> No
         for name, parameter in model.named_parameters():
             if ".self_attention.core_attention.indexer." in name:
                 parameter.requires_grad_(False)
+
+
+def _maybe_freeze_for_partial_experts(args: TrainerConfig, model: GPTModel) -> None:
+    """--partial-experts-selection: train only the selected routed experts.
+
+    Runs right after GPTModel is built and before DDP wraps it, like the indexer freeze above, so DDP's
+    grad buffers and the optimizer only ever see the trainable experts. Everything else freezes: router,
+    attention, KDA, indexer, shared experts, latent projections, embeddings and the output layer. The
+    router's expert bias is a buffer, so the update rate must be zero to keep it fixed.
+    """
+    if args.partial_experts_selection is None:
+        return
+    from miles_plugins.models.kimi_k3.partial_experts import freeze_all_but_trainable_experts
+
+    assert args.backend.moe_router_bias_update_rate == 0, (
+        "--partial-experts-selection keeps the router fixed; set --moe-router-bias-update-rate 0"
+    )
+    trainable, frozen = freeze_all_but_trainable_experts(model)
+    has_experts = any(".mlp.experts." in name for name, _ in model.named_parameters())
+    assert trainable > 0 or not has_experts, "--partial-experts-selection: no trainable expert parameter on this rank"
+    logger.info("partial experts: %d trainable expert parameters, %d frozen parameters on this rank", trainable, frozen)
 
 
 def _maybe_install_witness(
