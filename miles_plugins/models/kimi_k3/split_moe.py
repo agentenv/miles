@@ -60,7 +60,12 @@ class PartiallyTrainableGroupedMLP(MegatronModule):
         super().__init__(config=config)
         assert 0 < num_local_trainable < num_local_experts, (num_local_trainable, num_local_experts)
         assert not config.add_bias_linear, "Kimi K3 experts carry no bias"
-        assert not config.moe_use_legacy_grouped_gemm, "partial experts need TE grouped GEMM"
+        # Megatron eb547f33e (the k31 image) has no moe_use_legacy_grouped_gemm; the TE
+        # path is the only grouped GEMM there and moe_grouped_gemm must be on
+        assert not getattr(  # config-access-exempt: absent on newer Megatron
+            config, "moe_use_legacy_grouped_gemm", False
+        ), "partial experts need TE grouped GEMM"
+        assert config.moe_grouped_gemm, "partial experts need --moe-grouped-gemm"
         assert not getattr(  # config-access-exempt: the op fuser assembles one GroupedLinear itself and cannot split
             config, "use_transformer_engine_op_fuser", False
         ), "partial experts: the TE op fuser path rebuilds a single GroupedLinear"
