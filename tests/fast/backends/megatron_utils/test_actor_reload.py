@@ -565,8 +565,10 @@ class TestAReloadThatFindsNothingItSaved:
         _watch_load(actor_module, monkeypatch, args=args, iteration=0)
         resets = []
         monkeypatch.setattr(actor_module, "reset_optimizer_state", lambda *a, **k: resets.append(a))
+        actor = _actor(actor_module, role="actor", args=args)
+        actor.optimizer = Mock()  # the reset runs only for a trainer that holds an optimizer
 
-        _reload(_actor(actor_module, role="actor", args=args))
+        _reload(actor)
 
         assert len(resets) == 1
 
