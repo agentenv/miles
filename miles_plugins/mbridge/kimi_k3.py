@@ -265,8 +265,16 @@ class KimiK3Bridge(LinearAttentionBridgeMixin, DeepseekV3Bridge):
                     original_id = layout.local_slot_to_original_id(hf_layer, ep_rank, local_slot)
                     fc1, fc2 = self._packed_expert_rows(hf_layer, original_id)
                     if local_slot < k_local:
-                        # the BF16 master starts as the exact dequantization of the shipped MXFP4 expert
-                        _copy_expert(trainable_half, local_slot, dequantize_mxfp4_rows(fc1, MXFP4_GROUP_SIZE), dequantize_mxfp4_rows(fc2, MXFP4_GROUP_SIZE))
+                        # the BF16 master starts as the exact dequantization of the shipped MXFP4 expert;
+                        # dequantize on the expert's device (the rows load on CPU, where 16 experts x ~31
+                        # layers per rank take tens of minutes; the result is bit-identical)
+                        device = _expert_device(trainable_half)
+                        _copy_expert(
+                            trainable_half,
+                            local_slot,
+                            dequantize_mxfp4_rows(fc1.to(device, non_blocking=True), MXFP4_GROUP_SIZE),
+                            dequantize_mxfp4_rows(fc2.to(device, non_blocking=True), MXFP4_GROUP_SIZE),
+                        )
                     else:
                         _copy_expert(frozen_half, local_slot - k_local, fc1, fc2)
                 router = layer.mlp.router
@@ -339,6 +347,11 @@ def _partial_experts_layout(models) -> SlotLayout | None:
         if layout is not None:
             return layout
     return get_active_slot_layout()
+
+
+def _expert_device(half) -> torch.device:
+    """The device the half's expert weights live on (CPU before they move to the GPU)."""
+    return next(half.parameters()).device
 
 
 def _copy_expert(half, local_index: int, fc1: torch.Tensor, fc2: torch.Tensor) -> None:
