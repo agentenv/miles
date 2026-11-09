@@ -2196,8 +2196,12 @@ def _optimizer_steps_per_local_round(
     ):
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise RuntimeError(f"full-parameter {name} is invalid")
-    # A critic steps once per rollout here: upstream has no critic-epochs knob, so
-    # the critic's optimizer progress per local round equals the actor's.
+    if role == "critic":
+        # --num-critic-epochs: the critic takes that many optimizer steps per rollout.
+        critic_epochs = actor.args.num_critic_epochs
+        if isinstance(critic_epochs, bool) or not isinstance(critic_epochs, int) or critic_epochs < 1:
+            raise RuntimeError("full-parameter critic epochs is invalid")
+        optimizer_steps *= critic_epochs
     return optimizer_steps, optimizer_steps * global_batch_size
 
 

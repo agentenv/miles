@@ -47,6 +47,8 @@ from miles.backends.training_utils.types import TrainStepOutput
 from miles.backends.training_utils.weight_update.hf_weight_iterator import WeightUpdatePlacement
 from miles.backends.training_utils.weight_update.snapshot_publisher import SnapshotPublisher
 from miles.backends.training_utils.weight_update.updater import WeightUpdater
+from miles.backends.training_utils.sao_critic import refresh_values_after_critic_update
+from miles.utils.args.configs.yeto_algo import yeto_algo_option
 from miles.dashboard import hooks as dashboard_hooks
 from miles.ray.rollout.inference_controller import UpdatableEngines
 from miles.ray.specs.train import compute_trainer_pool_id
@@ -744,18 +746,37 @@ class MegatronTrainRayActor(TrainRayActor):
 
         assert self.args.loss_type == "value_loss"
         self._log_first_train_config()
-        train_step_outcome: TrainStepOutcome = train(
-            self.args,
-            rollout_id,
-            self.model,
-            self.optimizer,
-            self.opt_param_scheduler,
-            data_iterator,
-            num_microbatches,
-            get_num_rollouts(self.args, rollout_data, len(num_microbatches)),
-            witness_info=None,
-            attempt=0,
-        )
+        # --num-critic-epochs (alias --critic-updates-per-step): value targets are fixed
+        # for this rollout; each extra update rebuilds the consumed iterator (SAO 16a9bea4).
+        for critic_epoch in range(yeto_algo_option(self.args, "num_critic_epochs")):
+            if critic_epoch > 0:
+                data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
+            train_step_outcome: TrainStepOutcome = train(
+                self.args,
+                rollout_id,
+                self.model,
+                self.optimizer,
+                self.opt_param_scheduler,
+                data_iterator,
+                num_microbatches,
+                get_num_rollouts(self.args, rollout_data, len(num_microbatches)),
+                witness_info=None,
+                attempt=0,
+            )
+
+        if refresh_values_after_critic_update(self.args, rollout_id):
+            # SAO (16a9bea4): ship values from the updated critic; returns/targets above stay fixed.
+            data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
+            rollout_data.update(
+                forward_only(
+                    get_values,
+                    self.args,
+                    self.model,
+                    data_iterator,
+                    num_microbatches,
+                    rollout_id=rollout_id,
+                )
+            )
 
         self._heartbeat.bump()
         values = None

@@ -20,6 +20,7 @@ from miles.backends.training_utils.loss.hub.math_utils import (
 )
 from miles.backends.training_utils.loss.hub.score_centering import selected_log_probs_and_entropy
 from miles.backends.training_utils.parallel import get_parallel_state
+from miles.utils.args.configs.yeto_algo import yeto_algo_option
 from miles.utils.sampling_mask import RolloutSamplingMask
 from miles.utils.types import RolloutBatch
 
@@ -68,6 +69,7 @@ def _iter_response_chunks(
     response_lengths: list[int],
     max_seq_lens: list[int] | None = None,
     include_response_indices: bool,
+    apply_temperature: bool = True,
 ) -> Iterator[tuple[torch.Tensor, torch.Tensor, Sequence[int]]]:
     """Yield response logits, tokens, and original response indices per sample.
 
@@ -104,7 +106,12 @@ def _iter_response_chunks(
     )
 
     if args.true_on_policy_mode:
-        if logits.size(-1) > 1 and args.rollout_temperature > 0 and args.rollout_temperature != 1.0:
+        if (
+            apply_temperature
+            and logits.size(-1) > 1
+            and args.rollout_temperature > 0
+            and args.rollout_temperature != 1.0
+        ):
             logits = logits.div(args.rollout_temperature)
         if args.backend.bf16:
             logits = logits.to(torch.bfloat16)
@@ -131,6 +138,22 @@ def _iter_response_chunks(
         yield logits_chunk, tokens_chunk, response_indices
 
 
+def _value_support(args: Namespace, device: torch.device) -> torch.Tensor:
+    """Return the scalar support represented by a categorical value head."""
+    low, high = args.value_reward_range
+    return torch.linspace(low, high, args.value_num_bins, dtype=torch.float32, device=device)
+
+
+def predict_values_from_logits(logits: torch.Tensor, args: Namespace) -> torch.Tensor:
+    """Convert scalar or categorical value-head output to scalar predictions."""
+    if yeto_algo_option(args, "value_loss_type") == "classification":
+        assert logits.size(-1) == args.value_num_bins, f"{logits.shape}"
+        return logits.float().softmax(dim=-1) @ _value_support(args, logits.device)
+    assert logits.size(-1) == 1, f"{logits.shape}"
+    # upcast (no-op for fp32) so value-head outputs stay fp32 even when logits arrive bf16
+    return logits.squeeze(-1).float()
+
+
 def get_responses(
     logits: torch.Tensor,
     *,
@@ -139,6 +162,7 @@ def get_responses(
     total_lengths: list[int],
     response_lengths: list[int],
     max_seq_lens: list[int] | None = None,
+    apply_temperature: bool = True,
 ) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
     """Yield response-aligned `(logits_chunk, tokens_chunk)` pairs per sample."""
     for logits_chunk, tokens_chunk, _ in _iter_response_chunks(
@@ -149,6 +173,7 @@ def get_responses(
         response_lengths=response_lengths,
         max_seq_lens=max_seq_lens,
         include_response_indices=False,
+        apply_temperature=apply_temperature,
     ):
         yield logits_chunk, tokens_chunk
 
@@ -499,10 +524,9 @@ def get_values(
         total_lengths=total_lengths,
         response_lengths=response_lengths,
         max_seq_lens=max_seq_lens,
+        apply_temperature=False,
     ):
-        assert logits_chunk.size(-1) == 1, f"{logits_chunk.shape}"
-        # upcast (no-op for fp32) so value-head outputs stay fp32 even when logits arrive bf16
-        value_list.append(logits_chunk.squeeze(-1).float())
+        value_list.append(predict_values_from_logits(logits_chunk, args))
 
     res = {
         "values": value_list,

@@ -385,8 +385,8 @@ def test_local_step_generation_keeps_global_base_until_complete_apply(monkeypatc
 
 @pytest.mark.parametrize(
     ("role", "expected_optimizer_steps"),
-    # Upstream has no critic-epochs knob: a critic steps as often as the actor.
-    (("actor", 2), ("critic", 2)),
+    # --num-critic-epochs 3: a critic takes three optimizer steps per actor step.
+    (("actor", 2), ("critic", 6)),
 )
 def test_local_step_receipt_uses_role_aware_optimizer_progress(
     monkeypatch,
@@ -402,6 +402,7 @@ def test_local_step_receipt_uses_role_aware_optimizer_progress(
             lora_rank=0,
             lora_adapter_path=None,
             num_steps_per_rollout=2,
+            num_critic_epochs=3,
             backend=_backend(global_batch_size=4),
         ),
         optimizer=SimpleNamespace(

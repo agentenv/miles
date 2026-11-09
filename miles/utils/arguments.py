@@ -1943,6 +1943,7 @@ def miles_validate_args(args):
 
     validate_policy_loss_variant_args(args)
     validate_positive_example_args(args)
+    validate_sao_and_critic_args(args)
 
     validate_score_centering_args(args)
 
@@ -1990,6 +1991,31 @@ def validate_positive_example_args(args: argparse.Namespace) -> None:
         )
     if args.positive_example_lm_loss_coef < 0:
         raise ValueError("--positive-example-lm-loss-coef must be >= 0")
+
+
+def validate_sao_and_critic_args(args: argparse.Namespace) -> None:
+    if args.policy_objective == "sao_dis":
+        if not 0 <= args.sao_dis_eps_low < 1:
+            raise ValueError("--sao-dis-eps-low must be in [0, 1)")
+        if args.sao_dis_eps_high <= 0:
+            raise ValueError("--sao-dis-eps-high must be positive")
+        if args.use_tis or args.get_mismatch_metrics or args.use_opsm:
+            raise ValueError("SAO DIS cannot be combined with TIS, mismatch correction, or OPSM")
+        # DIS directly compares the current learner with the policy that
+        # generated each token. Avoid the redundant old-policy scoring pass.
+        args.use_rollout_logprobs = True
+    if args.num_critic_epochs < 1:
+        raise ValueError("--num-critic-epochs/--critic-updates-per-step must be positive")
+    if args.value_loss_type == "classification":
+        if args.value_num_bins < 2:
+            raise ValueError("classification value loss requires --value-num-bins >= 2")
+        if len(args.value_reward_range) != 2 or args.value_reward_range[0] >= args.value_reward_range[1]:
+            raise ValueError("--value-reward-range must satisfy LOW < HIGH")
+        if args.hl_gauss_sigma_ratio <= 0:
+            raise ValueError("--hl-gauss-sigma-ratio must be positive")
+    if is_lora_enabled(args) and (args.value_loss_type != "mse" or args.critic_freeze_attention):
+        # the LoRA bridge builds its own one-output value head (lora/bridge.py _make_value_model_hook)
+        raise ValueError("--value-loss-type classification and --critic-freeze-attention do not support LoRA")
 
 
 def validate_skip_actor_forward_only(args) -> None:
