@@ -115,7 +115,7 @@ class _Rank:
             "dense": (self.replication.dense_ranks, dict(_DENSE)),
             "expert": (self.replication.expert_ranks, _expert_names(rank % ep)),
         }
-        self.args = SimpleNamespace(full_parameter_lora_hybrid=False, 
+        self.args = SimpleNamespace(full_parameter_lora_hybrid=False, rematerialize_param_from_master_weight=False, stream_optimizer_state_to_disk=False, 
             lora_rank=0, lora_adapter_path=None, num_steps_per_rollout=1, backend=_backend(global_batch_size=1), start_rollout_id=None
         )
         self.opt_param_scheduler = SimpleNamespace(num_steps=0)

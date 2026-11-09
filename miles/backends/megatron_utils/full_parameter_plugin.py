@@ -34,6 +34,8 @@ _PLAIN_OPERATIONS = {
     "finalize_full_parameter_commit": state.finalize_full_parameter_commit,
     "full_parameter_commit_status": state.full_parameter_commit_status,
     "abort_prepared_full_parameter_shard": state.abort_prepared_full_parameter_shard,
+    "model_weight_version": state.model_weight_version,
+    "set_model_weight_version": state.set_model_weight_version,
 }
 
 PLUGIN_PATH = "miles.backends.megatron_utils.full_parameter_plugin.full_parameter_rank_call"

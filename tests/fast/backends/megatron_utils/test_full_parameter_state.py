@@ -240,7 +240,7 @@ def test_optimizer_state_proof_binds_progress_and_survives_parameter_apply(
         state=states,
     )
     actor = SimpleNamespace(
-        args=SimpleNamespace(full_parameter_lora_hybrid=False, 
+        args=SimpleNamespace(full_parameter_lora_hybrid=False, rematerialize_param_from_master_weight=False, stream_optimizer_state_to_disk=False, 
             lora_rank=0,
             lora_adapter_path=None,
             num_steps_per_rollout=1,
@@ -293,7 +293,7 @@ def test_local_step_generation_keeps_global_base_until_complete_apply(monkeypatc
     base = SimpleNamespace(param_groups=[{"params": masters}], state={})
     backups = []
     actor = SimpleNamespace(
-        args=SimpleNamespace(full_parameter_lora_hybrid=False, 
+        args=SimpleNamespace(full_parameter_lora_hybrid=False, rematerialize_param_from_master_weight=False, stream_optimizer_state_to_disk=False, 
             lora_rank=0,
             lora_adapter_path=None,
             num_steps_per_rollout=1,
@@ -398,7 +398,7 @@ def test_local_step_receipt_uses_role_aware_optimizer_progress(
         parameter.data.copy_(parameter.main_param.to(dtype=parameter.dtype))
     masters = [parameter.main_param for _name, parameter in named]
     actor = SimpleNamespace(
-        args=SimpleNamespace(full_parameter_lora_hybrid=False, 
+        args=SimpleNamespace(full_parameter_lora_hybrid=False, rematerialize_param_from_master_weight=False, stream_optimizer_state_to_disk=False, 
             lora_rank=0,
             lora_adapter_path=None,
             num_steps_per_rollout=2,
@@ -449,7 +449,7 @@ def test_local_step_receipt_rejects_normal_without_scheduler_progress(monkeypatc
     named = parameters()
     masters = [parameter.main_param for _name, parameter in named]
     actor = SimpleNamespace(
-        args=SimpleNamespace(full_parameter_lora_hybrid=False, 
+        args=SimpleNamespace(full_parameter_lora_hybrid=False, rematerialize_param_from_master_weight=False, stream_optimizer_state_to_disk=False, 
             lora_rank=0,
             lora_adapter_path=None,
             num_steps_per_rollout=1,
@@ -536,7 +536,7 @@ def test_local_step_receipt_does_not_advance_when_topology_proof_fails(
         parameter.data.copy_(parameter.main_param.to(dtype=parameter.dtype))
     masters = [parameter.main_param for _name, parameter in named]
     actor = SimpleNamespace(
-        args=SimpleNamespace(full_parameter_lora_hybrid=False, 
+        args=SimpleNamespace(full_parameter_lora_hybrid=False, rematerialize_param_from_master_weight=False, stream_optimizer_state_to_disk=False, 
             lora_rank=0,
             lora_adapter_path=None,
             num_steps_per_rollout=1,
@@ -594,7 +594,7 @@ def _chunked_actor(monkeypatch):
         for master in masters
     }
     actor = SimpleNamespace(
-        args=SimpleNamespace(full_parameter_lora_hybrid=False, 
+        args=SimpleNamespace(full_parameter_lora_hybrid=False, rematerialize_param_from_master_weight=False, stream_optimizer_state_to_disk=False, 
             lora_rank=0,
             lora_adapter_path=None,
             num_steps_per_rollout=1,
@@ -1013,7 +1013,7 @@ def _manifest_actor(**args):
     named = parameters()
     masters = [parameter.main_param for _name, parameter in named]
     actor = SimpleNamespace(
-        args=SimpleNamespace(**{"full_parameter_lora_hybrid": False, "lora_rank": 0, "lora_adapter_path": None, **args}),
+        args=SimpleNamespace(**{"full_parameter_lora_hybrid": False, "lora_rank": 0, "lora_adapter_path": None, "rematerialize_param_from_master_weight": False, "stream_optimizer_state_to_disk": False, **args}),
         optimizer=SimpleNamespace(optimizer=SimpleNamespace(param_groups=[{"params": masters}], state={})),
     )
     return actor, named
@@ -1024,6 +1024,8 @@ def _manifest_actor(**args):
     [
         ({"lora_rank": 8}, "without --full-parameter-lora-hybrid"),
         ({"full_parameter_lora_hybrid": True}, "requires a LoRA actor"),
+        ({"rematerialize_param_from_master_weight": True}, "rematerialize-param-from-master-weight"),
+        ({"stream_optimizer_state_to_disk": True}, "stream-optimizer-state-to-disk"),
         (
             {"lora_rank": 8, "full_parameter_lora_hybrid": True, "lora_base_cpu_backup": True},
             "incompatible with --lora-base-cpu-backup",
@@ -1077,7 +1079,7 @@ def _megatron_default_args(**overrides):
         vocab_size=0, padded_vocab_size=None, tokenizer_model="tok", tokenizer_type="HuggingFaceTokenizer",
         hf_checkpoint="/models/x", spec=None,
         true_on_policy_mode=False, debug_disable_optimizer=False, multi_lora_n_adapters=0,
-        full_parameter_lora_hybrid=False, dsa_impl=None, cp_comm_type=None,
+        full_parameter_lora_hybrid=False, rematerialize_param_from_master_weight=False, stream_optimizer_state_to_disk=False, dsa_impl=None, cp_comm_type=None,
     )
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -1153,7 +1155,7 @@ def _distopt_actor(monkeypatch, *, mode: str):
         shard_float16_groups=[bf16_views or [first.detach().view(-1), second.detach().view(-1)]],
     )
     actor = SimpleNamespace(
-        args=SimpleNamespace(full_parameter_lora_hybrid=False, lora_rank=0, lora_adapter_path=None, num_steps_per_rollout=1, backend=_backend(global_batch_size=1)),
+        args=SimpleNamespace(full_parameter_lora_hybrid=False, rematerialize_param_from_master_weight=False, stream_optimizer_state_to_disk=False, lora_rank=0, lora_adapter_path=None, num_steps_per_rollout=1, backend=_backend(global_batch_size=1)),
         optimizer=wrapper,
         opt_param_scheduler=SimpleNamespace(num_steps=0),
         weights_backuper=SimpleNamespace(backup=lambda role: None, backup_tensors=lambda tag, ids: 0),

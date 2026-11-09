@@ -1011,8 +1011,13 @@ async def apply_chunked_cut(
     max_commit_attempts: int = 3,
     skip_resident_fragments: bool = False,
     verified_fragments: Mapping[int, str] | None = None,
+    weight_version: int | None = None,
 ) -> int:
     """Prepare, idempotently converge, then finalize every owner rank.
+
+    ``weight_version``: the published weight version (model companion) every
+    rank stamps in its finalize, so all islands publish the merged policy
+    under the same monotone number; None leaves the companion alone.
 
     ``skip_resident_fragments``: ``cut`` is the last exported or committed
     cut with some fragments replaced; each rank reads and copies only the
@@ -1057,7 +1062,14 @@ async def apply_chunked_cut(
     commit_results = await _converge(group, "commit_prepared_full_parameter_shard", token, max_commit_attempts, phase="commit")
     if commit_results != prepare_results:
         raise FullParameterCommitInDoubtError(token, "count-reconciliation")
-    finalize_results = await _converge(group, "finalize_full_parameter_commit", token, max_commit_attempts, phase="finalize")
+    finalize_results = await _converge(
+        group,
+        "finalize_full_parameter_commit",
+        token,
+        max_commit_attempts,
+        phase="finalize",
+        **({} if weight_version is None else {"weight_version": weight_version}),
+    )
     if finalize_results != commit_results:
         raise FullParameterCommitInDoubtError(token, "final-count-reconciliation")
     return sum(finalize_results)
@@ -1104,7 +1116,7 @@ async def _abort_after_failed_prepare(
     raise RuntimeError("Megatron rank rejected full-parameter prepare") from prepare_failure
 
 
-async def _converge(group, operation: str, token: str, attempts: int, *, phase: str) -> list[object]:
+async def _converge(group, operation: str, token: str, attempts: int, *, phase: str, **kwargs) -> list[object]:
     """Retry an idempotent commit phase until every rank succeeds.
 
     Never abort after commit begins: a successful rank may already expose the
@@ -1112,7 +1124,7 @@ async def _converge(group, operation: str, token: str, attempts: int, *, phase: 
     """
 
     for _attempt in range(attempts):
-        results = await _rank_call(group, operation, commit_token=token)
+        results = await _rank_call(group, operation, commit_token=token, **kwargs)
         if _first_failure(results, expected_positive=True) is None:
             return results
     raise FullParameterCommitInDoubtError(token, phase)

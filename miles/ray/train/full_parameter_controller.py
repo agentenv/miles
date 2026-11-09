@@ -72,8 +72,12 @@ class FullParameterTransportMixin:
         max_commit_attempts: int = 3,
         skip_resident_fragments: bool = False,
         verified_fragments: dict[int, str] | None = None,
+        weight_version: int | None = None,
     ) -> int:
-        """Prepare, idempotently converge, then finalize every rank."""
+        """Prepare, idempotently converge, then finalize every rank.
+
+        ``weight_version``: published weight version (model companion) stamped
+        on every rank in the finalize; None leaves it unchanged."""
         return await full_parameter_transport.apply_chunked_cut(
             self,
             cut,
@@ -81,6 +85,7 @@ class FullParameterTransportMixin:
             max_commit_attempts=max_commit_attempts,
             skip_resident_fragments=skip_resident_fragments,
             verified_fragments=verified_fragments,
+            weight_version=weight_version,
         )
 
     async def record_full_parameter_local_step(

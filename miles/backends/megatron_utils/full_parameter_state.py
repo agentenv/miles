@@ -162,10 +162,15 @@ class FullParameterLocalStepReceipt:
     optimizer_steps: int
     scheduler_start_steps: int
     scheduler_end_steps: int
+    # The published weight version (model companion) after this step; None when
+    # the model has no companion (bare test actors).
+    weight_version: int | None = None
 
     def __post_init__(self) -> None:
         if not _ROLE.fullmatch(self.role):
             raise ValueError(f"invalid full-parameter role: {self.role!r}")
+        if self.weight_version is not None:
+            _validate_non_negative_integer(self.weight_version, "weight version")
         for name in (
             "base_policy_version",
             "local_step_generation",
@@ -1505,6 +1510,15 @@ def require_full_parameter_actor(args, action: str) -> None:
 
     from miles.utils.lora.utils import full_parameter_lora_hybrid_enabled, is_lora_enabled
 
+    # A commit writes the masters and then the model parameters.  Under
+    # --rematerialize-param-from-master-weight the parameter buffer may be
+    # paused after a sleep, and --stream-optimizer-state-to-disk defers the
+    # main_param storage (0 bytes), which the master-range checks cannot see.
+    if args.rematerialize_param_from_master_weight:
+        raise RuntimeError(f"full-parameter DiLoCo cannot {action} with --rematerialize-param-from-master-weight")
+    if args.stream_optimizer_state_to_disk:
+        raise RuntimeError(f"full-parameter DiLoCo cannot {action} with --stream-optimizer-state-to-disk")
+
     hybrid = full_parameter_lora_hybrid_enabled(args)
     if not is_lora_enabled(args):
         if hybrid:
@@ -2359,6 +2373,7 @@ def record_full_parameter_local_step(
         optimizer_steps=optimizer_steps,
         scheduler_start_steps=start,
         scheduler_end_steps=end,
+        weight_version=model_weight_version(actor),
     )
     full_parameter_rank_state(actor).local_step_generation = generation
     full_parameter_rank_state(actor).last_local_rollout_id = rollout_id
@@ -3965,7 +3980,61 @@ def _assert_masters_resident(actor) -> None:
         check("full-parameter partial commit")
 
 
-def finalize_full_parameter_commit(actor, *, commit_token: str) -> int:
+def _model_companions(actor) -> list:
+    """The model companions of the actor's chunks ([] for a bare test actor)."""
+
+    from miles.backends.training_utils.model_companion import ModelCompanion
+
+    try:
+        chunks = actor.model
+    except AttributeError:
+        return []
+    if not isinstance(chunks, (list, tuple)):
+        return []  # a bare test actor; Megatron hands the actor a list of chunks
+    return [module for chunk in chunks for module in chunk.modules() if isinstance(module, ModelCompanion)]
+
+
+def model_weight_version(actor) -> int | None:
+    """The published weight version (model companion), None without a companion.
+
+    This is what the engines are told at a weight update; the transport's
+    own ``policy_version`` is the DiLoCo transaction number."""
+
+    companions = _model_companions(actor)
+    if not companions:
+        return None
+    versions = {int(companion.weight_version.item()) for companion in companions}
+    if len(versions) != 1:
+        raise RuntimeError(f"model companion weight versions diverged: {sorted(versions)}")
+    return versions.pop()
+
+
+@torch.no_grad()
+def set_model_weight_version(actor, version: int) -> int:
+    """Stamp the published weight version on every chunk's companion.
+
+    Monotone: refuses a version below the current one (re-stamping the current
+    one is a no-op).  The companion's backup is refreshed so a restore after
+    an offload cycle does not revive the previous version.  Returns the
+    version now installed."""
+
+    _validate_non_negative_integer(version, "weight version")
+    companions = _model_companions(actor)
+    if not companions:
+        raise RuntimeError("the model has no companion; cannot set its weight version")
+    current = model_weight_version(actor)
+    if version < current:
+        raise RuntimeError(f"weight version {version} is below the installed {current}")
+    if version == current:
+        return version
+    for companion in companions:
+        companion.weight_version.fill_(version)
+    if actor._enable_weight_backup is not False:
+        actor.weights_backuper.backup_tensors("actor", {id(companion.weight_version) for companion in companions})
+    return version
+
+
+def finalize_full_parameter_commit(actor, *, commit_token: str, weight_version: int | None = None) -> int:
     """Acknowledge a group-wide commit after every rank has converged."""
 
     token = _validate_commit_token(commit_token)
@@ -3975,6 +4044,8 @@ def finalize_full_parameter_commit(actor, *, commit_token: str) -> int:
         installed, _generation, _exported, _anchor = _require_full_parameter_tracking(actor)
         if installed != finalized.policy_version:
             raise RuntimeError("finalized full-parameter commit journal is stale")
+        if weight_version is not None:
+            set_model_weight_version(actor, weight_version)  # idempotent re-finalize
         return finalized.parameter_tensor_count
     if not isinstance(committed, _FullParameterCommitOutcome):
         raise RuntimeError("no committed full-parameter cut is pending finalization")
@@ -3983,6 +4054,10 @@ def finalize_full_parameter_commit(actor, *, commit_token: str) -> int:
     installed, generation, exported, _anchor = _require_full_parameter_tracking(actor)
     if installed != committed.policy_version or generation != 0 or exported != 0:
         raise RuntimeError("committed full-parameter journal disagrees with actor")
+    # The published version changes with the weights: stamp it in the same
+    # finalize so every island publishes the merged policy under one number.
+    if weight_version is not None:
+        set_model_weight_version(actor, weight_version)
     full_parameter_rank_state(actor).last_finalized_cut = committed
     full_parameter_rank_state(actor).committed_cut = None
     return committed.parameter_tensor_count
