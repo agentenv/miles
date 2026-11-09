@@ -79,6 +79,7 @@ from miles.utils.tracking_utils.tracking import init_tracking
 from miles.utils.types import RolloutBatch
 from miles.utils.workers.naming import compute_cell_id
 from miles.utils.workers.rpc.common.wire_types import Pickled
+from miles.utils.workers.worker_handle import ExternalFailureError
 
 from ...utils.profile_utils import TrainProfiler
 from ...utils.tensor_backper import TensorBackuper
@@ -1080,7 +1081,14 @@ class MegatronTrainRayActor(TrainRayActor):
             # Connection setup also allocates CUDA tensors (e.g. NCCL object
             # collectives). Do not reuse unmapped, offloaded allocator blocks.
             with torch_memory_saver.disable() if self.args.offload_train else nullcontext():
-                self.weight_updater.reconnect(info)
+                try:
+                    self.weight_updater.reconnect(info)
+                except ExternalFailureError:
+                    # Raised on every rank (the updater agrees on the outcome over gloo): the engines failed, this
+                    # actor is healthy and stays up for the next publication. Leave it as the normal path would.
+                    if process_groups_are_temporary:
+                        destroy_process_groups()
+                    raise
 
         if self.args.debug_skip_weight_update:
             if dist.get_rank() == 0:

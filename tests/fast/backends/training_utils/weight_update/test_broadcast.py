@@ -1,5 +1,6 @@
 import asyncio
 import threading
+import time
 from argparse import Namespace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -11,6 +12,7 @@ from miles.backends.training_utils.weight_update.protocols.broadcast import (
     UpdateWeightFromDistributed,
     connect_rollout_engines_from_distributed,
     disconnect_rollout_engines_from_distributed,
+    RolloutEngineJoinError,
     update_weights_from_distributed,
 )
 from miles.utils import async_utils
@@ -140,6 +142,159 @@ class TestConnectRolloutEnginesFromDistributed:
                 )
 
 
+class _DyingEngine:
+    """An engine whose join request fails after ``delay`` seconds (its process died)."""
+
+    def __init__(self, delay: float = 0.05) -> None:
+        self.delay = delay
+
+    async def init_weights_update_group(self, *args, **kwargs) -> None:
+        await asyncio.sleep(self.delay)
+        raise ConnectionError("engine process died")
+
+
+class _HangingEngine:
+    """An engine whose HTTP server is up but whose scheduler never answers the join request."""
+
+    async def init_weights_update_group(self, *args, **kwargs) -> None:
+        await asyncio.sleep(3600)
+
+
+class _RecordingEngine:
+    def __init__(self) -> None:
+        self.kwargs: dict | None = None
+
+    async def init_weights_update_group(self, *args, **kwargs) -> dict:
+        self.kwargs = kwargs
+        return {"success": True}
+
+
+def _rendezvous_waiting_for_a_dead_rank(blocked: threading.Event, released: threading.Event):
+    def join(**kwargs):
+        blocked.set()
+        released.wait(30)
+        return MagicMock(name="never")
+
+    return join
+
+
+class TestConnectDoesNotWaitForADeadEngine:
+    """An engine killed during a publish never joins; rank 0's rendezvous would wait for it until the pg
+    timeout (30 min default) with the inference controller lock held."""
+
+    def test_a_join_request_failure_aborts_the_connect_while_rank_zero_still_waits(self) -> None:
+        """The connect fails as soon as the dead engine's request fails, not when the rendezvous times out."""
+        blocked, released = threading.Event(), threading.Event()
+        with (
+            patch(f"{_BROADCAST_MODULE}.ray") as ray_mock,
+            patch(
+                f"{_BROADCAST_MODULE}.init_process_group",
+                side_effect=_rendezvous_waiting_for_a_dead_rank(blocked, released),
+            ),
+        ):
+            ray_mock._private.services.get_node_ip_address.return_value = "10.0.0.1"
+            started = time.monotonic()
+            with pytest.raises(RolloutEngineJoinError, match=r"engine 1 failed to join .*engine process died"):
+                connect_rollout_engines_from_distributed(
+                    "miles-pp_0", [_AcceptingEngine(), _DyingEngine()], engine_gpu_counts=[1, 1]
+                )
+            elapsed = time.monotonic() - started
+        released.set()
+        assert blocked.is_set(), "rank 0 had started its rendezvous"
+        assert elapsed < 5.0, f"the connect waited {elapsed:.1f}s for the rendezvous instead of failing fast"
+
+    def test_the_engine_request_timeout_bounds_a_join_that_never_answers(self) -> None:
+        """--update-weight-engine-request-timeout covers the join request like every other engine request."""
+        blocked, released = threading.Event(), threading.Event()
+        with (
+            patch(f"{_BROADCAST_MODULE}.ray") as ray_mock,
+            patch(
+                f"{_BROADCAST_MODULE}.init_process_group",
+                side_effect=_rendezvous_waiting_for_a_dead_rank(blocked, released),
+            ),
+        ):
+            ray_mock._private.services.get_node_ip_address.return_value = "10.0.0.1"
+            started = time.monotonic()
+            with pytest.raises(RolloutEngineJoinError, match="TimeoutError"):
+                connect_rollout_engines_from_distributed(
+                    "miles-pp_0", [_HangingEngine()], engine_gpu_counts=[1], request_timeout=0.2
+                )
+            elapsed = time.monotonic() - started
+        released.set()
+        assert elapsed < 5.0
+
+    def test_a_join_error_is_an_external_failure(self) -> None:
+        """The trainer cell must survive it: the fault lies with the engine, not with the trainer ranks."""
+        from miles.utils.workers.worker_handle import ExternalFailureError
+
+        assert issubclass(RolloutEngineJoinError, ExternalFailureError)
+        assert issubclass(RolloutEngineJoinError, RuntimeError)
+
+    def test_a_rendezvous_timeout_surfaces_as_the_connect_error(self) -> None:
+        """A trainer-side rendezvous failure is not reclassified as an engine failure."""
+        with (
+            patch(f"{_BROADCAST_MODULE}.ray") as ray_mock,
+            patch(f"{_BROADCAST_MODULE}.init_process_group", side_effect=TimeoutError("rendezvous timed out")),
+        ):
+            ray_mock._private.services.get_node_ip_address.return_value = "10.0.0.1"
+            with pytest.raises(TimeoutError, match="rendezvous timed out"):
+                connect_rollout_engines_from_distributed("miles-pp_0", [_AcceptingEngine()], engine_gpu_counts=[1])
+
+    def test_without_a_timeout_the_request_and_the_rendezvous_are_unchanged(self) -> None:
+        """No request timeout and torch's own pg timeout: the existing tests pin the exact kwargs."""
+        engine = _RecordingEngine()
+        with (
+            patch(f"{_BROADCAST_MODULE}.ray") as ray_mock,
+            patch(f"{_BROADCAST_MODULE}.init_process_group", return_value=MagicMock(name="g")) as init_pg,
+        ):
+            ray_mock._private.services.get_node_ip_address.return_value = "10.0.0.1"
+            connect_rollout_engines_from_distributed("miles-pp_0", [engine], engine_gpu_counts=[1])
+        assert "timeout" not in init_pg.call_args.kwargs
+        assert engine.kwargs == {"backend": "nccl"}
+
+
+class TestAnAbandonedRendezvousIsIsolated:
+    """The join thread left behind by a fail-fast abort blocks nothing and the next connect uses a fresh
+    port; the abandoned thread's late outcome changes nothing."""
+
+    def test_the_next_connect_proceeds_while_the_old_join_still_waits_and_its_late_result_is_ignored(self) -> None:
+        """A reconnect after an aborted one is not serialized behind the abandoned rendezvous."""
+        first_release = threading.Event()
+        joins: list[dict] = []
+        results: list = []
+
+        def join(**kwargs):
+            joins.append(kwargs)
+            if len(joins) == 1:  # the abandoned rendezvous: still waiting for the dead rank
+                first_release.wait(30)
+                results.append("late")
+                return MagicMock(name="late_group")
+            return MagicMock(name="fresh_group")
+
+        with (
+            patch(f"{_BROADCAST_MODULE}.ray") as ray_mock,
+            patch(f"{_BROADCAST_MODULE}.init_process_group", side_effect=join),
+        ):
+            ray_mock._private.services.get_node_ip_address.return_value = "10.0.0.1"
+            with pytest.raises(RolloutEngineJoinError, match="engine process died"):
+                connect_rollout_engines_from_distributed("miles-pp_0", [_DyingEngine()], engine_gpu_counts=[1])
+            started = time.monotonic()
+            group = connect_rollout_engines_from_distributed("miles-pp_0", [_RecordingEngine()], engine_gpu_counts=[1])
+            elapsed = time.monotonic() - started
+        assert group._mock_name == "fresh_group"
+        assert elapsed < 5.0, "the second connect waited on the abandoned rendezvous"
+        assert len(joins) == 2 and joins[0]["init_method"] != joins[1]["init_method"], "a fresh port per attempt"
+        assert results == [], "the abandoned join has not finished yet and nothing waited for it"
+        first_release.set()
+        deadline = time.monotonic() + 5
+        while not results and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert results == ["late"], "the abandoned thread finishes on its own"
+        assert all(
+            not t.is_alive() or t.daemon for t in threading.enumerate() if t.name.startswith("weight-update-join-")
+        ), "join threads are daemons: they never block exit"
+
+
 class TestUpdateWeightFromDistributedConnect:
     def test_the_protocol_forwards_discovered_gpu_counts_to_the_group_builder(self) -> None:
         """The protocol must not replace heterogeneous discovered counts with the uniform fallback."""
@@ -149,7 +304,9 @@ class TestUpdateWeightFromDistributedConnect:
             intra_dp_cp=SimpleNamespace(rank=0),
         )
         with patch(f"{_BROADCAST_MODULE}.get_parallel_state", return_value=initial_parallel_state):
-            protocol = UpdateWeightFromDistributed(Namespace(check_weight_update_equal=False))
+            protocol = UpdateWeightFromDistributed(
+                Namespace(check_weight_update_equal=False, update_weight_engine_request_timeout=300.0)
+            )
 
         engines = [MagicMock(name="prefill"), MagicMock(name="decode")]
         parallel_state = SimpleNamespace(pp=SimpleNamespace(rank=0))
@@ -172,7 +329,39 @@ class TestUpdateWeightFromDistributedConnect:
             "miles-pp_0",
             engines,
             engine_gpu_counts=[2, 4],
+            request_timeout=300.0,
         )
+
+    def test_a_failed_connect_leaves_no_old_group_to_destroy_twice(self) -> None:
+        """The old group is destroyed before the connect; a failed connect must not leave its handle behind."""
+        parallel_state = SimpleNamespace(
+            pp=SimpleNamespace(size=1, rank=0), tp=SimpleNamespace(rank=0), intra_dp_cp=SimpleNamespace(rank=0)
+        )
+        with patch(f"{_BROADCAST_MODULE}.get_parallel_state", return_value=parallel_state):
+            protocol = UpdateWeightFromDistributed(
+                Namespace(check_weight_update_equal=False, update_weight_engine_request_timeout=300.0)
+            )
+        protocol._model_update_groups = MagicMock(name="old_group")
+        with (
+            patch(f"{_BROADCAST_MODULE}.get_data_replica_rank_and_size", return_value=(0, 1)),
+            patch(f"{_BROADCAST_MODULE}.disconnect_rollout_engines_from_distributed"),
+            patch(
+                f"{_BROADCAST_MODULE}.connect_rollout_engines_from_distributed",
+                side_effect=RolloutEngineJoinError("engine 0 failed to join"),
+            ),
+            pytest.raises(RolloutEngineJoinError),
+        ):
+            protocol.connect(
+                [MagicMock()],
+                engine_gpu_counts=[1],
+                engine_gpu_offsets=[0],
+                engine_cell_ids=["cell-0"],
+                parallel_state=SimpleNamespace(pp=SimpleNamespace(rank=0)),
+                placement=SimpleNamespace(gather_pp=False),
+                selector="all",
+            )
+
+        assert protocol._model_update_groups is None
 
 
 class TestDisconnectRolloutEnginesFromDistributed:

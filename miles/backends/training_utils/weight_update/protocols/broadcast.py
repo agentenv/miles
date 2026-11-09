@@ -1,7 +1,9 @@
+import asyncio
 import socket
+import threading
 from argparse import Namespace
 from collections.abc import Sequence
-from concurrent.futures import Future
+from concurrent.futures import FIRST_COMPLETED, Future, wait
 from contextlib import AbstractContextManager, nullcontext
 
 import ray
@@ -17,6 +19,7 @@ from miles.backends.training_utils.weight_update.rollout_cell_updater import cre
 from miles.utils import async_utils
 from miles.utils.distributed_lock import create_world_ticket_lock
 from miles.utils.distributed_utils import init_process_group
+from miles.utils.workers.worker_handle import ExternalFailureError
 
 
 class UpdateWeightFromDistributed(WeightTransferProtocol):
@@ -69,8 +72,13 @@ class UpdateWeightFromDistributed(WeightTransferProtocol):
             disconnect_rollout_engines_from_distributed(
                 self.group_name, self._model_update_groups, self.rollout_engines
             )
+            # The old group is gone even if the connect below fails: a later reconnect must not destroy it twice.
+            self._model_update_groups = None
             self._model_update_groups = connect_rollout_engines_from_distributed(
-                self.group_name, rollout_engines, engine_gpu_counts=engine_gpu_counts
+                self.group_name,
+                rollout_engines,
+                engine_gpu_counts=engine_gpu_counts,
+                request_timeout=self.args.update_weight_engine_request_timeout,
             )
 
     def send_bucket(self, bucket: list[tuple[str, torch.Tensor]]) -> None:
@@ -88,10 +96,16 @@ class UpdateWeightFromDistributed(WeightTransferProtocol):
             bucket.clear()
 
 
+class RolloutEngineJoinError(ExternalFailureError, RuntimeError):
+    """A rollout engine failed to join the weight update group; the trainer ranks are healthy."""
+
+
 def connect_rollout_engines_from_distributed(
     group_name: str,
     rollout_engines: Sequence[SGLangApiClient],
     engine_gpu_counts: Sequence[int] | None = None,
+    *,
+    request_timeout: float | None = None,
 ) -> dist.ProcessGroup:
     """
     Create NCCL group: training rank 0 + all engine GPUs. Blocks until joined.
@@ -99,6 +113,10 @@ def connect_rollout_engines_from_distributed(
     ``engine_gpu_counts`` gives the number of GPUs per engine.  When engines
     have heterogeneous TP sizes (e.g. prefill TP=2, decode TP=4), each engine
     occupies a different number of ranks in the NCCL group.
+
+    ``request_timeout`` (``--update-weight-engine-request-timeout``) bounds each engine's join request.
+    An engine whose join request fails or times out aborts the connect with ``RolloutEngineJoinError``
+    instead of leaving rank 0 in the rendezvous until the process-group timeout.
     """
     assert engine_gpu_counts is not None and len(engine_gpu_counts) == len(rollout_engines)
     master_address = ray._private.services.get_node_ip_address()
@@ -110,26 +128,54 @@ def connect_rollout_engines_from_distributed(
     futures = []
     rank_cursor = 1
     for i, api_client in enumerate(rollout_engines):
+        request = api_client.init_weights_update_group(
+            master_address,
+            master_port,
+            rank_cursor,
+            world_size,
+            group_name,
+            backend="nccl",
+        )
         futures.append(
-            async_utils.submit(
-                api_client.init_weights_update_group(
-                    master_address,
-                    master_port,
-                    rank_cursor,
-                    world_size,
-                    group_name,
-                    backend="nccl",
-                )
-            )
+            async_utils.submit(request if request_timeout is None else asyncio.wait_for(request, request_timeout))
         )
         rank_cursor += engine_gpu_counts[i]
-    model_update_groups = init_process_group(
-        backend="nccl",
-        init_method=f"tcp://{master_address}:{master_port}",
-        world_size=world_size,
-        rank=0,
-        group_name=group_name,
-    )
+
+    # Rank 0 joins in a thread so the engines' join requests can be watched meanwhile: a rendezvous waits for
+    # every rank, so an engine that dies (or refuses) before joining would otherwise block this call for the
+    # whole pg timeout (default 30 min) with the caller's locks held. An engine failure aborts the connect at
+    # once; the join thread is left to time out on its own (its port is private to this attempt).
+    join: Future = Future()
+
+    def _join() -> None:
+        try:
+            join.set_result(
+                init_process_group(
+                    backend="nccl",
+                    init_method=f"tcp://{master_address}:{master_port}",
+                    world_size=world_size,
+                    rank=0,
+                    group_name=group_name,
+                )
+            )
+        except BaseException as e:  # noqa: BLE001 - delivered to the waiting caller
+            join.set_exception(e)
+
+    threading.Thread(target=_join, name=f"weight-update-join-{group_name}", daemon=True).start()
+    pending = set(futures)
+    while not join.done():
+        done, _ = wait({join, *pending}, return_when=FIRST_COMPLETED)
+        for future in done:
+            if future is join:
+                continue
+            pending.discard(future)
+            if (error := future.exception()) is not None:
+                index = futures.index(future)
+                raise RolloutEngineJoinError(
+                    f"engine {index} failed to join weight update group {group_name} while rank 0 waited for "
+                    f"the rendezvous; connect aborted instead of waiting for the group timeout ({error!r})"
+                ) from error
+    model_update_groups = join.result()
     async_utils.wait_futures(futures)
     return model_update_groups
 

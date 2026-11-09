@@ -6,7 +6,7 @@ from contextlib import nullcontext
 from functools import partial
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 import torch
@@ -393,3 +393,55 @@ class TestUpdateWeightsFaultHookContext:
         reach_fault_hook(FaultHookName.TRAINER_WEIGHT_UPDATE_BEFORE_ALL_GATHER)
 
         assert log == []
+
+
+class TestUpdateWeightsWhenAnEngineFailsToJoin:
+    """The engines failed, not the trainer. The actor must raise the engine-side error as is (so the cell keeps
+    it alive) and leave its temporary process groups as the normal path would."""
+
+    @staticmethod
+    def _make_actor(actor_module: ModuleType, monkeypatch: pytest.MonkeyPatch, *, offload_train: bool, asleep: bool):
+        from miles.backends.training_utils.weight_update.protocols.broadcast import RolloutEngineJoinError
+
+        updater = _FakeWeightUpdater()
+        updater.conn_status = Mock()
+        updater.conn_status.needs_reconnect.return_value = True
+        updater.reconnect = Mock(side_effect=RolloutEngineJoinError("engine 0 failed to join"))
+        actor = _make_updating_actor(actor_module, monkeypatch, updater)
+        actor.args.offload_train = offload_train
+        actor._asleep = asleep
+        return actor, updater
+
+    def test_the_engine_failure_propagates_and_nothing_is_sent(
+        self, actor_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A failed connect must not fall through to a send over a group that does not exist."""
+        from miles.utils.workers.worker_handle import ExternalFailureError
+
+        actor, updater = self._make_actor(actor_module, monkeypatch, offload_train=False, asleep=False)
+        destroy = Mock()
+        monkeypatch.setattr(actor_module, "destroy_process_groups", destroy)
+
+        with pytest.raises(ExternalFailureError, match="engine 0 failed to join"):
+            _update(actor, rollout_id=3)
+
+        assert updater.weight_versions == []
+        destroy.assert_not_called()
+
+    def test_temporary_process_groups_are_destroyed_again_on_the_failure_path(
+        self, actor_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An offloaded actor reloads its groups for the update and must drop them again when it fails."""
+        from miles.utils.workers.worker_handle import ExternalFailureError
+
+        actor, _ = self._make_actor(actor_module, monkeypatch, offload_train=True, asleep=True)
+        monkeypatch.setattr(actor_module, "torch_memory_saver", MagicMock())
+        reload, destroy = Mock(), Mock()
+        monkeypatch.setattr(actor_module, "reload_process_groups", reload)
+        monkeypatch.setattr(actor_module, "destroy_process_groups", destroy)
+
+        with pytest.raises(ExternalFailureError):
+            _update(actor, rollout_id=3)
+
+        reload.assert_called_once()
+        destroy.assert_called_once()

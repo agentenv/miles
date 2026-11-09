@@ -46,6 +46,7 @@ from miles.utils.test_utils.fault_injector.models import FaultHookName, FaultHoo
 from miles.utils.tracking_utils.structured_log import log_structured
 from miles.utils.workers.cell_operations.base import BaseCellOperations
 from miles.utils.workers.types import DeploymentIdentity
+from miles.utils.workers.worker_handle import ExternalFailureError
 from miles.utils.workers.worker_provider.base import BaseWorkerProvider, CellInfo, StopWatchFn
 from miles.utils.workers.worker_provider.utils import apply_cell_observation
 
@@ -469,17 +470,22 @@ class TrainerController(FullParameterTransportMixin):
     async def _update_weights_on_first_alive_cell(
         self, info: UpdatableEngines, *, debug_weight_update_id: str, rollout_id: int | None
     ) -> WeightUpdateOutput:
-        # Catch with vanilla retry: cells w/ exceptions are auto marked errored, thus retry will find the next one
-        outputs = await retry(
-            lambda _: self._execute_first_alive(
-                "update_weights",
-                timeout=self.args.update_weights_timeout,
-                info=info,
-                debug_weight_update_id=debug_weight_update_id,
-                rollout_id=rollout_id,
-            ),
-            max_attempts=_RETRY_MAX_ATTEMPTS,
-        )
+        # Catch with vanilla retry: cells w/ exceptions are auto marked errored, thus retry will find the next one.
+        # An ExternalFailureError (a rollout engine failed, the cell is fine) is not retried: the same engines
+        # would fail again, and the caller decides what to do with them.
+        async def _attempt(_: int) -> list[WeightUpdateOutput]:
+            try:
+                return await self._execute_first_alive(
+                    "update_weights",
+                    timeout=self.args.update_weights_timeout,
+                    info=info,
+                    debug_weight_update_id=debug_weight_update_id,
+                    rollout_id=rollout_id,
+                )
+            except ExternalFailureError as e:
+                raise NonRetryableError(f"update_weights failed on the rollout engine side: {e}") from e
+
+        outputs = await retry(_attempt, max_attempts=_RETRY_MAX_ATTEMPTS)
         return _unique(outputs)
 
     async def _update_weights_on_every_alive_cell(
