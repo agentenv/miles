@@ -22,6 +22,7 @@ from miles.ray.rollout.cell_state import (
 )
 from miles.ray.rollout.engine_env_reporter import EngineEnvReporter
 from miles.ray.rollout.serving_registry import ServingRegistry, SGLangServingRegistry
+from miles.router.backend import RouterKind, make_router_backend
 from miles.utils.ft_utils.api_server.models import CellCondition, CellStatus, TriState
 from miles.utils.ft_utils.health_checker import (
     ActiveAndEpoch,
@@ -41,6 +42,14 @@ SHUTDOWN_TIMEOUT = 30
 UNREGISTER_FROM_ROUTER_TIMEOUT = 120
 INITIALIZING_TIMEOUT_SECONDS = 1800.0
 ABORT_REQUEST_TIMEOUT_SECONDS = 30.0
+
+
+class CordonUnsupportedError(RuntimeError):
+    pass
+
+
+class CellNotServingError(RuntimeError):
+    pass
 
 
 class ServerCellMetadata(FrozenStrictBaseModel):
@@ -230,17 +239,48 @@ class ServerCell:
         if serve_without_weight_update:
             self._mark_serving()
 
-    async def mark_weights_ready(self) -> None:
+    async def mark_weights_ready(self, *, cordoned: bool = False) -> None:
+        """Register with the router and become Serving; ``cordoned`` registers it unselectable until uncordoned."""
         assert isinstance(self._state, StatePendingWeights), f"{self._state=}"
-        await self._register_with_router(addr_info=self._state.addr_info)
+        if cordoned:
+            self._assert_router_cordons()
+        await self._register_with_router(addr_info=self._state.addr_info, cordoned=cordoned)
         self._mark_serving()
 
-    async def _register_with_router(self, addr_info: CellAddrInfo) -> None:
+    async def _register_with_router(self, addr_info: CellAddrInfo, *, cordoned: bool = False) -> None:
         await self._registry.register(
             worker_url=addr_info.server_url,
             worker_type=self.meta.worker_type,
             bootstrap_port=addr_info.bootstrap_port,
+            **({"cordoned": True} if cordoned else {}),
         )
+
+    # -------------------------- cordon / drain (routers with RouterFeatures.cordon) -----------------------------
+
+    async def cordon(self) -> None:
+        """Stop the router from selecting this cell for new requests; it stays registered and keeps serving."""
+        self._assert_cordonable()
+        await self.router_api_client.cordon_worker(worker_url=self.server_url)
+
+    async def uncordon(self) -> None:
+        self._assert_cordonable()
+        await self.router_api_client.uncordon_worker(worker_url=self.server_url)
+
+    async def get_inflight(self) -> int:
+        """Requests the router proxied to this cell and has not seen finish."""
+        self._assert_cordonable()
+        return (await self.router_api_client.get_worker_inflight()).get(self.server_url, 0)
+
+    def _assert_cordonable(self) -> None:
+        self._assert_router_cordons()
+        if not isinstance(self._state, StateServing):
+            raise CellNotServingError(
+                f"cell {self.meta.cell_id} is not serving, so it is not registered with the router ({self._state=})"
+            )
+
+    def _assert_router_cordons(self) -> None:
+        if not make_router_backend(self.args).features.cordon:
+            raise CordonUnsupportedError(f"cordon and in-flight counts need --router {RouterKind.MILES.value}")
 
     @property
     def _registry(self) -> ServingRegistry:
