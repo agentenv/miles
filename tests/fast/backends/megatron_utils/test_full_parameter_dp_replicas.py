@@ -129,7 +129,7 @@ class _Rank:
                 },
             )
         )
-        self.args = SimpleNamespace(
+        self.args = SimpleNamespace(full_parameter_lora_hybrid=False, 
             lora_rank=0, lora_adapter_path=None, num_steps_per_rollout=1, global_batch_size=1, start_rollout_id=None
         )
         self.opt_param_scheduler = SimpleNamespace(num_steps=0)

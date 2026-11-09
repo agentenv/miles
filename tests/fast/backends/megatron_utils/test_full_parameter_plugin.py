@@ -7,7 +7,7 @@ from miles.backends.megatron_utils import full_parameter_state as state
 
 
 def _actor():
-    return SimpleNamespace(role="critic", args=SimpleNamespace(start_rollout_id=None))
+    return SimpleNamespace(role="critic", args=SimpleNamespace(full_parameter_lora_hybrid=False, start_rollout_id=None))
 
 
 def _patch(monkeypatch, *, topology="t0", calls=None):
