@@ -150,3 +150,18 @@ def test_load_slot_layout_installs_the_active_layout_and_checks_ep(tmp_path):
         load_slot_layout(path, num_experts=E, ep_size=8)
     with pytest.raises(AssertionError, match="experts"):
         load_slot_layout(path, num_experts=E * 2, ep_size=4)
+
+
+def test_each_layer_has_its_own_trainable_set_and_tables():
+    """92 layers x 128 experts: the selection is per layer; nothing is shared between layers."""
+    layout = SlotLayout.from_selection(make_selection(num_experts=E, num_trainable=K, ep_size=4, layers=[1, 2, 3], seed=7))
+    sets = {layer: {e for r in range(4) for e in layout.trainable_original_ids(layer, r)} for layer in (1, 2, 3)}
+    assert all(len(s) == K for s in sets.values())
+    assert sets[1] != sets[2] and sets[2] != sets[3]
+    ids = torch.arange(E).view(1, E)
+    for layer in (1, 2, 3):
+        slots = layout.original_to_slot_ids(layer, ids)
+        assert torch.equal(layout.perm[layer][slots[0]], ids[0])  # this layer's own inverse
+        # a trainable id of layer 1 only lands in a trainable slot of layer 1 if layer 1 trains it
+        for e in sets[1]:
+            assert layout.is_trainable_slot(int(layout.inv[layer][e])) == (e in sets[layer])
