@@ -29,6 +29,61 @@ class YetoAlgoConfig(BaseConfig):
     gmpo_log_clip_low: A[float, Arg(help="GMPO log-space clip: lower bound is -value")] = 0.4
     gmpo_log_clip_high: A[float, Arg(help="GMPO log-space clip: upper bound is +value")] = 0.4
 
+    gae_variant: A[
+        str,
+        Arg(
+            choices=["vanilla", "length_adaptive", "decoupled", "cross_segment_whole_rollout", "cross_segment_per_sample"],
+            help=(
+                "PPO GAE variant. cross_segment_per_sample (CompactionRL, one sample per compaction segment) runs "
+                "local GAE per sample and multiplies the advantage by (gamma*lambda)^tokens_after from "
+                "sample.metadata['tokens_after'] (optional metadata 'gae_length' sets l for length-adaptive lambda). "
+                "cross_segment_whole_rollout is an explicit CONTROL mode (one sample per rollout with per-token "
+                "sample.metadata['segment_ids']; earlier segments get no terminal reward, which differs from "
+                "CompactionRL eq. 15). The ambiguous value cross_segment is rejected."
+            ),
+        ),
+    ] = "vanilla"
+    gae_lambd_mode: A[
+        str,
+        Arg(
+            choices=["fixed", "length_adaptive"],
+            help="Policy lambda: fixed (--lambd) or length_adaptive (1 - 1/(alpha * response_len)).",
+        ),
+    ] = "fixed"
+    gae_length_alpha: A[float, Arg(help="alpha for length-adaptive lambda")] = 1.5
+    gae_critic_lambd: A[float, Arg(help="critic-target lambda for --gae-variant decoupled")] = 1.0
+    positive_example_lm_loss_coef: A[
+        float,
+        Arg(
+            help=(
+                "VAPO positive-example LM loss weight mu (paper eq. 9-10): adds mu * NLL over the response tokens "
+                "of positive samples, normalized by the global (all micro-batches and DP ranks of the optimizer "
+                "step) count of positive-sample tokens (0 disables)."
+            )
+        ),
+    ] = 0.0
+    positive_example_source: A[
+        str,
+        Arg(
+            choices=["success", "reward"],
+            help=(
+                "How a sample is judged positive. success (default): the explicit boolean "
+                "sample.metadata['success'] (or 'is_correct') set by the reward function; a missing field is an "
+                "error. reward: reward > --positive-example-reward-threshold; only valid when the reward is a "
+                "binary success signal (a positive reward always means complete success)."
+            ),
+        ),
+    ] = "success"
+    positive_example_reward_threshold: A[
+        float | None,
+        Arg(
+            help=(
+                "With --positive-example-source reward: a sample is positive when reward > this (default 0.0). "
+                "Rejected with --positive-example-source success."
+            )
+        ),
+    ] = None
+
 
 _DEFAULTS = {name: field.default for name, field in YetoAlgoConfig.model_fields.items()}
 

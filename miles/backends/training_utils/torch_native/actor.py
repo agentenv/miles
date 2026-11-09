@@ -60,6 +60,7 @@ TRAIN_KEYS = FORWARD_ONLY_KEYS + [
     "returns",
     "ref_log_probs",
     "rollout_log_probs",
+    "positive_example_lm_weights",
     *ROLLOUT_TOPK_KEYS,
 ]
 SAMPLING_MASK_KEYS = ["rollout_sampling_mask_ids", "rollout_sampling_mask_offsets"]
