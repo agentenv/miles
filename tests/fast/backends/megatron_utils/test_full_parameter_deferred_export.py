@@ -167,7 +167,7 @@ def test_prepare_refuses_a_deferred_fragment_the_masters_no_longer_hold(monkeypa
     deferred = _export(actor, ray, defer=True)
     target = _deferred_rows_target(deferred, ray, 1, {0: [1.0, 2.0]})
     forget_full_parameter_resident_fragments(actor)
-    with pytest.raises(RuntimeError, match=r"deferred full-parameter fragments \[1, 2\] are not held"):
+    with pytest.raises(RuntimeError, match=r"deferred or lazy full-parameter fragments \[1, 2\] are not held"):
         prepare_full_parameter_chunked_shard(actor, target, commit_token="t", ray_module=ray, skip_resident=True)
 
 
