@@ -55,6 +55,7 @@ from miles.utils.types import SampleLineage
 
 from ...utils.misc import filter_keys
 from ..training_utils.parallel import get_parallel_state
+from . import hybrid_optimizer_pinning
 from .checkpoint import load_checkpoint, save_checkpoint
 from .ci_utils import (
     check_model_hashes,
@@ -192,6 +193,9 @@ def setup_model_and_optimizer(
         return model, None, None
 
     # Optimizer
+    if args.backend.optimizer_cpu_offload:
+        # HybridDeviceOptimizer: step the CPU FP32 masters in pinned memory.
+        hybrid_optimizer_pinning.install()
     kwargs = {}
     for f in dataclasses.fields(OptimizerConfig):
         if hasattr(args.backend, f.name):  # config-access-exempt: attribute selected at runtime from f.name
