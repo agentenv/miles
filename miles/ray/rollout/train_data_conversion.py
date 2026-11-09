@@ -28,6 +28,7 @@ ROLLOUT_DATA_TENSOR_DTYPES = {
     "tokens": "int32",
     "target_tokens": "int32",
     "loss_masks": "int32",
+    "segment_ids": "int32",
     "rollout_log_probs": "float32",
     "rollout_topk_token_ids": "int32",
     "rollout_topk_lengths": "int32",
@@ -48,6 +49,9 @@ ROLLOUT_DATA_VALUE_SPEC: dict[str, ValueSpec] = {
     "rewards": ValueSpec(codec="ndarray", dtype="float32"),
     "truncated": ValueSpec(codec="ndarray", dtype="int64"),
     "round_number": ValueSpec(codec="ndarray", dtype="int64"),
+    "tokens_after": ValueSpec(codec="ndarray", dtype="int64"),
+    "gae_length": ValueSpec(codec="ndarray", dtype="int64"),
+    "positive_example_success": ValueSpec(codec="ndarray", dtype="int64"),
     "sample_indices": ValueSpec(codec="ndarray", dtype="int64"),
     "lineage_source_sample_indices": ValueSpec(codec="ndarray", dtype="int64"),
     "lineage_output_indices": ValueSpec(codec="ndarray", dtype="int64"),
@@ -122,6 +126,33 @@ def convert_samples_to_train_data(
     }
 
     train_data["loss_masks"] = loss_masks
+
+    # CompactionRL per-token segment ids (cross-segment GAE); only emitted when a sample provides them.
+    if any(s.metadata and "segment_ids" in s.metadata for s in samples):
+        segment_ids = []
+        for sample in samples:
+            seg = (sample.metadata or {}).get("segment_ids")
+            if seg is None:
+                seg = [0] * sample.response_length
+            assert len(seg) == sample.response_length, (
+                f"segment_ids length {len(seg)} != response length {sample.response_length}"
+            )
+            segment_ids.append(list(seg))
+        train_data["segment_ids"] = segment_ids
+
+    # CompactionRL one-sample-per-segment layout (--gae-variant cross_segment_per_sample):
+    # tokens_after = N_{>s}; gae_length = optional length l for length-adaptive lambda.
+    if any(s.metadata and "tokens_after" in s.metadata for s in samples):
+        train_data["tokens_after"] = [int((s.metadata or {}).get("tokens_after", 0)) for s in samples]
+    if any(s.metadata and "gae_length" in s.metadata for s in samples):
+        train_data["gae_length"] = [
+            int((s.metadata or {}).get("gae_length") or s.response_length) for s in samples
+        ]
+
+    # VAPO positive-example LM loss: explicit success judgement from the reward function
+    # (sample.metadata['success'] / 'is_correct'); 1 / 0, -1 = missing (error at use).
+    if any(s.metadata and (SUCCESS_KEYS[0] in s.metadata or SUCCESS_KEYS[1] in s.metadata) for s in samples):
+        train_data["positive_example_success"] = [sample_success_flag(s.metadata) for s in samples]
 
     train_data["rollout_mask_sums"] = _compute_rollout_mask_sums(train_data["rollout_ids"], loss_masks)
 
@@ -308,6 +339,27 @@ def _get_training_sample_identity_columns(samples: list[Sample]) -> dict[str, li
         "lineage_output_indices": [x.output_index if (x := sample.lineage) is not None else 0 for sample in samples],
         "lineage_output_counts": [x.output_count if (x := sample.lineage) is not None else 1 for sample in samples],
     }
+SUCCESS_KEYS = ("success", "is_correct")
+
+
+def sample_success_flag(metadata: dict | None) -> int:
+    """1 / 0 from the boolean metadata success field; -1 when absent. Non-boolean values are rejected."""
+    metadata = metadata or {}
+    found = []
+    for key in SUCCESS_KEYS:
+        if key in metadata and metadata[key] is not None:
+            value = metadata[key]
+            if isinstance(value, bool):
+                found.append(int(value))
+            elif isinstance(value, int) and value in (0, 1):
+                found.append(int(value))
+            else:
+                raise ValueError(f"sample.metadata[{key!r}] must be a boolean success flag, got {value!r}")
+    if not found:
+        return -1
+    if len(set(found)) != 1:
+        raise ValueError(f"sample.metadata success/is_correct disagree: {found}")
+    return found[0]
 
 
 def _compute_rollout_mask_sums(rollout_ids: list[int], loss_masks: list[list[int]]) -> list[int]:
@@ -508,6 +560,10 @@ def _package_shards(args, data: dict[str, Any], partitions) -> list[dict[str, An
             "rewards",
             "truncated",
             "loss_masks",
+            "segment_ids",
+            "tokens_after",
+            "gae_length",
+            "positive_example_success",
             "round_number",
             "sample_indices",
             "lineage_source_sample_indices",

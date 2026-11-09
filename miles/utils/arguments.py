@@ -1942,6 +1942,7 @@ def miles_validate_args(args):
         validate_skip_actor_forward_only(args)
 
     validate_policy_loss_variant_args(args)
+    validate_positive_example_args(args)
 
     validate_score_centering_args(args)
 
@@ -1973,6 +1974,22 @@ def validate_policy_loss_variant_args(args) -> None:
     for name in names.get(variant, ()):
         value = vars(args)[name]
         assert math.isfinite(value) and value > 0, f"--{name.replace('_', '-')} must be finite and > 0, got {value}"
+
+
+def validate_positive_example_args(args: argparse.Namespace) -> None:
+    """VAPO positive-example LM loss: the positive judgement must be explicit (success field) unless the
+    reward is declared to be a binary success signal (--positive-example-source reward)."""
+    source = args.positive_example_source
+    threshold = args.positive_example_reward_threshold
+    if source not in ("success", "reward"):
+        raise ValueError(f"--positive-example-source must be success or reward, got {source!r}")
+    if source == "success" and threshold is not None:
+        raise ValueError(
+            "--positive-example-reward-threshold is only valid with --positive-example-source reward "
+            "(declares that a reward above the threshold always means complete success)"
+        )
+    if args.positive_example_lm_loss_coef < 0:
+        raise ValueError("--positive-example-lm-loss-coef must be >= 0")
 
 
 def validate_skip_actor_forward_only(args) -> None:

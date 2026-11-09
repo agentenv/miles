@@ -11,7 +11,28 @@ from miles.backends.training_utils.loss.hub.math_utils import (
     get_reinforce_plus_plus_returns,
 )
 from miles.backends.training_utils.parallel import get_parallel_state
+from miles.utils.args.configs.yeto_algo import yeto_algo_option
 from miles.utils.distributed_utils import distributed_masked_whiten
+
+
+def _gae_variant_kwargs(args: Namespace, segment_ids, tokens_after=None, gae_length=None) -> dict:
+    """Extra GAE-variant kwargs; empty (original call) when the variant is left at its defaults."""
+    variant = yeto_algo_option(args, "gae_variant")
+    mode = yeto_algo_option(args, "gae_lambd_mode")
+    if variant == "vanilla" and mode == "fixed":
+        return {}
+    return dict(
+        gae_variant=variant,
+        gae_lambd_mode=mode,
+        gae_length_alpha=yeto_algo_option(args, "gae_length_alpha"),
+        gae_critic_lambd=yeto_algo_option(args, "gae_critic_lambd"),
+        segment_ids_list=segment_ids,
+        **(
+            dict(tokens_after_list=tokens_after, gae_length_list=gae_length)
+            if variant == "cross_segment_per_sample"
+            else {}
+        ),
+    )
 
 
 def compute_advantages(
@@ -24,6 +45,9 @@ def compute_advantages(
     response_lengths: list[int],
     values: list[torch.Tensor] | None = None,
     max_seq_lens: list[int] | None = None,
+    segment_ids: list | None = None,
+    tokens_after: list | None = None,
+    gae_length: list | None = None,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
     """Dispatch to the configured advantage estimator.
 
@@ -75,6 +99,7 @@ def compute_advantages(
             loss_masks=loss_masks,
             gamma=args.gamma,
             lambd=args.lambd,
+            **_gae_variant_kwargs(args, segment_ids, tokens_after, gae_length),
         )
 
     elif args.advantage_estimator == "reinforce_plus_plus":

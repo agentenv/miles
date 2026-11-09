@@ -41,6 +41,7 @@ from miles.backends.training_utils.loss.hub.math_utils import (
     compute_ess_ratio_contribution,
 )
 from miles.backends.training_utils.parallel import get_parallel_state
+from miles.utils.args.configs.yeto_algo import yeto_algo_option
 from miles.utils.lora.utils import is_multi_lora_enabled
 from miles.utils.types import RolloutBatch
 
@@ -71,6 +72,9 @@ _UNSUPPORTED_FEATURES: dict[str, Callable[[Namespace], bool]] = {
     "--custom-pg-loss-reducer-function-path": lambda args: args.custom_pg_loss_reducer_function_path is not None,
     "--dump-details": lambda args: args.dump_details is not None,
     "multi-LoRA": is_multi_lora_enabled,
+    # fork-only options (configs/yeto_algo.py) read per-sample tensors
+    "--policy-loss-variant gmpo": lambda args: yeto_algo_option(args, "policy_loss_variant") == "gmpo",
+    "--positive-example-lm-loss-coef": lambda args: yeto_algo_option(args, "positive_example_lm_loss_coef") != 0,
 }
 
 # fn(chunk logits [n, V], targets [n], per-row side input [n, ...] or None) -> named per-row results
