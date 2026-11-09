@@ -96,6 +96,7 @@ def bridge_args(tmp_path: Path) -> Namespace:
         optimizer="adam",
         accumulate_allreduce_grads_in_fp32=True,
         dsa_kernel_backend="flash_mla",
+        calculate_per_token_loss=False,
     )
     return Namespace(
         backend=backend,
