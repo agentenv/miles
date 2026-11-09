@@ -43,11 +43,13 @@ from miles.utils.args.configs.tensorboard import TensorboardConfig
 from miles.utils.args.configs.tinker import TinkerConfig
 from miles.utils.args.configs.train import TrainConfig, TrainRolloutOnlyConfig
 from miles.utils.args.configs.wandb import WandbConfig, WandbRolloutOnlyConfig
+from miles.utils.args.configs.yeto_extension import YetoExtensionConfig
 from miles.utils.args.runtime_base import BaseLeafConfig
 
 
 class OrchestratorConfig(
     BaseLeafConfig,
+    YetoExtensionConfig,
     RawTrainerBackendConfig,
     TrainerBackendTraitConfig,
     OrchestratorOnlyConfig,
@@ -85,6 +87,7 @@ class OrchestratorConfig(
 
 class TrainerConfig(
     BaseLeafConfig,
+    YetoExtensionConfig,
     TrainerOnlyConfig,
     RunUuidConfig,
     ClusterConfig,
@@ -166,6 +169,7 @@ class TrainerConfig(
 
 class InferenceControllerConfig(
     BaseLeafConfig,
+    YetoExtensionConfig,
     TrainerBackendTraitConfig,
     InferenceControllerOnlyConfig,
     RunUuidConfig,
@@ -202,6 +206,7 @@ class InferenceControllerConfig(
 
 class RolloutConfig(
     BaseLeafConfig,
+    YetoExtensionConfig,
     RawTrainerBackendConfig,
     TrainerBackendTraitConfig,
     RolloutOnlyConfig,
@@ -249,6 +254,7 @@ class RolloutConfig(
 
 class MultiLoraConfig(
     BaseLeafConfig,
+    YetoExtensionConfig,
     TrainerBackendTraitConfig,
     MultiLoraOnlyConfig,
     RunUuidConfig,
@@ -285,6 +291,7 @@ class MultiLoraConfig(
 
 class AllConfig(
     BaseLeafConfig,
+    YetoExtensionConfig,
     RunUuidConfig,
     ClusterConfig,
     ScalingConfig,
