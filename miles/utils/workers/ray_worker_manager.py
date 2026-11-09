@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import functools
 import inspect
 import logging
@@ -10,6 +11,7 @@ from functools import partial
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 import ray
+from ray.util.placement_group import PlacementGroup
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from miles.utils.args.configs.scaling import ScalingConfig
@@ -80,22 +82,39 @@ class RayWorkerManager:
         self.port_allocator = PortAllocator(range_start=args.worker_dynamic_port_start)
         self.comm_backend = comm_backend
         self.pgs = pgs
+        # views of the placement group created at startup; a re-pointed view must stay inside them
+        self._startup_pgs = dict(pgs)
         self._pools = {spec.name: _PoolManager.initial(spec, self) for spec in specs}
         assert len(self._pools) == len(specs)
         self._membership_lock = asyncio.Lock()
 
-        await self.start_cells([c.cell_id for c in self._all_cells()])
+        self._validate_initial_bindings()
+        # deferred cells are declared stopped: they wait for an explicit start_cells (after rebind_cell if unbound)
+        await self.start_cells([c.cell_id for c in self._all_cells() if not c.deferred])
 
     async def start_cells(self, cell_ids: list[str]) -> None:
         async with self._membership_lock:
             cells = [cell for cell_id in cell_ids if (cell := self._find_cell(cell_id)).actors is None]
+            unbound = [c.cell_id for c in cells if c.unbound]
+            if unbound:
+                raise CellUnboundError(f"deferred cells {unbound} are bound to no bundle; rebind_cell them first")
+            for cell in cells:
+                # bindings were checked free when made; check again, a view may have been re-pointed onto them since
+                self._assert_bundles_free(cell.bundles(), ignore=cell)
             try:
                 await _gather_or_raise([c.launch_actors() for c in cells])
                 await _gather_or_raise([c.alloc_ports() for c in cells])
                 await _gather_or_raise([c.post_setup() for c in cells])
-            except Exception:
+            except Exception as error:
                 logger.error(f"Starting cells {[c.cell_id for c in cells]} failed, rolling back", exc_info=True)
-                await asyncio.gather(*[c.stop() for c in cells], return_exceptions=True)
+                results = await asyncio.gather(*[c.stop() for c in cells], return_exceptions=True)
+                failed = {c.cell_id: r for c, r in zip(cells, results, strict=True) if isinstance(r, BaseException)}
+                if failed:
+                    raise StartRollbackFailedError(
+                        f"starting cells {[c.cell_id for c in cells]} failed ({error!r}) and stopping "
+                        f"{sorted(failed)} during the rollback failed too ({list(failed.values())!r}); they may "
+                        f"still hold workers, stop them again"
+                    ) from error
                 raise
 
     async def stop_cells(self, cell_ids: list[str]) -> None:
@@ -105,6 +124,105 @@ class RayWorkerManager:
     async def shutdown(self) -> None:
         async with self._membership_lock:
             await asyncio.gather(*[cell.stop() for cell in self._all_cells()])
+
+    # -------------------------- rebinding (elastic placement) -----------------------------
+    # A stopped cell may move onto other bundles of the placement group created at startup; nothing here creates
+    # bundles, so every target stays inside the startup placement.
+
+    async def rebind_cell(self, cell_id: str, *, pg_name: str, pg_slot_offset: int) -> None:
+        """Bind a stopped cell's workers to slots ``pg_slot_offset..`` of ``pgs[pg_name]`` for its next start."""
+        async with self._membership_lock:
+            cell = self._find_cell(cell_id)
+            assert not cell.alive, f"cell {cell_id} is running; stop it before rebinding it"
+            binding = _CellBinding(pg_name=pg_name, pg_slot_offset=pg_slot_offset)
+            bundles = self._validate_binding(cell, binding)
+            self._assert_bundles_free(bundles, ignore=cell)
+            cell.binding = binding
+            logger.info(f"Cell {cell_id} rebound to {pg_name}[{pg_slot_offset}:] (bundles {sorted(bundles)})")
+
+    async def unbind_cell(self, cell_id: str) -> None:
+        """Return a stopped deferred cell to the unbound state, so it holds no bundle (e.g. before a trainer grows)."""
+        async with self._membership_lock:
+            cell = self._find_cell(cell_id)
+            assert cell.deferred, f"cell {cell_id} was not declared deferred; only deferred cells can be unbound"
+            assert not cell.alive, f"cell {cell_id} is running; stop it before unbinding it"
+            cell.binding = None
+            logger.info(f"Cell {cell_id} unbound")
+
+    async def set_pg_view(self, pg_name: str, info: PlacementGroupInfo) -> None:
+        """Point ``pg_name`` at another slice of the startup placement group (e.g. GPUs a trainer released).
+
+        Refused while a running cell uses the view, when a bundle lies outside the startup placement group or is
+        held by a running cell, and when a stopped cell still bound to the view would reach outside it.
+        """
+        async with self._membership_lock:
+            users = [c.cell_id for c in self._all_cells() if c.alive and c.pg_name == pg_name]
+            assert not users, f"cells {users} run on {pg_name!r}; stop them before re-pointing it"
+            known = {
+                (pg_key(pgi.pg), b) for pgi in self._startup_pgs.values() for b in pgi.pg_reordered_bundle_indices
+            }
+            wanted = {(pg_key(info.pg), b) for b in info.pg_reordered_bundle_indices}
+            outside = sorted(b for _, b in wanted - known)
+            assert not outside, f"bundles {outside} are outside the placement group created at startup"
+            assert len(wanted) == len(info.pg_reordered_bundle_indices), f"{pg_name!r} view repeats bundles"
+            self._assert_bundles_free(wanted, ignore=None)
+            num_slots = len(info.pg_reordered_bundle_indices)
+            overflowing = {
+                c.cell_id: slots
+                for c in self._all_cells()
+                if c.pg_name == pg_name and (slots := [slot for slot in c.all_slots() if slot >= num_slots])
+            }
+            assert not overflowing, (
+                f"stopped cells {overflowing} are bound to slots beyond the {num_slots} bundles of the new "
+                f"{pg_name!r} view; rebind them first"
+            )
+            self.pgs = {**self.pgs, pg_name: info}
+
+    def get_pg_view(self, pg_name: str) -> PlacementGroupInfo:
+        return self.pgs[pg_name]
+
+    def get_cell_bundles(self, cell_id: str) -> list[int]:
+        return sorted(b for _, b in self._find_cell(cell_id).bundles())
+
+    def describe_cells(self, *, pool_ids: list[str] | None = None) -> dict[str, dict[str, Any]]:
+        """Every cell (of ``pool_ids``, default all) with its state and binding, read-only.
+
+        ``alias`` is the caller's name for the cell (placement map ``rollout_cells``) or None; ``state`` is
+        ``unbound`` (a deferred cell with no binding), ``stopped`` or ``running``; ``bundles`` / ``gpu_ids`` are the
+        bundles of the startup placement group the cell uses or would use at its next start.
+        """
+        pools = self._pools if pool_ids is None else {name: self._pools[name] for name in pool_ids}
+        return {c.cell_id: c.describe() for pool in pools.values() for c in pool.cells}
+
+    def _validate_initial_bindings(self) -> None:
+        owner: dict[tuple[Any, int], str] = {}
+        for cell in self._all_cells():
+            if cell.binding is None:
+                continue
+            for bundle in self._validate_binding(cell, cell.binding):
+                assert bundle not in owner, f"cells {owner[bundle]} and {cell.cell_id} are declared on bundle {bundle}"
+                owner[bundle] = cell.cell_id
+
+    def _validate_binding(self, cell: _CellManager, binding: _CellBinding) -> set[tuple[Any, int]]:
+        scheduling = cell.spec.scheduling(self.scaling)
+        assert scheduling.num_gpu_slots_per_worker > 0, f"{cell.spec.name!r} owns no GPU slots to rebind"
+        assert (
+            binding.pg_name in self.pgs
+        ), f"unknown placement group view {binding.pg_name!r}; known: {sorted(self.pgs)}"
+        probe = dataclasses.replace(cell, binding=binding, actors=None)
+        num_slots = len(self.pgs[binding.pg_name].pg_reordered_bundle_indices)
+        bad = [slot for slot in probe.all_slots() if not 0 <= slot < num_slots]
+        assert not bad, f"slots {bad} are outside {binding.pg_name!r}, which has {num_slots} bundles"
+        return probe.bundles()
+
+    def _assert_bundles_free(self, bundles: set[tuple[Any, int]], *, ignore: _CellManager | None) -> None:
+        for other in self._all_cells():
+            if other is ignore or not other.alive:
+                continue
+            if overlap := bundles & other.bundles():
+                raise BundleInUseError(
+                    f"bundles {sorted(b for _, b in overlap)} are in use by running cell {other.cell_id}"
+                )
 
     def observe_fault_target(self, cell_id: str, *, rank: int) -> ObservedFaultHookTarget:
         cell = self._find_cell(cell_id)
@@ -194,6 +312,7 @@ class _PoolManager:
 
     @classmethod
     def initial(cls, spec: BaseSpec, manager: RayWorkerManager) -> _PoolManager:
+        scheduling = spec.scheduling(manager.scaling)
         return cls(
             spec=spec,
             cells=[
@@ -202,13 +321,43 @@ class _PoolManager:
                     cell_index=cell_index,
                     spec=spec,
                     actors=None,
+                    deferred=cell_index >= scheduling.num_cells,
+                    binding=(
+                        _CellBinding(*b)
+                        if cell_index < len(scheduling.initial_bindings)
+                        and (b := scheduling.initial_bindings[cell_index]) is not None
+                        else None
+                    ),
                 )
-                for cell_index in range(spec.scheduling(manager.scaling).num_cells)
+                for cell_index in range(scheduling.num_cells + scheduling.num_deferred_cells)
             ],
         )
 
 
 SpecT = TypeVar("SpecT", bound=BaseSpec)
+
+
+class BundleInUseError(RuntimeError):
+    pass
+
+
+class CellUnboundError(RuntimeError):
+    """A deferred cell was asked to start before ``rebind_cell`` bound it to bundles."""
+
+
+class StartRollbackFailedError(RuntimeError):
+    """A start failed and the rollback that should have stopped its cells failed as well."""
+
+
+def pg_key(pg: Any) -> Any:
+    # key bundles by the placement group id, so two handles of the same group compare equal
+    return pg.id if isinstance(pg, PlacementGroup) else pg
+
+
+@dataclass(frozen=True)
+class _CellBinding:
+    pg_name: str
+    pg_slot_offset: int
 
 
 def _actor_manager_cls(spec: BaseSpec, *, comm_backend: WorkerCommBackend) -> type[_BaseActorManager]:
@@ -230,6 +379,76 @@ class _CellManager(Generic[SpecT]):
     actors: list[_BaseActorManager] | None
     generation: int = 0
     liveness_scan_task: asyncio.Task | None = None
+    # set by RayWorkerManager.rebind_cell or the placement map; None keeps the spec's own slot layout
+    binding: _CellBinding | None = None
+    # declared beyond the scheduling's num_cells: not started at init, and only a binding makes it startable
+    deferred: bool = False
+
+    @property
+    def alias(self) -> str | None:
+        aliases = self.spec.scheduling(self.manager.scaling).cell_aliases
+        return aliases[self.cell_index] if self.cell_index < len(aliases) else None
+
+    @property
+    def unbound(self) -> bool:
+        return self.deferred and self.binding is None
+
+    @property
+    def pg_name(self) -> str | None:
+        if self.unbound:
+            return None
+        return self.binding.pg_name if self.binding is not None else self.spec.scheduling(self.manager.scaling).pg_name
+
+    def slot_of(self, worker_in_cell_index: int) -> int | None:
+        scheduling = self.spec.scheduling(self.manager.scaling)
+        if self.pg_name is None:
+            return None
+        if (binding := self.binding) is not None:
+            return binding.pg_slot_offset + worker_in_cell_index * scheduling.num_gpu_slots_per_worker
+        return (
+            scheduling.pg_slot_offset
+            + (self.cell_index * scheduling.num_workers_per_cell + worker_in_cell_index)
+            * scheduling.num_gpu_slots_per_worker
+        )
+
+    def all_slots(self) -> list[int]:
+        scheduling = self.spec.scheduling(self.manager.scaling)
+        if self.pg_name is None or scheduling.num_gpu_slots_per_worker == 0:
+            return []
+        return [
+            self.slot_of(w) + k
+            for w in range(scheduling.num_workers_per_cell)
+            for k in range(scheduling.num_gpu_slots_per_worker)
+        ]
+
+    def bundles(self) -> set[tuple[Any, int]]:
+        if not (slots := self.all_slots()):
+            return set()
+        pg = self.manager.pgs[self.pg_name]
+        return {(pg_key(pg.pg), pg.pg_reordered_bundle_indices[slot]) for slot in slots}
+
+    def describe(self) -> dict[str, Any]:
+        bundles: list[int] | None = []
+        gpu_ids: list[int] | None = []
+        if slots := self.all_slots():
+            pg = self.manager.pgs[self.pg_name]
+            if all(0 <= slot < len(pg.pg_reordered_bundle_indices) for slot in slots):
+                bundles = [pg.pg_reordered_bundle_indices[slot] for slot in slots]
+                gpu_ids = [pg.pg_reordered_gpu_ids[slot] for slot in slots]
+            else:  # a stopped cell left outside a re-pointed view
+                bundles = gpu_ids = None
+        return dict(
+            cell_id=self.cell_id,
+            alias=self.alias,
+            pool_id=self.spec.name,
+            deferred=self.deferred,
+            state="unbound" if self.unbound else ("running" if self.alive else "stopped"),
+            generation=self.generation,
+            pg_name=self.pg_name,
+            pg_slot_offset=self.binding.pg_slot_offset if self.binding is not None else None,
+            bundles=bundles,
+            gpu_ids=gpu_ids,
+        )
 
     async def launch_actors(self):
         assert self.actors is None
@@ -243,13 +462,7 @@ class _CellManager(Generic[SpecT]):
                 worker_in_cell_index=worker_in_cell_index,
                 spec=self.spec,
                 actor_handle=None,
-                gpu_slot_index=(
-                    scheduling.pg_slot_offset
-                    + (self.cell_index * scheduling.num_workers_per_cell + worker_in_cell_index)
-                    * scheduling.num_gpu_slots_per_worker
-                    if scheduling.pg_name is not None
-                    else None
-                ),
+                gpu_slot_index=self.slot_of(worker_in_cell_index),
             )
             for worker_in_cell_index in range(scheduling.num_workers_per_cell)
         ]
@@ -397,7 +610,7 @@ class _BaseActorManager(Generic[SpecT]):
     def _create_actor(self, actor_class: type, **ctor_kwargs) -> ray.actor.ActorHandle:
         scheduling = self.spec.scheduling(self.manager.scaling)
         scheduling_strategy = None
-        if (pg_name := scheduling.pg_name) is not None:
+        if (pg_name := self.parent.pg_name) is not None:
             pg = self.manager.pgs[pg_name]
             scheduling_strategy = PlacementGroupSchedulingStrategy(
                 placement_group=pg.pg,
@@ -450,11 +663,11 @@ class _BaseActorManager(Generic[SpecT]):
 
     @property
     def gpu_ids(self) -> list[int]:
-        scheduling = self.spec.scheduling(self.manager.scaling)
-        if (pg_name := scheduling.pg_name) is None:
+        if (pg_name := self.parent.pg_name) is None:
             return []
         pg = self.manager.pgs[pg_name]
         base_gpu_id = int(pg.pg_reordered_gpu_ids[self.gpu_slot_index])
+        scheduling = self.spec.scheduling(self.manager.scaling)
         return list(range(base_gpu_id, base_gpu_id + scheduling.num_gpu_slots_per_worker))
 
     @property
