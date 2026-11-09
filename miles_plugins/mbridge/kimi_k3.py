@@ -1,14 +1,17 @@
 import torch
 from megatron.core.transformer import MLATransformerConfig
 from megatron.core.transformer.enums import AttnBackend
+from megatron.core.utils import unwrap_model
 
 from mbridge.core import register_model
 from mbridge.core.safetensor_io import SafeTensorIO
 from mbridge.models import DeepseekV3Bridge
-from miles.utils.mxfp4 import MXFP4_GROUP_SIZE, pack_mxfp4_rows
+from miles.utils.mxfp4 import MXFP4_GROUP_SIZE, dequantize_mxfp4_rows, pack_mxfp4_rows
 from miles_plugins.mbridge.linear_attn import LinearAttentionBridgeMixin
 from miles_plugins.models.kimi_k3.model import build_kimi_k3_spec
 from miles_plugins.models.kimi_k3.ops import situ_and_mul
+from miles_plugins.models.kimi_k3.partial_experts import FROZEN_HALF, TRAINABLE_HALF, is_split_expert_param_name
+from miles_plugins.models.kimi_k3.permute import SlotLayout, get_active_slot_layout
 
 
 @register_model("kimi_k3")
@@ -224,6 +227,60 @@ class KimiK3Bridge(LinearAttentionBridgeMixin, DeepseekV3Bridge):
         self._experts_packed = any(name.endswith(".weight_packed") for name in safetensor_io.index)
         return safetensor_io
 
+    # ---- partial routed-expert training (--partial-experts-selection) -------------------------------
+    #
+    # The split experts module names its halves ``mlp.experts.trainable`` / ``mlp.experts.frozen``, which
+    # mbridge's ``".mlp.experts.linear_fc" in name`` test does not recognize as EP-sharded: it would load
+    # them on TP rank 0 and scatter them over TP. So the base loader skips those names and
+    # ``_load_partial_experts`` fills each EP rank's local slots itself from the safetensors shards, in slot
+    # order, dequantizing the trainable slots to BF16 and keeping the frozen slots as packed MXFP4 rows.
+    # The router weight and expert bias load in HF order through the base loader and are permuted in place.
+
+    def _weight_name_mapping_mcore_local_to_global(self, model, consider_ep: bool = True) -> dict[str, str]:
+        mapping = super()._weight_name_mapping_mcore_local_to_global(model, consider_ep=consider_ep)
+        return {k: v for k, v in mapping.items() if not is_split_expert_param_name(k)}
+
+    def load_weights(self, models, weights_path: str, memory_efficient: bool = False) -> None:
+        super().load_weights(models, weights_path, memory_efficient=memory_efficient)
+        layout = _partial_experts_layout(models)
+        if layout is not None:
+            self._load_partial_experts(models, layout)
+
+    @torch.no_grad()
+    def _load_partial_experts(self, models, layout: SlotLayout) -> None:
+        assert self._experts_packed, "partial expert training loads the frozen experts from an MXFP4 checkpoint"
+        assert self.mpu.etp_size == 1, "partial experts: expert tensor parallelism is not implemented"
+        ep_rank = self.mpu.ep_rank
+        n_local, k_local = layout.num_local_experts, layout.num_local_trainable
+        assert n_local == self.config.num_moe_experts // self.mpu.ep_size, (n_local, self.config.num_moe_experts)
+        for model in models:
+            for layer in unwrap_model(model).decoder.layers:
+                if not layer.is_moe_layer:
+                    continue
+                hf_layer = layer.layer_number - 1
+                experts = layer.mlp.experts
+                trainable_half, frozen_half = getattr(experts, TRAINABLE_HALF), getattr(experts, FROZEN_HALF)  # config-access-exempt: the split module names its halves by these constants
+                for local_slot in range(n_local):
+                    original_id = layout.local_slot_to_original_id(hf_layer, ep_rank, local_slot)
+                    fc1, fc2 = self._packed_expert_rows(hf_layer, original_id)
+                    if local_slot < k_local:
+                        # the BF16 master starts as the exact dequantization of the shipped MXFP4 expert
+                        _copy_expert(trainable_half, local_slot, dequantize_mxfp4_rows(fc1, MXFP4_GROUP_SIZE), dequantize_mxfp4_rows(fc2, MXFP4_GROUP_SIZE))
+                    else:
+                        _copy_expert(frozen_half, local_slot - k_local, fc1, fc2)
+                router = layer.mlp.router
+                router.weight.copy_(layout.permute_router_rows(hf_layer, router.weight))
+                if router.expert_bias is not None:
+                    router.expert_bias.copy_(layout.permute_router_rows(hf_layer, router.expert_bias))
+
+    def _packed_expert_rows(self, hf_layer: int, expert_id: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """fc1 (w1 stacked over w3) and fc2 (w2) of one HF expert as packed MXFP4 rows, as _weight_to_mcore_format builds them."""
+        fc1_names = [x.format(layer_number=hf_layer, expert_id=expert_id) for x in self._MXFP4_EXPERT_MAPPING["mlp.experts.linear_fc1.weight"]]
+        fc2_names = [x.format(layer_number=hf_layer, expert_id=expert_id) for x in self._MXFP4_EXPERT_MAPPING["mlp.experts.linear_fc2.weight"]]
+        fc1 = self._weight_to_mcore_format("mlp.experts.linear_fc1.weight", [self.safetensor_io.load_one_hf_weight(x) for x in fc1_names])
+        fc2 = self._weight_to_mcore_format("mlp.experts.linear_fc2.weight", [self.safetensor_io.load_one_hf_weight(x) for x in fc2_names])
+        return fc1, fc2
+
     def _weight_name_mapping_mlp(self, name: str) -> list[str]:
         if self._experts_packed:
             for keyword, templates in self._MXFP4_EXPERT_MAPPING.items():
@@ -263,10 +320,30 @@ class KimiK3Bridge(LinearAttentionBridgeMixin, DeepseekV3Bridge):
         if mcore_weights_name.endswith("self_attention.linear_attn.dt_bias"):
             assert len(hf_weights) == 1
             return hf_weights[0].float().contiguous()
-        if self._experts_packed and ".mlp.experts.linear_fc" in mcore_weights_name:
+        if self._experts_packed and "mlp.experts.linear_fc" in mcore_weights_name:
             # the packed codes of w1 and w3 stack as fc1's rows, exactly as their BF16 weights would; the scales follow
             half = len(hf_weights) // 2
             return pack_mxfp4_rows(
                 torch.cat(hf_weights[:half], dim=0), torch.cat(hf_weights[half:], dim=0), MXFP4_GROUP_SIZE
             )
         return super()._weight_to_mcore_format(mcore_weights_name, hf_weights)
+
+
+def _partial_experts_layout(models) -> SlotLayout | None:
+    """The slot layout the model was built with (``get_kimi_k3_spec`` sets it on the config), else the process's."""
+    for model in models:
+        layout = getattr(  # config-access-exempt: only a partial-experts model spec sets partial_experts_layout
+            unwrap_model(model).config, "partial_experts_layout", None
+        )
+        if layout is not None:
+            return layout
+    return get_active_slot_layout()
+
+
+def _copy_expert(half, local_index: int, fc1: torch.Tensor, fc2: torch.Tensor) -> None:
+    dst1 = getattr(half.linear_fc1, f"weight{local_index}")  # config-access-exempt: TE GroupedLinear registers weight0..weightN-1
+    dst2 = getattr(half.linear_fc2, f"weight{local_index}")  # config-access-exempt: TE GroupedLinear registers weight0..weightN-1
+    assert dst1.shape == fc1.shape and dst1.dtype == fc1.dtype, (dst1.shape, dst1.dtype, fc1.shape, fc1.dtype)
+    assert dst2.shape == fc2.shape and dst2.dtype == fc2.dtype, (dst2.shape, dst2.dtype, fc2.shape, fc2.dtype)
+    dst1.copy_(fc1)
+    dst2.copy_(fc2)
