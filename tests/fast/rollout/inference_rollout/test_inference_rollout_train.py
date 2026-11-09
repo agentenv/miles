@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from miles.rollout import rollout_runtime_stats
 from miles.rollout.inference_rollout import inference_rollout_train
 from miles.utils.output_store.plan import StorePlanError
 
@@ -57,6 +58,51 @@ class TestAbort:
         assert "Failed to abort worker at http://unresponsive: worker cannot answer" in caplog.text
 
 
+    async def test_discarded_groups_are_tallied_without_partial_rollout(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Without partial rollout the drained groups are counted for the all-samples hook; a drained group that
+        raised counts as unknown and does not fail the abort."""
+        args = Namespace(
+            partial_rollout=False,
+            sglang_router_ip="router",
+            sglang_router_port=30000,
+            enable_sample_ownership_checker=False,
+        )
+        state = SimpleNamespace(args=args, aborted=False)
+
+        async def fake_get(url: str) -> dict:
+            return {"workers": [{"url": "http://w"}]}
+
+        async def fake_post(url: str, payload: dict[str, bool]) -> None:
+            return None
+
+        async def fake_hook(hook_args: Namespace) -> None:
+            return None
+
+        async def group(lengths: list[int]) -> list[SimpleNamespace]:
+            return [SimpleNamespace(response="x", response_length=n, metadata={}) for n in lengths]
+
+        async def broken() -> list[SimpleNamespace]:
+            raise RuntimeError("sandbox lease is not live")
+
+        pendings = {
+            asyncio.create_task(group([3, 4])),
+            asyncio.create_task(group([10])),
+            asyncio.create_task(broken()),
+        }
+        monkeypatch.setattr(inference_rollout_train, "get", fake_get)
+        monkeypatch.setattr(inference_rollout_train, "post", fake_post)
+        monkeypatch.setattr(inference_rollout_train, "call_agent_abort_hook", fake_hook)
+        monkeypatch.setattr(inference_rollout_train, "record_dropped_samples", lambda group: None)
+        rollout_runtime_stats.take("abort_discard")
+
+        assert await inference_rollout_train.abort(state, pendings, rollout_id=3) == []
+        assert rollout_runtime_stats.take("abort_discard") == {
+            "groups": 3,
+            "samples": 3,
+            "response_tokens": 17,
+            "unknown_groups": 1,
+        }
+
 class TestGroupErrors:
     async def test_a_non_retryable_group_error_stops_the_rollout(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A broken contract fails every group the same way: raise instead of resubmitting forever."""
@@ -66,6 +112,7 @@ class TestGroupErrors:
             rollout_batch_size=1,
             n_samples_per_prompt=1,
             over_sampling_batch_size=1,
+            agentic_suspend_between_turns=False,
         )
         submitted: list[asyncio.Task] = []
 

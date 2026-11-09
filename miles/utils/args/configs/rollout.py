@@ -528,6 +528,30 @@ class RolloutRelatedRolloutOnlyConfig(BaseConfig):
             )
         ),
     ] = False
+    agentic_suspend_between_turns: A[
+        bool,
+        Arg(
+            help=(
+                "Agentic multi-turn rollouts (--custom-agent-function-path): at the over-sampling cut-off, suspend "
+                "the unfinished trajectories between two model turns instead of discarding them, and continue them "
+                "in the next rollout. The agent module must define async suspend(args) / resume(args): suspend "
+                "closes the agent's model-turn gate (a tool call that is running finishes and its result is written "
+                "back; the next model request waits at the gate), then the engines abort the model turns in flight "
+                "(the agent retries such a turn after resume). Requires --use-session-server; exclusive with "
+                "--partial-rollout and --fully-async."
+            )
+        ),
+    ] = False
+    agentic_suspend_max_rounds: A[
+        int,
+        Arg(
+            help=(
+                "With --agentic-suspend-between-turns: a suspended trajectory may be continued in at most this many "
+                "later rollouts after the one that started it; at a cut-off, suspended trajectories that could not "
+                "be trained within that window are cancelled (the agent releases their environments) and counted."
+            )
+        ),
+    ] = 1
     max_weight_staleness: A[
         int | None,
         Arg(
