@@ -542,7 +542,6 @@ class TestAReloadThatFindsNothingItSaved:
         [
             dict(fp16=True),
             dict(use_precision_aware_optimizer=True),
-            dict(optimizer_cpu_offload=True),
             dict(offload_optimizer_states=True),
         ],
     )
@@ -552,6 +551,24 @@ class TestAReloadThatFindsNothingItSaved:
 
         with pytest.raises(AssertionError):
             _reload(actor)
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            dict(optimizer_cpu_offload=True),
+            dict(optimizer_cpu_offload=True, use_precision_aware_optimizer=True),
+        ],
+    )
+    def test_a_cpu_offloaded_trainer_is_reset_and_loads(self, actor_module, tmp_path, monkeypatch, overrides):
+        """HybridDeviceOptimizer keeps standalone FP32 masters that the load refreshes, so its reset is whole."""
+        args = _cold_started_args(tmp_path, **overrides)
+        _watch_load(actor_module, monkeypatch, args=args, iteration=0)
+        resets = []
+        monkeypatch.setattr(actor_module, "reset_optimizer_state", lambda *a, **k: resets.append(a))
+
+        _reload(_actor(actor_module, role="actor", args=args))
+
+        assert len(resets) == 1
 
     def test_a_reload_that_did_save_is_not_pushed_back_to_the_beginning(self, actor_module, tmp_path, monkeypatch):
         """The reset path is for a run with nothing of its own, and running it over a real resume would undo it."""

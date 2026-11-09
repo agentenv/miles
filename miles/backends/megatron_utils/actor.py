@@ -438,8 +438,9 @@ class MegatronTrainRayActor(TrainRayActor):
             reset_optim = ckpt_load_config.finetune or ckpt_load_config.no_load_optim
             if reset_optim:
                 assert not self.args.backend.fp16
-                assert not self.args.backend.use_precision_aware_optimizer
-                assert not self.args.backend.optimizer_cpu_offload
+                # precision-aware is only safe with --optimizer-cpu-offload, whose HybridDeviceOptimizer keeps
+                # standalone FP32 masters that reload_model_params refreshes from the loaded weights
+                assert not self.args.backend.use_precision_aware_optimizer or self.args.backend.optimizer_cpu_offload
                 assert not self.args.backend.offload_optimizer_states
             if ckpt_load_config.finetune or ckpt_load_config.no_load_rng:
                 self._post_init_random_state.restore()
