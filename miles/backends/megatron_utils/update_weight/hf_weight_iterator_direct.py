@@ -26,6 +26,7 @@ from miles.utils.distributed_utils import get_gloo_group
 from miles.utils.test_utils.fault_injector.controller import reach_fault_hook
 from miles.utils.test_utils.fault_injector.models import FaultHookName
 from miles.utils.types import ParamInfo
+from miles_plugins.models.kimi_k3.partial_experts import is_trainable_expert_param_name
 
 logger = logging.getLogger(__name__)
 
@@ -275,17 +276,27 @@ def _pack_param_infos_by_size(
 def _partition_expert_infos(
     param_infos: Sequence[ParamInfo], *, num_local_experts: int, edp_size: int
 ) -> list[list[ParamInfo]]:
-    """Assign contiguous local-expert ranges to EDP replicas, keeping FC1/FC2 together."""
-    count, remainder = divmod(num_local_experts, edp_size)
-    owners = [owner for owner in range(edp_size) for _ in range(count + (owner < remainder))]
-    partitions: list[list[ParamInfo]] = [[] for _ in range(edp_size)]
+    """Assign contiguous ranges of the present local experts to EDP replicas, keeping FC1/FC2 together.
+
+    Only the local experts that appear in ``param_infos`` are partitioned: a partial-experts export carries
+    the first ``k_local`` slots of every rank, not all ``num_local_experts``, and every owner should still
+    get an equal share of what is actually sent.
+    """
+    local_expert_of: dict[str, int] = {}
     for info in param_infos:
         # The direct converter uses TE grouped weights with global expert IDs.
         match = re.search(r"\.weight(\d+)$", info.name)
         if match is None:
             raise ValueError(f"Cannot identify the routed expert in {info.name!r}")
-        local_expert = int(match.group(1)) % num_local_experts
-        partitions[owners[local_expert]].append(info)
+        local_expert_of[info.name] = int(match.group(1)) % num_local_experts
+    present = sorted(set(local_expert_of.values()))
+    count, remainder = divmod(len(present), edp_size)
+    owner_of = dict(
+        zip(present, [owner for owner in range(edp_size) for _ in range(count + (owner < remainder))], strict=True)
+    )
+    partitions: list[list[ParamInfo]] = [[] for _ in range(edp_size)]
+    for info in param_infos:
+        partitions[owner_of[local_expert_of[info.name]]].append(info)
     return partitions
 
 
@@ -311,8 +322,13 @@ def _get_megatron_local_param_infos(
     adapter_ids = {id(param) for params in adapter_named_parameters(model) for param in params.values()}
     param_infos: dict[str, ParamInfo] = {}
     rank = dist.get_rank()
+    trainable_experts_only = args.partial_experts_selection is not None
     for name, param in named_params_and_buffers(args, model):
         if id(param) in adapter_ids:
+            continue
+        # the engines start from the same HF checkpoint and only the selected experts ever change; the
+        # converter maps the trainable half's slot index back to the original expert id
+        if trainable_experts_only and not is_trainable_expert_param_name(name):
             continue
         param_infos[name] = ParamInfo(
             name=name,
