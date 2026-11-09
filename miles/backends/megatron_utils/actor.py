@@ -386,6 +386,7 @@ class MegatronTrainRayActor(TrainRayActor):
     @with_logs
     def load_state(self, ckpt_load_config: MegatronCkptLoadConfig | None) -> int:
         assert ckpt_load_config is not None, "Megatron reload requires checkpoint load inputs"
+        self._assert_full_parameter_boundary_clear()
         resume_from_ckpt = ckpt_load_config.resume_from_ckpt
         assert self.is_initialized()
 
@@ -660,6 +661,15 @@ class MegatronTrainRayActor(TrainRayActor):
                 use_rollout_sampling_mask=store_prefix == "" and self.args.use_sampling_support_replay,
             )
 
+    def _assert_full_parameter_boundary_clear(self) -> None:
+        """No full-parameter cut may be prepared or committed but not finalized.
+
+        Every entry point that reads or writes the model or the masters
+        (train, weight update, checkpoint save/load, healing, DP reconfigure)
+        refuses to run across a half-applied cut."""
+
+        assert_full_parameter_boundary_clear(self)
+
     @with_logs
     @event_logger_context(
         lambda _self, rollout_id, rollout_data_ref, witness_info=None, attempt=0, external_data=None: dict(
@@ -676,7 +686,7 @@ class MegatronTrainRayActor(TrainRayActor):
     ) -> TrainStepOutput:
         self._heartbeat.bump()
         # A pending full-parameter commit must resolve before any local step.
-        assert_full_parameter_boundary_clear(self)
+        self._assert_full_parameter_boundary_clear()
         self._last_rollout_id = rollout_id
         if self.args.offload_train and self._asleep:
             self.wake_up()
@@ -946,6 +956,7 @@ class MegatronTrainRayActor(TrainRayActor):
     @timer
     def save_model(self, rollout_id: int, force_sync: bool = False) -> None:
         self._heartbeat.bump()
+        self._assert_full_parameter_boundary_clear()  # never checkpoint a half-committed cut
         if self.args.debug_rollout_only:
             return
 
@@ -1047,6 +1058,7 @@ class MegatronTrainRayActor(TrainRayActor):
         self, info: UpdatableEngines, debug_weight_update_id: str, rollout_id: int | None
     ) -> WeightUpdateOutput:
         self._heartbeat.bump()
+        self._assert_full_parameter_boundary_clear()  # never publish a half-committed cut
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return WeightUpdateOutput(weight_version=None, failed_cell_ids=())
 
@@ -1124,6 +1136,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
     @with_logs
     def load_other_checkpoint(self, model_tag: str, path: str) -> None:
+        self._assert_full_parameter_boundary_clear()
         ckpt_step = self.args.backend.ckpt_step
         if model_tag == "ref":
             ckpt_step = self.args.ref_ckpt_step
@@ -1148,6 +1161,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
     @with_logs
     def send_ckpt(self, dst_rank: int) -> None:
+        self._assert_full_parameter_boundary_clear()
         # These states are not handled
         assert not self.args.keep_old_actor
         assert self._last_rollout_id is not None, "healing before the first train step is unsupported"
@@ -1164,6 +1178,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
     @with_logs
     def reconfigure_indep_dp(self, indep_dp_info: IndepDPInfo, indep_dp_store_addr: str | None) -> None:
+        self._assert_full_parameter_boundary_clear()
         reconfigure_indep_dp_group(
             parallel_state=get_parallel_state(),
             store_addr=indep_dp_store_addr,
