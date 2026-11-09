@@ -10,9 +10,11 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_
 from miles.backends.sglang_utils.sglang_api_client import SGLangApiClient
 from miles.dashboard import hooks as dashboard_hooks
 from miles.ray.rollout.eval_fleet import EvalFleetInfo, EvalFleetPin, InferenceControllerEvalFleet
+from miles.ray.rollout.inference_membership import InferenceMembershipMixin
 from miles.ray.rollout.rollout_server import RolloutServer, create_rollout_servers
 from miles.ray.rollout.router_manager import resolve_router_addrs
 from miles.ray.rollout.server_cell import ServerCell, ServerCellMetadata
+from miles.router.backend import RouterKind, make_router_backend
 from miles.utils import async_utils
 from miles.utils.args.component_rollout import InferenceRuntimeImmutState
 from miles.utils.audit_utils.checksum_utils import ChecksumCollectionFailure
@@ -45,7 +47,7 @@ CELLS_READY_TIMEOUT_SECONDS = 3600.0
 
 
 @enforce_lock_discipline
-class InferenceController:
+class InferenceController(InferenceMembershipMixin):
     @lock_exempt
     def __init__(
         self,
@@ -212,9 +214,28 @@ class InferenceController:
 
     @acquires_lock
     async def start_update_weights(
-        self, model_id: str | None = None, receiver_pool: str = "rollout"
+        self,
+        model_id: str | None = None,
+        receiver_pool: str = "rollout",
+        members: list[str] | None = None,
+        expected_epoch: int | None = None,
+        admit_cordoned: bool = False,
     ) -> "UpdatableEngines":
-        """Return engines eligible for weight updates."""
+        """Return engines eligible for weight updates.
+
+        ``members`` (cell ids, with the membership ``expected_epoch`` it was planned for) restricts the update to
+        exactly these cells of the updatable server: only they are waited for and returned, so ``end_update_weights``
+        marks only them ready and every other cell keeps its weights and state. ``admit_cordoned`` makes
+        ``end_update_weights`` register the cells it readies cordoned, until ``admit_cells``.
+        """
+        self._admit_cordoned = False
+        if admit_cordoned and not make_router_backend(self.args).features.cordon:
+            raise ValueError(f"admit_cordoned needs a router that cordons (--router {RouterKind.MILES.value})")
+        if members is not None:
+            return await self._start_member_update_weights(
+                model_id=model_id, members=members, expected_epoch=expected_epoch, admit_cordoned=admit_cordoned
+            )
+        self._admit_cordoned = admit_cordoned
         if receiver_pool not in {"rollout", "eval"}:
             raise ValueError(f"Unknown receiver pool: {receiver_pool!r}")
         if receiver_pool == "eval":
@@ -248,8 +269,32 @@ class InferenceController:
             receiver_pool=receiver_pool,
         )
 
+    @requires_lock
+    async def _start_member_update_weights(
+        self, *, model_id: str | None, members: list[str], expected_epoch: int | None, admit_cordoned: bool
+    ) -> "UpdatableEngines":
+        srv = self._get_updatable_server(model_id=model_id)
+        assert srv is not None, f"no updatable server to publish members {members} to"
+        # validated before the health monitor is paused, so a refused publish changes nothing
+        self._validate_member_publish(srv=srv, members=members, expected_epoch=expected_epoch)
+        await self._health_monitoring_pause(model_id)
+        self._admit_cordoned = admit_cordoned
+        await self._ensure_cells_ready(model_id=model_id, cell_ids=set(members))
+        cells = sorted(
+            (cell for cell_id, cell in srv.normal_server_cells.items() if cell_id in set(members)),
+            key=lambda cell: cell.meta.gpu_offset,
+        )
+        return UpdatableEngines(
+            rollout_engines=[cell.api_client for cell in cells],
+            engine_gpu_counts=[cell.meta.num_gpus_per_engine for cell in cells],
+            engine_gpu_offsets=[cell.meta.gpu_offset for cell in cells],
+            engine_cell_ids=[cell.meta.cell_id for cell in cells],
+            snapshot_cell_id_to_hashes={cell.meta.cell_id: cell.meta.workers_hash for cell in cells},
+        )
+
     @lock_exempt
     async def abort_update_weights(self) -> None:
+        self._admit_cordoned = False
         self.context_lock.release_if_detached()
 
     @releases_lock
@@ -280,7 +325,14 @@ class InferenceController:
         ]
         failed_cells, updated_cells = partition(cells, lambda kv: kv[0] not in failed_cell_ids)
         await asyncio.gather(*[cell.mark_errored() for _, cell in failed_cells])
-        await asyncio.gather(*[cell.mark_weights_ready() for _, cell in updated_cells if cell.is_pending_weights])
+        ready = [(cell_id, cell) for cell_id, cell in updated_cells if cell.is_pending_weights]
+        admit_cordoned = self._admit_cordoned
+        await asyncio.gather(
+            *[cell.mark_weights_ready(cordoned=self._registers_cordoned(cell_id)) for cell_id, cell in ready]
+        )
+        self._admit_cordoned = False
+        if admit_cordoned:
+            self._awaiting_admission = {**self._awaiting_admission, **dict(ready)}
 
         return checksum_results
 
@@ -298,11 +350,14 @@ class InferenceController:
         )
 
     @requires_lock
-    async def _ensure_cells_ready(self, model_id: str | None = None) -> None:
+    async def _ensure_cells_ready(self, model_id: str | None = None, cell_ids: set[str] | None = None) -> None:
         deadline = time.monotonic() + CELLS_READY_TIMEOUT_SECONDS
         while True:
             cells = [
-                cell for srv in self._get_servers_of_model_id(model_id) for cell in srv.normal_server_cells.values()
+                cell
+                for srv in self._get_servers_of_model_id(model_id)
+                for cell_id, cell in srv.normal_server_cells.items()
+                if cell_ids is None or cell_id in cell_ids
             ]
             if self.args.colocate:
                 await asyncio.gather(*[cell.init() for cell in cells if cell.is_uninitialized])
