@@ -395,3 +395,32 @@ def test_is_clipped_marks_the_tokens_tis_truncates() -> None:
         ),
     )
     assert metrics.is_clipped.tolist() == [1.0, 0.0, 0.0]  # the inactive third token never counts
+
+
+@pytest.mark.parametrize("mode", ["none", "tis", "mis"])
+@pytest.mark.parametrize("rollout_excess", [0.0, 1e-7, 1e-6])
+@pytest.mark.parametrize("train_mass", [1.0, 1 - 1e-7, 0.999])
+def test_head_mass_at_or_above_one_has_finite_loss_and_gradient(
+    mode: str, rollout_excess: float, train_mass: float
+) -> None:
+    # Real top-128 heads often hold all the mass in fp32: q_mass >= 1 on 15% (SGLang) to 48% (vLLM) of the
+    # tokens of k31-rl-3/5 buffers, up to 1 + 9e-7. The tail floor must keep rho, alpha and the loss finite.
+    generator = torch.Generator().manual_seed(0)
+    logits = torch.randn(6, 128, generator=generator, dtype=torch.float64) * 4
+    train_head = (torch.log_softmax(logits, -1) + math.log(train_mass)).float().requires_grad_(True)
+    rollout_head = (torch.log_softmax(logits + 0.01, -1) + math.log1p(rollout_excess)).float()
+    train = train_head[:, 0].detach().clone().requires_grad_(True)
+    loss, metrics = score_centering_loss(
+        ScoreCenteringInputs(
+            train_log_probs=train,
+            train_head_log_probs=train_head,
+            rollout_log_probs=rollout_head[:, 0],
+            rollout_head_log_probs=rollout_head,
+            head_mask=torch.ones(6, 128, dtype=torch.bool),
+            advantages=torch.ones(6),
+            mode=mode,
+        )
+    )
+    loss.sum().backward()
+    assert torch.isfinite(loss).all() and torch.isfinite(metrics.tail_ratio).all()
+    assert torch.isfinite(train_head.grad).all() and torch.isfinite(train.grad).all()
