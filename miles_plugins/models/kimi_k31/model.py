@@ -23,6 +23,7 @@ from miles_plugins.models.cp_utils import zigzag_gather_layout
 from miles_plugins.models.kimi_k3.layers import KimiK3Attention, _linear
 from miles_plugins.models.kimi_k3.model import KIMI_K3_KDA_LAYERS, get_kimi_k3_spec
 from miles_plugins.models.kimi_k31.dsa_layout import checked_dsa_layers
+from miles_plugins.models.kimi_k31.indexer_tp_split import indexer_tp_split_enabled, tp_split_topk
 
 
 # Query rows the frozen DSA indexer scores per block (MILES_K31_INDEXER_QUERY_CHUNK overrides).
@@ -118,6 +119,17 @@ class KimiK31DSAAttention(KimiK3Attention):
         if indexer_replay_manager.enabled:
             # replay hands back one top-k stream per layer call: keep a single call
             return lighting_indexer(index_q, index_k, weights, starts, ends, self.index_topk, topk_fn=topk_fn)[1]
+        if indexer_tp_split_enabled() and self.tp_group.size() > 1:
+            # every TP rank holds the same indexer inputs: score 1/TP of the rows, all-gather the indices
+            return tp_split_topk(
+                lambda q, w, ks, ke: chunked_indexer_topk(q, index_k, w, ks, ke, self.index_topk, topk_fn),
+                index_q,
+                weights,
+                starts,
+                ends,
+                self.index_topk,
+                self.tp_group,
+            )
         return chunked_indexer_topk(index_q, index_k, weights, starts, ends, self.index_topk, topk_fn)
 
     def _forward_mla(self, hidden_states: torch.Tensor, packed_seq_params: PackedSeqParams | None) -> torch.Tensor:
