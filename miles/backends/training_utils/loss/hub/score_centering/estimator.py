@@ -55,6 +55,9 @@ class ScoreCenteringMetrics:
     rollout_head_mass: torch.Tensor
     tail_ratio: torch.Tensor
     importance_weight: torch.Tensor
+    # tokens whose sample weight is below the raw ratio pi_train / pi_rollout (TIS
+    # clip, or MIS out of its band): the score-centering analogue of PPO clipfrac
+    is_clipped: torch.Tensor
 
     def as_log_dict(self) -> dict[str, torch.Tensor]:
         """Map existing log names to the tensors without copying their storage."""
@@ -83,9 +86,9 @@ def score_centering_loss(inputs: ScoreCenteringInputs) -> tuple[torch.Tensor, Sc
         rho = (1 - q_mass).clamp_min(inputs.eps) / (1 - p_mass).clamp_min(inputs.eps)
         alpha = sampling.tail_scale(rho, p.dtype)
         residual = sampling.head_mass(p, q, train_head - rollout_head) - alpha.unsqueeze(-1) * p
-        weight = sampling.sample_weight(
-            drop_inactive_nan(inputs.train_log_probs - inputs.rollout_log_probs, active, 0.0)
-        )
+        log_ratio = drop_inactive_nan(inputs.train_log_probs - inputs.rollout_log_probs, active, 0.0)
+        weight = sampling.sample_weight(log_ratio)
+        is_clipped = (active & (weight < log_ratio.exp() * (1 - 1e-6))).to(weight.dtype)
     correction = (residual * scored_log_probs(train_head, residual)).sum(-1)
     loss = -inputs.advantages.detach() * (weight * scored_log_probs(inputs.train_log_probs, weight) - correction)
     return loss, ScoreCenteringMetrics(
@@ -94,4 +97,5 @@ def score_centering_loss(inputs: ScoreCenteringInputs) -> tuple[torch.Tensor, Sc
         rollout_head_mass=q_mass,
         tail_ratio=rho,
         importance_weight=weight,
+        is_clipped=is_clipped,
     )

@@ -332,6 +332,7 @@ def test_tiny_tails_and_padding_are_finite_and_detached(mode: str) -> None:
         "sc_rollout_head_mass": metrics.rollout_head_mass,
         "sc_tail_ratio": metrics.tail_ratio,
         "sc_importance_weight": metrics.importance_weight,
+        "sc_is_clipped": metrics.is_clipped,
     }
     assert list(logged) == list(expected)
     assert all(logged[key] is value and not value.requires_grad for key, value in expected.items())
@@ -380,3 +381,17 @@ def test_selected_log_probs_gradcheck_and_empty_response() -> None:
     assert result.shape == (0, 3)
     result.sum().backward()
     torch.testing.assert_close(logits.grad, torch.zeros_like(logits))
+
+
+def test_is_clipped_marks_the_tokens_tis_truncates() -> None:
+    train = torch.tensor([0.0, -2.0, -1.0], dtype=torch.float64)  # ratios e^2, 1, e^-1 vs rollout
+    rollout = torch.tensor([-2.0, -2.0, 0.0], dtype=torch.float64)
+    head = torch.full((3, 1), -0.1, dtype=torch.float64)
+    _, metrics = score_centering_loss(
+        ScoreCenteringInputs(
+            train_log_probs=train, train_head_log_probs=head, rollout_log_probs=rollout,
+            rollout_head_log_probs=head, head_mask=torch.ones(3, 1, dtype=torch.bool),
+            advantages=torch.tensor([1.0, 1.0, 0.0]), mode="tis", tis_clip=2.0,
+        ),
+    )
+    assert metrics.is_clipped.tolist() == [1.0, 0.0, 0.0]  # the inactive third token never counts
