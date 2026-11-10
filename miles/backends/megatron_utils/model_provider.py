@@ -422,6 +422,12 @@ def _maybe_freeze_for_partial_experts(args: TrainerConfig, model: GPTModel) -> N
         "--partial-experts-selection keeps the router fixed; set --moe-router-bias-update-rate 0"
     )
     trainable, frozen = freeze_all_but_trainable_experts(model)
+    # the embedding freezes too: under full recompute the first pipeline stage's reentrant checkpoints would
+    # see no input requiring grad and give its trainable experts no gradient (later stages receive a
+    # requires-grad p2p tensor); the LoRA path solves the same problem with this hook
+    from miles.backends.megatron_utils.lora.native.lora import _require_grad_on_first_activation
+
+    _require_grad_on_first_activation(model)
     has_experts = any(".mlp.experts." in name for name, _ in model.named_parameters())
     assert trainable > 0 or not has_experts, "--partial-experts-selection: no trainable expert parameter on this rank"
     logger.info("partial experts: %d trainable expert parameters, %d frozen parameters on this rank", trainable, frozen)
