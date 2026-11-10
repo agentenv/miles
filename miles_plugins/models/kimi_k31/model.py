@@ -5,6 +5,8 @@ runs absorbed over the 512-wide KV latent plus K3's 64-wide unrotated key extra,
 shared DSA kernels in `miles.kernels.attention.dsa`.
 """
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -21,6 +23,41 @@ from miles_plugins.models.cp_utils import zigzag_gather_layout
 from miles_plugins.models.kimi_k3.layers import KimiK3Attention, _linear
 from miles_plugins.models.kimi_k3.model import KIMI_K3_KDA_LAYERS, get_kimi_k3_spec
 from miles_plugins.models.kimi_k31.dsa_layout import checked_dsa_layers
+
+
+# Query rows the frozen DSA indexer scores per block (MILES_K31_INDEXER_QUERY_CHUNK overrides).
+INDEXER_QUERY_CHUNK = int(os.environ.get("MILES_K31_INDEXER_QUERY_CHUNK", "8192"))
+
+
+def chunked_indexer_topk(
+    index_q, index_k, weights, starts, ends, topk: int, topk_fn, chunk: int | None = None
+) -> torch.Tensor:
+    """Top-k key indices of the frozen DSA indexer, scored one block of ``chunk`` query rows at a time.
+
+    The indexer is frozen (its inputs are detached) and only the selected keys are used, so the
+    [rows, T_kv] fp32 score matrix never has to exist at once: the peak is chunk x T_kv x 4 B instead
+    of rows x T_kv x 4 B (128 GiB for 131k query rows over 262k keys). The indices are absolute key
+    positions and every row's range is its own (``starts`` / ``ends``), so the blocks concatenate to
+    exactly the single-call result. ``chunk`` defaults to ``INDEXER_QUERY_CHUNK``; the same
+    query-block pattern as DeepSeek-V4.1's indexer (``deepseek_v4_1/ops/indexer.py``)."""
+    chunk = INDEXER_QUERY_CHUNK if chunk is None else int(chunk)
+    rows = index_q.shape[0]
+    if chunk <= 0 or rows <= chunk:
+        return lighting_indexer(index_q, index_k, weights, starts, ends, topk, topk_fn=topk_fn)[1]
+    return torch.cat(
+        [
+            lighting_indexer(
+                index_q[r : r + chunk],
+                index_k,
+                weights[r : r + chunk],
+                starts[r : r + chunk],
+                ends[r : r + chunk],
+                topk,
+                topk_fn=topk_fn,
+            )[1]
+            for r in range(0, rows, chunk)
+        ]
+    )
 
 
 class KimiK31Indexer(nn.Module):
@@ -76,17 +113,12 @@ class KimiK31DSAAttention(KimiK3Attention):
             gather_order, positions = cp_layout
             index_k = gather_from_sequence_parallel_region(index_k, group=self.cp_group).index_select(0, gather_order)
         starts, ends = causal_ranges(cu_seqlens, positions)
+        starts, ends = starts.to(torch.int32), ends.to(torch.int32)
         topk_fn = indexer_replay_manager.get_topk_fn(self.topk_fn, return_probs=False)
-        _, topk_indices = lighting_indexer(
-            index_q,
-            index_k,
-            weights,
-            starts.to(torch.int32),
-            ends.to(torch.int32),
-            self.index_topk,
-            topk_fn=topk_fn,
-        )
-        return topk_indices
+        if indexer_replay_manager.enabled:
+            # replay hands back one top-k stream per layer call: keep a single call
+            return lighting_indexer(index_q, index_k, weights, starts, ends, self.index_topk, topk_fn=topk_fn)[1]
+        return chunked_indexer_topk(index_q, index_k, weights, starts, ends, self.index_topk, topk_fn)
 
     def _forward_mla(self, hidden_states: torch.Tensor, packed_seq_params: PackedSeqParams | None) -> torch.Tensor:
         assert (
