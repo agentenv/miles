@@ -1,5 +1,8 @@
+import os
+
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 
 def situ_and_mul(
@@ -32,18 +35,43 @@ class KimiRMSNorm(nn.Module):
         return self.weight * normalized.to(input_dtype)
 
 
+# Tokens per block of the attention residual aggregate; each token mixes only its own rows, so
+# blocks are exact. The fp32 rows of one call are [T, blocks + 1, H] (7.9 GiB at 32k tokens and
+# 9 rows); scoring them in checkpointed token blocks bounds those temporaries. <= 0 disables.
+ATTN_RES_TOKEN_CHUNK = int(os.environ.get("MILES_K3_ATTN_RES_TOKEN_CHUNK", "4096"))
+
+
+def _attn_res_mix(
+    prefix_sum: torch.Tensor,
+    block_residual: torch.Tensor,
+    score_weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    rows = torch.cat((block_residual, prefix_sum.unsqueeze(-2)), dim=-2)
+    rows_float = rows.float()
+    normalized = rows_float * torch.rsqrt(rows_float.square().mean(dim=-1, keepdim=True) + eps)
+    scores = (normalized * score_weight).sum(dim=-1)
+    probabilities = torch.softmax(scores, dim=-1)
+    return (probabilities.unsqueeze(-1) * rows_float).sum(dim=-2).to(rows.dtype)
+
+
 def attn_res_aggregate(
     prefix_sum: torch.Tensor,
     block_residual: torch.Tensor,
     score_proj: nn.Linear,
     score_norm: KimiRMSNorm,
     output_norm: nn.Module,
+    chunk: int | None = None,
 ) -> torch.Tensor:
-    rows = torch.cat((block_residual, prefix_sum.unsqueeze(-2)), dim=-2)
-    rows_float = rows.float()
-    normalized = rows_float * torch.rsqrt(rows_float.square().mean(dim=-1, keepdim=True) + score_norm.eps)
+    chunk = ATTN_RES_TOKEN_CHUNK if chunk is None else int(chunk)
     score_weight = score_norm.weight.float() * score_proj.weight.squeeze(0).float()
-    scores = (normalized * score_weight).sum(dim=-1)
-    probabilities = torch.softmax(scores, dim=-1)
-    mixed = (probabilities.unsqueeze(-1) * rows_float).sum(dim=-2).to(rows.dtype)
+    tokens = prefix_sum.shape[0]
+    if chunk <= 0 or tokens <= chunk:
+        mixed = _attn_res_mix(prefix_sum, block_residual, score_weight, score_norm.eps)
+    else:
+        mixed = torch.cat([
+            checkpoint(_attn_res_mix, prefix_sum[start:start + chunk], block_residual[start:start + chunk],
+                       score_weight, score_norm.eps, use_reentrant=False)
+            for start in range(0, tokens, chunk)
+        ])
     return output_norm(mixed)
