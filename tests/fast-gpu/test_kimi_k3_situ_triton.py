@@ -32,7 +32,7 @@ def _inputs(rows, scale, seed=0):
 
 
 def _bits(t):
-    return t.contiguous().view(torch.int16)
+    return t.contiguous().view(torch.int16 if t.element_size() == 2 else torch.int32)
 
 
 @pytest.mark.parametrize("scale", [0.1, 3.0, 40.0])
@@ -42,8 +42,21 @@ def test_matches_eager_bitwise(scale):
     ye, yf = _eager(xe), fused_situ_and_mul(xf)
     ye.backward(dy)
     yf.backward(dy)
-    assert torch.equal(_bits(yf), _bits(ye))
-    assert torch.equal(_bits(xf.grad), _bits(xe.grad))
+    assert not (msg := _where_differ("y", yf, ye, x[:, :N], x[:, N:])), msg
+    assert not (msg := _where_differ("dx", xf.grad, xe.grad, x, x)), msg
+
+
+def _where_differ(name, got, want, gate, linear) -> str:
+    """'' if bitwise equal, else the count and the input range of the differing elements."""
+    differ = _bits(got) != _bits(want)
+    if not differ.any():
+        return ""
+    g, lin, w = gate.float()[differ], linear.float()[differ], want.float()[differ]
+    return (
+        f"{name}: {int(differ.sum())}/{differ.numel()} differ; gate in [{g.min().item():.4g}, {g.max().item():.4g}], "
+        f"linear |.| in [{lin.abs().min().item():.4g}, {lin.abs().max().item():.4g}], eager |{name}| max "
+        f"{w.abs().max().item():.4g}"
+    )
 
 
 @pytest.mark.parametrize("probs_shape", ["rows", "rows1"])
@@ -63,6 +76,58 @@ def test_with_probs_matches_megatron_bitwise(probs_shape):
     assert torch.equal(_bits(xf.grad), _bits(xe.grad))
     assert pf.grad.shape == pe.grad.shape
     assert torch.equal(pf.grad, pe.grad)
+
+
+def _bf16_values(device="cuda"):
+    """Every BF16 value in 2**-40 <= |v| <= 40, and 0: no fp32 intermediate of the chain gets subnormal (where
+    Triton's denormal handling is not asserted to match ATen; it only touches results below 1e-38)."""
+    bits = torch.arange(65536, dtype=torch.int32, device=device)
+    v = torch.where(bits >= 32768, bits - 65536, bits).to(torch.int16).view(torch.bfloat16)
+    a = v.float().abs()
+    return v[(a <= 40) & ((a >= 2.0**-40) | (a == 0))]
+
+
+def _same(a, b):
+    """Bitwise equal, NaN only where the other is NaN too (payloads may differ)."""
+    nan = torch.isnan(a.float())
+    return torch.equal(nan, torch.isnan(b.float())) and torch.equal(_bits(a)[~nan], _bits(b)[~nan])
+
+
+@pytest.mark.parametrize("with_probs", [False, True])
+def test_every_bf16_input_matches_eager_bitwise(with_probs):
+    # every gate value meets every cancellation point of d(gate) (e.g. g = -1.21875, where its tanh and
+    # sigmoid terms cancel and any contracted multiply-add shows up as a BF16 ulp); Megatron / TE imported
+    # as in the trainer
+    import megatron.core.transformer.moe.experts  # noqa: F401
+    import transformer_engine.pytorch  # noqa: F401
+
+    values = _bf16_values()
+    torch.manual_seed(3)
+    reps = 8
+    gate = values.repeat(reps)
+    linear = values[torch.randperm(values.numel(), device="cuda")].repeat(reps)
+    pad = (-gate.numel()) % N
+    gate = torch.cat([gate, gate[:pad]]).view(-1, N)
+    linear = torch.cat([linear, linear[:pad]]).view(-1, N)
+    x = torch.cat([gate, linear], dim=1).contiguous()
+    rows = x.shape[0]
+    dy = torch.randn(rows, N, device="cuda").to(torch.bfloat16)
+    probs = torch.rand(rows, device="cuda") if with_probs else None
+    xe, xf = x.clone().requires_grad_(), x.clone().requires_grad_()
+    if with_probs:
+        pe, pf = probs.clone().requires_grad_(), probs.clone().requires_grad_()
+        ye = _eager(xe)
+        ye = (ye * pe.reshape(-1, 1)).to(ye.dtype)
+        yf = fused_situ_and_mul(xf, pf)
+    else:
+        ye, yf = _eager(xe), fused_situ_and_mul(xf)
+    ye.backward(dy)
+    yf.backward(dy)
+    assert _same(yf, ye)
+    differ = (_bits(xf.grad) != _bits(xe.grad)) & ~torch.isnan(xe.grad.float())
+    assert _same(xf.grad, xe.grad), f"{int(differ.sum())} dx differ, gate values {x[differ][:8].float().tolist()}"
+    if with_probs:
+        assert _same(pf.grad, pe.grad)
 
 
 def test_switch_routes_and_keeps_shape(monkeypatch):

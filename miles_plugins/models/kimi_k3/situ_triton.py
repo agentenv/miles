@@ -14,8 +14,11 @@ The kernels below replay that chain op for op so the forward is meant to be bit-
   /25 -> *fp32(1/25);
 * sigmoid is ``1 / (1 + exp(-x))`` with an IEEE division (div_rn);
 * tanh / exp are libdevice (__nv_tanhf / __nv_expf), the same CUDA math library ATen calls;
-* the kernels launch with ``enable_fp_fusion=False`` so no multiply-add is contracted unless asked
-  (``TANH_BWD_FMA`` reproduces ATen's tanh_backward ``a * (1 - b*b)`` if nvcc contracted it to an FMA).
+* every fp32 multiply / add / subtract is explicit PTX ``mul/add/sub.rn.f32`` (no ``.ftz``), which no
+  compiler pass contracts and which keeps subnormals as ATen does: ``enable_fp_fusion=False`` alone was not honored
+  in every process (inside a Megatron/TE trainer process ``d_s * (1 - s) * s + d_g1 / 4`` came out fused,
+  one BF16 ulp off where the two terms cancel, g = -1.21875); the only FMA is ATen's own, tanh_backward's
+  ``a * (1 - b*b)`` as nvcc contracts it (``fma_rn(-b, b, 1)``; the plain form differs on B300).
 The backward reproduces autograd's per-op gradients (MulBackward, TanhBackward, SigmoidBackward,
 DivBackward with a scalar, ToCopyBackward) and their dtype casts; d(probs) is reduced by the same torch
 ``sum_to_size`` autograd uses, so it can be bit-identical too.
@@ -56,6 +59,18 @@ if os.environ.get("TRITON_INTERPRET") == "1":  # CPU logic check only: libdevice
     def _fma(a, b, c):
         return a * b + c
 
+    @triton.jit
+    def _mul(a, b):
+        return a * b
+
+    @triton.jit
+    def _add(a, b):
+        return a + b
+
+    @triton.jit
+    def _sub(a, b):
+        return a - b
+
 else:
 
     @triton.jit
@@ -70,9 +85,32 @@ else:
     def _div_rn(a, b):
         return tl.math.div_rn(a, b)
 
+    # PTX with an explicit rounding modifier is never contracted, and without .ftz keeps subnormals like ATen
+    # (libdevice's *_rn flush them: Triton links libdevice with __CUDA_FTZ=1)
     @triton.jit
     def _fma(a, b, c):
-        return tl.math.fma(a, b, c)
+        return tl.inline_asm_elementwise(
+            "fma.rn.f32 $0, $1, $2, $3;", "=f,f,f,f", [a, b, c], dtype=tl.float32, is_pure=True, pack=1
+        )
+
+    @triton.jit
+    def _mul(a, b):
+        return tl.inline_asm_elementwise(
+            "mul.rn.f32 $0, $1, $2;", "=f,f,f", [a, b], dtype=tl.float32, is_pure=True, pack=1
+        )
+
+    @triton.jit
+    def _add(a, b):
+        return tl.inline_asm_elementwise(
+            "add.rn.f32 $0, $1, $2;", "=f,f,f", [a, b], dtype=tl.float32, is_pure=True, pack=1
+        )
+
+    @triton.jit
+    def _sub(a, b):
+        return tl.inline_asm_elementwise(
+            "sub.rn.f32 $0, $1, $2;", "=f,f,f", [a, b], dtype=tl.float32, is_pure=True, pack=1
+        )
+
 
 BETA = 4.0
 LINEAR_BETA = 25.0
@@ -82,9 +120,17 @@ INV_LINEAR_BETA = float(np.float32(1.0) / np.float32(LINEAR_BETA))  # fp32(1/25)
 
 @triton.jit
 def _situ_fwd_kernel(
-    x_ptr, p_ptr, out_ptr, total, N: tl.constexpr,
-    BETA: tl.constexpr, INV_BETA: tl.constexpr, LBETA: tl.constexpr, INV_LBETA: tl.constexpr,
-    HAS_P: tl.constexpr, BLOCK: tl.constexpr,
+    x_ptr,
+    p_ptr,
+    out_ptr,
+    total,
+    N: tl.constexpr,
+    BETA: tl.constexpr,
+    INV_BETA: tl.constexpr,
+    LBETA: tl.constexpr,
+    INV_LBETA: tl.constexpr,
+    HAS_P: tl.constexpr,
+    BLOCK: tl.constexpr,
 ):
     pid = tl.program_id(0).to(tl.int64)
     offs = pid * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
@@ -94,24 +140,41 @@ def _situ_fwd_kernel(
     base = row * (2 * N) + col
     g = tl.load(x_ptr + base, mask=mask, other=0.0).to(tl.float32)
     lin = tl.load(x_ptr + base + N, mask=mask, other=0.0).to(tl.float32)
-    t1 = _tanh(g * INV_BETA)
-    a = t1 * BETA
-    s = _div_rn(1.0, 1.0 + _exp(-g))
-    go = a * s
-    t2 = _tanh(lin * INV_LBETA)
-    lo = t2 * LBETA
-    y = (go * lo).to(tl.bfloat16)
+    one = tl.full([BLOCK], 1.0, tl.float32)
+    c_beta = tl.full([BLOCK], BETA, tl.float32)
+    c_inv_beta = tl.full([BLOCK], INV_BETA, tl.float32)
+    c_lbeta = tl.full([BLOCK], LBETA, tl.float32)
+    c_inv_lbeta = tl.full([BLOCK], INV_LBETA, tl.float32)
+    t1 = _tanh(_mul(g, c_inv_beta))
+    a = _mul(t1, c_beta)
+    s = _div_rn(one, _add(one, _exp(-g)))
+    go = _mul(a, s)
+    t2 = _tanh(_mul(lin, c_inv_lbeta))
+    lo = _mul(t2, c_lbeta)
+    y = _mul(go, lo).to(tl.bfloat16)
     if HAS_P:
         p = tl.load(p_ptr + row, mask=mask, other=0.0).to(tl.float32)
-        y = (y.to(tl.float32) * p).to(tl.bfloat16)
+        y = _mul(y.to(tl.float32), p).to(tl.bfloat16)
     tl.store(out_ptr + offs, y, mask=mask)
 
 
 @triton.jit
 def _situ_bwd_kernel(
-    x_ptr, p_ptr, dy_ptr, dx_ptr, y_ptr, total, N: tl.constexpr,
-    BETA: tl.constexpr, INV_BETA: tl.constexpr, LBETA: tl.constexpr, INV_LBETA: tl.constexpr,
-    HAS_P: tl.constexpr, WRITE_Y: tl.constexpr, TANH_BWD_FMA: tl.constexpr, BLOCK: tl.constexpr,
+    x_ptr,
+    p_ptr,
+    dy_ptr,
+    dx_ptr,
+    y_ptr,
+    total,
+    N: tl.constexpr,
+    BETA: tl.constexpr,
+    INV_BETA: tl.constexpr,
+    LBETA: tl.constexpr,
+    INV_LBETA: tl.constexpr,
+    HAS_P: tl.constexpr,
+    WRITE_Y: tl.constexpr,
+    TANH_BWD_FMA: tl.constexpr,
+    BLOCK: tl.constexpr,
 ):
     pid = tl.program_id(0).to(tl.int64)
     offs = pid * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
@@ -121,44 +184,49 @@ def _situ_bwd_kernel(
     base = row * (2 * N) + col
     g = tl.load(x_ptr + base, mask=mask, other=0.0).to(tl.float32)
     lin = tl.load(x_ptr + base + N, mask=mask, other=0.0).to(tl.float32)
+    one = tl.full([BLOCK], 1.0, tl.float32)
+    c_beta = tl.full([BLOCK], BETA, tl.float32)
+    c_inv_beta = tl.full([BLOCK], INV_BETA, tl.float32)
+    c_lbeta = tl.full([BLOCK], LBETA, tl.float32)
+    c_inv_lbeta = tl.full([BLOCK], INV_LBETA, tl.float32)
     dy = tl.load(dy_ptr + offs, mask=mask, other=0.0).to(tl.float32)
     if HAS_P:
         p = tl.load(p_ptr + row, mask=mask, other=0.0).to(tl.float32)
         # MulBackward0 grad_self = grad * probs (fp32), cast to the bf16 input dtype; ToCopyBackward -> fp32
-        gy = (dy * p).to(tl.bfloat16).to(tl.float32)
+        gy = _mul(dy, p).to(tl.bfloat16).to(tl.float32)
     else:
         gy = dy
-    t1 = _tanh(g * INV_BETA)
-    a = t1 * BETA
-    s = _div_rn(1.0, 1.0 + _exp(-g))
-    go = a * s
-    t2 = _tanh(lin * INV_LBETA)
-    lo = t2 * LBETA
-    d_go = gy * lo
-    d_lo = gy * go
-    d_t2 = d_lo * LBETA
+    t1 = _tanh(_mul(g, c_inv_beta))
+    a = _mul(t1, c_beta)
+    s = _div_rn(one, _add(one, _exp(-g)))
+    go = _mul(a, s)
+    t2 = _tanh(_mul(lin, c_inv_lbeta))
+    lo = _mul(t2, c_lbeta)
+    d_go = _mul(gy, lo)
+    d_lo = _mul(gy, go)
+    d_t2 = _mul(d_lo, c_lbeta)
     if TANH_BWD_FMA:
-        d_l1 = d_t2 * _fma(-t2, t2, 1.0)
+        d_l1 = _mul(d_t2, _fma(-t2, t2, one))
     else:
-        d_l1 = d_t2 * (1.0 - t2 * t2)
-    d_lin = d_l1 * INV_LBETA
-    d_a = d_go * s
-    d_s = d_go * a
-    d_g_sig = d_s * (1.0 - s) * s
-    d_t1 = d_a * BETA
+        d_l1 = _mul(d_t2, _sub(one, _mul(t2, t2)))
+    d_lin = _mul(d_l1, c_inv_lbeta)
+    d_a = _mul(d_go, s)
+    d_s = _mul(d_go, a)
+    d_g_sig = _mul(_mul(d_s, _sub(one, s)), s)  # sigmoid_backward a * (1 - b) * b
+    d_t1 = _mul(d_a, c_beta)
     if TANH_BWD_FMA:
-        d_g1 = d_t1 * _fma(-t1, t1, 1.0)
+        d_g1 = _mul(d_t1, _fma(-t1, t1, one))
     else:
-        d_g1 = d_t1 * (1.0 - t1 * t1)
-    d_g = d_g1 * INV_BETA + d_g_sig
+        d_g1 = _mul(d_t1, _sub(one, _mul(t1, t1)))
+    d_g = _add(_mul(d_g1, c_inv_beta), d_g_sig)
     tl.store(dx_ptr + base, d_g.to(tl.bfloat16), mask=mask)
     tl.store(dx_ptr + base + N, d_lin.to(tl.bfloat16), mask=mask)
     if WRITE_Y:
-        tl.store(y_ptr + offs, (go * lo).to(tl.bfloat16), mask=mask)
+        tl.store(y_ptr + offs, _mul(go, lo).to(tl.bfloat16), mask=mask)
 
 
 _BLOCK = 1024
-TANH_BWD_FMA = True  # ATen tanh_backward a * (1 - b*b) as nvcc contracts it
+TANH_BWD_FMA = True  # ATen tanh_backward a * (1 - b*b) as nvcc contracts it (B300 bench: fma 0 / plain 13682 dx diffs)
 
 
 def _launch_fwd(x, probs):
@@ -170,9 +238,19 @@ def _launch_fwd(x, probs):
         return out
     grid = (triton.cdiv(total, _BLOCK),)
     _situ_fwd_kernel[grid](
-        x, probs if probs is not None else x, out, total, n,
-        BETA, INV_BETA, LINEAR_BETA, INV_LINEAR_BETA, probs is not None, _BLOCK,
-        num_warps=4, enable_fp_fusion=False,
+        x,
+        probs if probs is not None else x,
+        out,
+        total,
+        n,
+        BETA,
+        INV_BETA,
+        LINEAR_BETA,
+        INV_LINEAR_BETA,
+        probs is not None,
+        _BLOCK,
+        num_warps=4,
+        enable_fp_fusion=False,
     )
     return out
 
@@ -200,10 +278,23 @@ class _FusedSitu(torch.autograd.Function):
         if total:
             grid = (triton.cdiv(total, _BLOCK),)
             _situ_bwd_kernel[grid](
-                x, probs if probs is not None else x, dy, dx, y, total, n,
-                BETA, INV_BETA, LINEAR_BETA, INV_LINEAR_BETA,
-                probs is not None, need_dp, TANH_BWD_FMA, _BLOCK,
-                num_warps=4, enable_fp_fusion=False,
+                x,
+                probs if probs is not None else x,
+                dy,
+                dx,
+                y,
+                total,
+                n,
+                BETA,
+                INV_BETA,
+                LINEAR_BETA,
+                INV_LINEAR_BETA,
+                probs is not None,
+                need_dp,
+                TANH_BWD_FMA,
+                _BLOCK,
+                num_warps=4,
+                enable_fp_fusion=False,
             )
         dp = None
         if need_dp:
