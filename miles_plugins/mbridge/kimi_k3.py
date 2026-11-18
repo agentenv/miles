@@ -8,6 +8,7 @@ from mbridge.core.safetensor_io import SafeTensorIO
 from mbridge.models import DeepseekV3Bridge
 from miles.utils.mxfp4 import MXFP4_GROUP_SIZE, dequantize_mxfp4_rows, pack_mxfp4_rows
 from miles_plugins.mbridge.linear_attn import LinearAttentionBridgeMixin
+from miles_plugins.models.kimi_k3.kda_layout import kimi_k3_kda_layers
 from miles_plugins.models.kimi_k3.model import build_kimi_k3_spec
 from miles_plugins.models.kimi_k3.ops import situ_and_mul
 from miles_plugins.models.kimi_k3.partial_experts import FROZEN_HALF, TRAINABLE_HALF, is_split_expert_param_name
@@ -203,7 +204,7 @@ class KimiK3Bridge(LinearAttentionBridgeMixin, DeepseekV3Bridge):
             moe_layer_freq=moe_layer_freq,
             disable_bf16_reduced_precision_matmul=True,
         )
-        config.kimi_kda_layers = tuple(hf_config.linear_attn_config["kda_layers"])
+        config.kimi_kda_layers = kimi_k3_kda_layers(hf_config, config.num_layers)
         config.kimi_linear_num_heads = hf_config.linear_attn_config["num_heads"]
         config.kimi_linear_head_dim = hf_config.linear_attn_config["head_dim"]
         config.kimi_linear_conv_kernel_size = hf_config.linear_attn_config["short_conv_kernel_size"]

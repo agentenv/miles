@@ -5,8 +5,10 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 
+from miles.utils.hf_utils.config import load_hf_config
 from miles.utils.lora.utils import is_lora_enabled
 
+from .kda_layout import kimi_k3_kda_layers
 from .layers import KimiK3Attention, KimiK3KDAAttention, KimiK3TransformerLayer
 from .mxfp4_experts import (
     MXFP4ColumnParallelGroupedLinear,
@@ -17,18 +19,13 @@ from .ops import situ_and_mul
 from .permute import load_slot_layout
 from .split_moe import partial_experts_spec
 
-KIMI_K3_KDA_LAYERS = tuple(
-    layer_number for layer_number in range(1, 94) if layer_number % 4 != 0 and layer_number != 93
-)
 
-
-def configure_kimi_k3(config) -> None:
+def configure_kimi_k3(config, kda_layers: tuple[int, ...]) -> None:
+    """``kda_layers``: ``kimi_k3_kda_layers`` of the checkpoint's text config."""
     assert config.num_layers <= 93
     assert config.num_attention_heads == 96
     assert config.moe_latent_size == 3584
-    config.kimi_kda_layers = tuple(
-        layer_number for layer_number in KIMI_K3_KDA_LAYERS if layer_number <= config.num_layers
-    )
+    config.kimi_kda_layers = tuple(kda_layers)
     config.kimi_linear_num_heads = 96
     config.kimi_linear_head_dim = 128
     config.kimi_linear_conv_kernel_size = 4
@@ -103,9 +100,11 @@ def frozen_experts_are_mxfp4(args) -> bool:
     return mxfp4
 
 
-def get_kimi_k3_spec(args, config, vp_stage, mla_attention=KimiK3Attention):
+def get_kimi_k3_spec(args, config, vp_stage, mla_attention=KimiK3Attention, text_config=None):
     _check_cp_layout(args)
-    configure_kimi_k3(config)
+    if text_config is None:
+        text_config = load_hf_config(args.hf_checkpoint).text_config
+    configure_kimi_k3(config, kimi_k3_kda_layers(text_config, config.num_layers))
     mxfp4 = frozen_experts_are_mxfp4(args)
     num_local_trainable = None
     if args.partial_experts_selection is not None:
