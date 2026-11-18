@@ -41,7 +41,12 @@ def _chunked(q, k, w, ks, ke, topk, chunk):
     # mirrors model.chunked_indexer_topk
     if chunk <= 0 or q.shape[0] <= chunk:
         return _indexer(q, k, w, ks, ke, topk)
-    return torch.cat([_indexer(q[r : r + chunk], k, w[r : r + chunk], ks[r : r + chunk], ke[r : r + chunk], topk) for r in range(0, q.shape[0], chunk)])
+    return torch.cat(
+        [
+            _indexer(q[r : r + chunk], k, w[r : r + chunk], ks[r : r + chunk], ke[r : r + chunk], topk)
+            for r in range(0, q.shape[0], chunk)
+        ]
+    )
 
 
 def _inputs(cu, positions=None, seed=0):
@@ -60,7 +65,10 @@ def _zigzag_positions(cu, cp_rank, cp_size):
     out = []
     for a, b in zip(cu[:-1].tolist(), cu[1:].tolist()):
         c = (b - a) // (2 * cp_size)
-        out += [torch.arange(a + cp_rank * c, a + (cp_rank + 1) * c), torch.arange(b - (cp_rank + 1) * c, b - cp_rank * c)]
+        out += [
+            torch.arange(a + cp_rank * c, a + (cp_rank + 1) * c),
+            torch.arange(b - (cp_rank + 1) * c, b - cp_rank * c),
+        ]
     return torch.cat(out)
 
 
@@ -82,7 +90,11 @@ def _split_by_hand(q, k, w, ks, ke, topk, tp, chunk):
     parts = []
     for r in range(tp):
         m = split.tp_rows(rows, r, tp)
-        part = _chunked(q[m], k, w[m], ks[m], ke[m], topk, chunk) if q[m].shape[0] else torch.empty((0, topk), dtype=torch.int32)
+        part = (
+            _chunked(q[m], k, w[m], ks[m], ke[m], topk, chunk)
+            if q[m].shape[0]
+            else torch.empty((0, topk), dtype=torch.int32)
+        )
         parts.append(split.pad_tp_part(part, rows, tp))
     return split.merge_tp_parts(torch.cat(parts), rows, tp)
 
@@ -118,7 +130,9 @@ def _worker(rank, world, port, results):
         for name in CASES:
             q, k, w, ks, ke = _case(name)
             for chunk in [0, 5]:
-                got = split.tp_split_topk(lambda q_, w_, s_, e_: _chunked(q_, k, w_, s_, e_, 16, chunk), q, w, ks, ke, 16, dist.group.WORLD)
+                got = split.tp_split_topk(
+                    lambda q_, w_, s_, e_: _chunked(q_, k, w_, s_, e_, 16, chunk), q, w, ks, ke, 16, dist.group.WORLD
+                )
                 results[(rank, name, chunk)] = bool(torch.equal(got, _indexer(q, k, w, ks, ke, 16)))
     finally:
         dist.destroy_process_group()
@@ -132,3 +146,31 @@ def test_gloo_all_gather_matches_one_call(tp):
     results = mp.Manager().dict()
     mp.start_processes(_worker, args=(tp, port, results), nprocs=tp, start_method="spawn")
     assert len(results) == tp * len(CASES) * 2 and all(results.values()), dict(results)
+
+
+def _switch_worker(rank, world, port, env, results):
+    os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port), MILES_K31_INDEXER_TP_SPLIT=env[rank])
+    dist.init_process_group("gloo", rank=rank, world_size=world)
+    try:
+        split._SPLIT_ON = None
+        try:
+            results[rank] = split.indexer_tp_split_on(dist.group.WORLD, torch.device("cpu"))
+        except RuntimeError as e:
+            results[rank] = "differs" if "differs across its TP group" in str(e) else repr(e)
+        results[(rank, "cached")] = split._SPLIT_ON
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize(
+    "env,expected",
+    [("11", [True, True]), ("00", [False, False]), ("10", ["differs", "differs"]), ("1101", ["differs"] * 4)],
+)
+def test_switch_is_checked_across_the_tp_group(env, expected):
+    # a rank whose switch differs would skip the all-gather the others wait on: every rank raises instead
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    results = mp.Manager().dict()
+    mp.start_processes(_switch_worker, args=(len(env), port, env, results), nprocs=len(env), start_method="spawn")
+    assert [results[r] for r in range(len(env))] == expected, dict(results)
