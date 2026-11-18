@@ -439,8 +439,14 @@ class MegatronTrainRayActor(TrainRayActor):
             if reset_optim:
                 assert not self.args.backend.fp16
                 # precision-aware is only safe with --optimizer-cpu-offload, whose HybridDeviceOptimizer keeps
-                # standalone FP32 masters that reload_model_params refreshes from the loaded weights
-                assert not self.args.backend.use_precision_aware_optimizer or self.args.backend.optimizer_cpu_offload
+                # standalone FP32 masters that reload_model_params refreshes from the loaded weights, or with
+                # --chunked-optimizer-state-offload, whose reset leaves the state empty: TE FusedAdam builds the
+                # masters on the first step from the loaded weights
+                assert (
+                    not self.args.backend.use_precision_aware_optimizer
+                    or self.args.backend.optimizer_cpu_offload
+                    or self.args.backend.chunked_optimizer_state_offload
+                )
                 assert not self.args.backend.offload_optimizer_states
             if ckpt_load_config.finetune or ckpt_load_config.no_load_rng:
                 self._post_init_random_state.restore()

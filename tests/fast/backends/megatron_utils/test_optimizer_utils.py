@@ -251,10 +251,14 @@ class TestWhatAResetRefusesToWalk:
                 optimizer, stream_optimizer_state_to_disk=False, chunked_optimizer_state_offload=False
             )
 
-    def test_a_chunked_offload_is_refused(self, monkeypatch):
-        """The offloader's cpu store keeps canonical moments this reset never reaches."""
+    def test_a_chunked_offload_that_has_stepped_is_refused(self, monkeypatch):
+        """Once a step ran, the offloader's cpu store keeps canonical moments this reset never reaches."""
+        member = _FakeChainedMember()
+        member._optimizer_state_offloader = SimpleNamespace(
+            _cpu_state={member.optimizer.param: {"exp_avg": torch.ones(2)}}, _cpu_master={}
+        )
         with pytest.raises(AssertionError, match="chunked-optimizer-state-offload"):
-            _reset(monkeypatch, _FakeChainedMember(), chunked_optimizer_state_offload=True)
+            _reset(monkeypatch, member, chunked_optimizer_state_offload=True)
 
     def test_an_optimizer_offloading_its_states_is_refused(self, monkeypatch):
         """The offloader would copy the old moments back over the reset from the buffer it keeps."""
@@ -339,3 +343,39 @@ class TestResettingACpuOffloadedOptimizer:
 
         with pytest.raises(AssertionError):
             optimizer_utils._check_optimizer_state_empty(optimizer)
+
+
+class TestResettingAChunkedOffloadBeforeItsFirstStep:
+    """A fresh launch from HF weights resets an optimizer whose chunked offloader has not stored anything yet."""
+
+    def _member(self):
+        calls = []
+        member = _FakeChainedMember(init_state_fn=lambda inner, config: calls.append(inner))
+        member._optimizer_state_offloader = SimpleNamespace(_cpu_state={}, _cpu_master={})
+        return member, calls
+
+    def test_the_state_is_cleared_and_left_for_the_first_step_to_build(self, monkeypatch):
+        """Built here, the whole state would sit on the GPU through the first forward/backward."""
+        member, calls = self._member()
+
+        _reset(monkeypatch, member, using_pytorch_optimizer=False, chunked_optimizer_state_offload=True)
+
+        assert member.optimizer.state == {} and calls == []
+        assert "step" not in member.optimizer.param_groups[0] and member.zero_grad_calls == [True]
+
+    def test_without_the_offload_the_fused_path_still_reinitializes(self, monkeypatch):
+        """The switch is the only thing that skips the initializer."""
+        member = _FakeChainedMember(init_state_fn=_zero_adam_state)
+
+        _reset(monkeypatch, member, using_pytorch_optimizer=False, chunked_optimizer_state_offload=False)
+
+        assert set(next(iter(member.optimizer.state.values()))) == {"exp_avg", "exp_avg_sq"}
+
+    def test_a_state_built_anyway_is_caught(self, monkeypatch):
+        """The self-check then expects nothing at all, so a moment that survived is still an error."""
+        optimizer_utils = pytest.importorskip("miles.backends.megatron_utils.optimizer_utils")
+        member, _ = self._member()
+        optimizer = _chained_optimizer(member)
+
+        with pytest.raises(AssertionError):
+            optimizer_utils._check_optimizer_state_empty(optimizer, lazy_state=True)
