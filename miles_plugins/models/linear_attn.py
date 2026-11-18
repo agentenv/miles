@@ -117,10 +117,20 @@ def gdn_recurrence(q, k, v, beta_logits, decay, A_log, dt_bias, *, backend, cu_s
     return out
 
 
+def kda_keeps_intermediates() -> bool:
+    """MILES_K31_KDA_SAVE_INTERMEDIATES=1 (default off): fla's ``disable_recompute``. chunk_kda's backward
+    otherwise recomputes the gate cumsum, w/u/qg/kg and the inter-chunk state h from its inputs; under
+    Megatron's full recompute the layer's forward has just run, so keeping them trades about one layer's
+    intermediates (~3.6 GiB at 131k tokens x 12 heads) for that second recompute."""
+    return os.environ.get("MILES_K31_KDA_SAVE_INTERMEDIATES", "0") == "1"
+
+
 def kda_recurrence(q, k, v, beta_logits, decay, A_log, dt_bias, *, gate_lower_bound, cu_seqlens, cp_context):
     """q/k ``[b, s, H, hk]``, v ``[b, s, H, hv]``, decay ``[b, s, H * hv]`` (the low-rank forget gate,
     gated inside the kernel) -> ``[b, s, H, hv]``."""
     boundaries = {"cp_context": cp_context} if cp_context is not None else {"cu_seqlens": cu_seqlens}
+    if kda_keeps_intermediates() and torch.is_grad_enabled():
+        boundaries["disable_recompute"] = True
     out, _ = kda_kernel()(
         q=q,
         k=k,
