@@ -26,6 +26,14 @@ weight: 122 GB per MoE layer and fetch at EP16, two fetches per layer under full
 ``MILES_K31_MXFP4_LUT_DEQUANT=1`` uses ``dequantize_mxfp4_lut`` instead, the same bits through a byte table at
 about 9 B per weight.
 
+``MILES_K31_MXFP4_BATCHED_DEQUANT=1`` dequantizes all the experts of one fetch together
+(``dequantize_mxfp4_rows_batched``: stacked into chunks of ``MILES_K31_MXFP4_BATCHED_DEQUANT_CHUNK`` weights, default
+2**27) instead of one expert at a time, in the forward fetch and, with the redequant switch, in the backward unpack
+(the first unpacked expert of a forward dequantizes the whole group, the rest take their slices). Same bits. Why: the
+48 frozen local experts x 2 projections make 96 dequantizations per MoE layer and pass, 7 (LUT) to 19 (fp32) small
+kernels each, and the a1d trace shows the host launching them as the bottleneck: ~0.2-0.66 ms of CPU per expert
+against tens of microseconds of GPU, 12 ms of GPU idle per MoE layer and pass (24 per layer and microbatch).
+
 Default off: the module forward is TE's, unchanged. Torch-only (plus ``miles.utils.mxfp4``) so the CPU tests load
 it without Megatron or TE.
 """
@@ -39,11 +47,19 @@ from collections.abc import Iterator, Sequence
 
 import torch
 
-from miles.utils.mxfp4 import MXFP4_GROUP_SIZE, dequantize_mxfp4_rows
+from miles.utils.mxfp4 import (
+    BATCHED_DEQUANT_CHUNK_ELEMENTS,
+    MXFP4_GROUP_SIZE,
+    dequantize_mxfp4_rows,
+    dequantize_mxfp4_rows_batched,
+)
 
 REDEQUANT_ENV = "MILES_K31_MXFP4_REDEQUANT_BACKWARD"
 # dequantize through the byte table (miles.utils.mxfp4.dequantize_mxfp4_lut): the same bits, about 1/8 of the traffic
 LUT_DEQUANT_ENV = "MILES_K31_MXFP4_LUT_DEQUANT"
+# dequantize all the experts of a fetch in a few stacked chunks (dequantize_mxfp4_rows_batched): the same bits
+BATCHED_DEQUANT_ENV = "MILES_K31_MXFP4_BATCHED_DEQUANT"
+BATCHED_DEQUANT_CHUNK_ENV = "MILES_K31_MXFP4_BATCHED_DEQUANT_CHUNK"
 
 logger = logging.getLogger(__name__)
 _reported = False
@@ -57,6 +73,39 @@ def lut_dequant_enabled() -> bool:
     return os.environ.get(LUT_DEQUANT_ENV, "0") == "1"
 
 
+def batched_dequant_enabled() -> bool:
+    return os.environ.get(BATCHED_DEQUANT_ENV, "0") == "1"
+
+
+def dequantize_expert_rows(rows: Sequence[torch.Tensor], group_size: int = MXFP4_GROUP_SIZE) -> list[torch.Tensor]:
+    """The exact BF16 weights of a grouped linear's packed experts, per the LUT and batched switches."""
+    lut = lut_dequant_enabled()
+    if batched_dequant_enabled():
+        chunk = int(os.environ.get(BATCHED_DEQUANT_CHUNK_ENV, BATCHED_DEQUANT_CHUNK_ELEMENTS))
+        return dequantize_mxfp4_rows_batched(list(rows), group_size, lut=lut, max_elements=chunk)
+    return [dequantize_mxfp4_rows(packed, group_size, lut=lut) for packed in rows]
+
+
+class _PackedGroup:
+    """The packed experts of one forward fetch: the first unpack in the backward dequantizes them all together."""
+
+    __slots__ = ("rows", "group_size", "_weights")
+
+    def __init__(self, rows: Sequence[torch.Tensor], group_size: int):
+        self.rows = list(rows)
+        self.group_size = group_size
+        self._weights: list[torch.Tensor | None] | None = None
+
+    def take(self, index: int) -> torch.Tensor:
+        if self._weights is None or self._weights[index] is None:
+            # first unpack (or a second read of the saved tensors): dequantize the whole group again
+            self._weights = dequantize_expert_rows(self.rows, self.group_size)
+        weight, self._weights[index] = self._weights[index], None
+        if all(w is None for w in self._weights):
+            self._weights = None
+        return weight
+
+
 def _key(tensor: torch.Tensor) -> tuple:
     # identity of a dequantized weight while its forward runs: a fresh allocation, so (address, geometry) is unique
     return (tensor.device, tensor.dtype, tensor.data_ptr(), tuple(tensor.shape), tuple(tensor.stride()))
@@ -65,20 +114,33 @@ def _key(tensor: torch.Tensor) -> tuple:
 class PackedWeightRef:
     """What the autograd graph holds instead of a dequantized expert: its packed parameter."""
 
-    __slots__ = ("rows", "version", "shape", "dtype", "group_size")
+    __slots__ = ("rows", "version", "shape", "dtype", "group_size", "group", "index")
 
-    def __init__(self, rows: torch.Tensor, shape: torch.Size, dtype: torch.dtype, group_size: int):
+    def __init__(
+        self,
+        rows: torch.Tensor,
+        shape: torch.Size,
+        dtype: torch.dtype,
+        group_size: int,
+        group: _PackedGroup | None = None,
+        index: int = 0,
+    ):
         self.rows = rows
         self.version = rows._version
         self.shape = shape
         self.dtype = dtype
         self.group_size = group_size
+        self.group = group
+        self.index = index
 
     def dequantize(self) -> torch.Tensor:
         assert self.rows._version == self.version, (
             "a frozen MXFP4 expert's packed bytes changed between its forward and its backward"
         )
-        weight = dequantize_mxfp4_rows(self.rows, self.group_size, lut=lut_dequant_enabled())
+        if self.group is not None:
+            weight = self.group.take(self.index)
+        else:
+            weight = dequantize_mxfp4_rows(self.rows, self.group_size, lut=lut_dequant_enabled())
         assert weight.shape == self.shape and weight.dtype == self.dtype, (weight.shape, self.shape, weight.dtype)
         return weight
 
@@ -88,23 +150,25 @@ class RedequantScope:
 
     def __init__(self, group_size: int = MXFP4_GROUP_SIZE):
         self.group_size = group_size
-        self._packed: dict[tuple, torch.Tensor] = {}
+        self._packed: dict[tuple, tuple[torch.Tensor, _PackedGroup | None, int]] = {}
         self.registered = 0
         self.packed = 0
 
     def register(self, weights: Sequence[torch.Tensor], rows: Sequence[torch.Tensor]) -> None:
         """``weights[i]`` was dequantized from ``rows[i]`` for this forward."""
         assert len(weights) == len(rows)
-        for weight, packed in zip(weights, rows, strict=True):
-            self._packed[_key(weight)] = packed
+        group = _PackedGroup(rows, self.group_size) if batched_dequant_enabled() and len(rows) > 1 else None
+        for index, (weight, packed) in enumerate(zip(weights, rows, strict=True)):
+            self._packed[_key(weight)] = (packed, group, index)
         self.registered += len(weights)
 
     def pack(self, tensor: torch.Tensor):
-        packed = self._packed.get(_key(tensor)) if isinstance(tensor, torch.Tensor) else None
-        if packed is None:
+        entry = self._packed.get(_key(tensor)) if isinstance(tensor, torch.Tensor) else None
+        if entry is None:
             return tensor
+        packed, group, index = entry
         self.packed += 1
-        return PackedWeightRef(packed, tensor.shape, tensor.dtype, self.group_size)
+        return PackedWeightRef(packed, tensor.shape, tensor.dtype, self.group_size, group, index)
 
     @staticmethod
     def unpack(saved):
@@ -163,8 +227,7 @@ class RedequantFrozenExperts:
 
     def _get_weight_tensors(self):
         rows = self._packed_rows()
-        lut = lut_dequant_enabled()
-        weights = [dequantize_mxfp4_rows(packed, MXFP4_GROUP_SIZE, lut=lut) for packed in rows]
+        weights = dequantize_expert_rows(rows, MXFP4_GROUP_SIZE)
         if self._redequant_scope is not None:
             self._redequant_scope.register(weights, rows)
         return weights
