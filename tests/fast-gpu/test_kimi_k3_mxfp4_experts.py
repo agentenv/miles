@@ -156,5 +156,16 @@ def test_redequant_in_backward_matches_and_frees_the_bf16_copies(config, linear,
     assert held_redo <= held_plain - bf16_copies
 
 
+def test_lut_dequant_matches_the_fp32_chain_on_cuda(config):
+    """MILES_K31_MXFP4_LUT_DEQUANT=1's byte table against the fp32 chain, every byte under every finite scale."""
+    from miles.utils.mxfp4 import dequantize_mxfp4_lut
+
+    packed = torch.arange(256, dtype=torch.uint8, device="cuda").repeat(255, 1)
+    scale = torch.arange(255, dtype=torch.uint8, device="cuda")[:, None].expand(255, 16).contiguous()
+    chain = dequantize_mxfp4(packed, scale, MXFP4_GROUP_SIZE)
+    lut = dequantize_mxfp4_lut(packed, scale, MXFP4_GROUP_SIZE)
+    assert torch.equal(chain.view(torch.int16), lut.view(torch.int16))
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

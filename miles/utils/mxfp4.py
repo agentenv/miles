@@ -81,6 +81,37 @@ def dequantize_mxfp4(
     return (dequantized * scales).reshape(unpacked.shape).to(torch.bfloat16).contiguous()
 
 
+def _byte_lut(device: torch.device) -> torch.Tensor:
+    """[256, 2] BF16: the low-nibble and high-nibble E2M1 values of every packed byte (sign bit 3 of a nibble)."""
+    magnitudes = torch.tensor(_E2M1_VALUES, dtype=torch.float32)
+    nibble = torch.arange(16)
+    values = torch.where(nibble >= 8, -magnitudes[nibble % 8], magnitudes[nibble % 8])  # code 8 is -0.0
+    byte = torch.arange(256)
+    return torch.stack([values[byte & 0x0F], values[byte >> 4]], dim=-1).to(torch.bfloat16).to(device)
+
+
+_BYTE_LUTS: dict[torch.device, torch.Tensor] = {}
+
+
+def dequantize_mxfp4_lut(weight_packed: torch.Tensor, weight_scale: torch.Tensor, group_size: int) -> torch.Tensor:
+    """``dequantize_mxfp4`` bit for bit, in BF16 through a 256-entry byte table instead of an fp32 chain.
+
+    Every E2M1 value and every E8M0 scale 2 ** (e - 127), e <= 254, is exact in BF16 and so is their product (at
+    most 3 significant bits, exponent within BF16's range), so the BF16 multiply rounds nothing and the result equals
+    the fp32 product cast to BF16. About 9 B of memory traffic per weight instead of about 77.
+    """
+    assert weight_packed.dtype == torch.uint8 and weight_scale.dtype == torch.uint8 and group_size > 0
+    lut = _BYTE_LUTS.get(weight_packed.device)
+    if lut is None:
+        lut = _BYTE_LUTS[weight_packed.device] = _byte_lut(weight_packed.device)
+    *lead, half = weight_packed.shape
+    values = lut.index_select(0, weight_packed.reshape(-1).to(torch.int32)).view(*lead, half * 2)
+    assert values.numel() % group_size == 0 and weight_scale.numel() == values.numel() // group_size
+    scales = torch.exp2(weight_scale.float() - 127.0).to(torch.bfloat16)
+    blocks = values.view(-1, group_size) * scales.reshape(-1, 1)
+    return blocks.view(*lead, half * 2)
+
+
 def mxfp4_row_width(in_features: int, group_size: int) -> int:
     """Bytes per output row of a packed row tensor: K/2 codes, then K/group_size scales."""
     assert in_features % group_size == 0 and in_features % 2 == 0, (in_features, group_size)
@@ -105,6 +136,7 @@ def split_mxfp4_rows(rows: torch.Tensor, group_size: int) -> tuple[torch.Tensor,
     return rows[:, : in_features // 2], rows[:, in_features // 2 :]
 
 
-def dequantize_mxfp4_rows(rows: torch.Tensor, group_size: int) -> torch.Tensor:
-    """The BF16 [N, K] weight a packed row tensor encodes; exact."""
-    return dequantize_mxfp4(*split_mxfp4_rows(rows, group_size), group_size)
+def dequantize_mxfp4_rows(rows: torch.Tensor, group_size: int, lut: bool = False) -> torch.Tensor:
+    """The BF16 [N, K] weight a packed row tensor encodes; exact. ``lut``: through ``dequantize_mxfp4_lut``."""
+    dequantize = dequantize_mxfp4_lut if lut else dequantize_mxfp4
+    return dequantize(*split_mxfp4_rows(rows, group_size), group_size)
