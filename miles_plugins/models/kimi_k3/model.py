@@ -19,6 +19,7 @@ from .mxfp4_experts import (
 from .ops import situ_and_mul
 from .permute import load_slot_layout
 from .split_moe import partial_experts_spec
+from .stage_recompute import apply_stage_recompute
 
 
 def configure_kimi_k3(config, kda_layers: tuple[int, ...]) -> None:
@@ -126,10 +127,13 @@ def get_kimi_k3_spec(args, config, vp_stage, mla_attention=KimiK3Attention, text
         # the mbridge loader reads the table from the model config; the converter and R3 read the active layout
         config.partial_experts_layout = layout
         num_local_trainable = layout.num_local_trainable
-    return build_kimi_k3_spec(
+    block_spec = build_kimi_k3_spec(
         config,
         vp_stage=vp_stage,
         mla_attention=mla_attention,
         mxfp4_experts=mxfp4,
         num_local_trainable_experts=num_local_trainable,
     )
+    # MILES_K31_RECOMPUTE_NUM_LAYERS_PER_STAGE: this stage's --recompute-method block layer count
+    apply_stage_recompute(config, stage_layers=len(block_spec.layer_specs))
+    return block_spec
