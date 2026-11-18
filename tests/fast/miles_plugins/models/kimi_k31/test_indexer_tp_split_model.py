@@ -12,6 +12,7 @@ import torch.multiprocessing as mp
 
 model = pytest.importorskip("miles_plugins.models.kimi_k31.model")
 tps = pytest.importorskip("miles_plugins.models.kimi_k31.indexer_tp_split")
+qs = pytest.importorskip("miles_plugins.models.kimi_k31.dsa_query_split")
 
 HIDDEN, Q_LORA, HEADS, HEAD_DIM, TOPK = 32, 24, 4, 16, 16
 ATTN_HEADS, ATTN_DIM = 8, 16
@@ -133,7 +134,31 @@ def _worker(rank, world, tp, port, results):
                 same_attention = torch.equal(mine, mine_whole) and torch.allclose(
                     torch.cat(parts, dim=1), reference, rtol=1e-5, atol=1e-6
                 )
-                results[(rank, name, chunk)] = (same_topk, same_on_ranks, same_attention, int((split >= 0).sum()))
+                # MILES_K31_DSA_QUERY_SPLIT: this rank's padded rows only (no all-gather), split on and off
+                own_split = attn._select_topk(q_lora, hidden, cu, layout, own_rows=True)
+                os.environ["MILES_K31_INDEXER_TP_SPLIT"] = "0"
+                tps._SPLIT_ON = None
+                own_whole = attn._select_topk(q_lora, hidden, cu, layout, own_rows=True)
+                own = tps.own_tp_part(whole, attn.tp_group)
+                same_own = torch.equal(own_split, own) and torch.equal(own_whole, own)
+                # and the query-split attention over those rows gives this rank's heads of the head-split one
+                qsplit = qs.query_split_attention(
+                    lambda q, k, i, sm_scale, d_v: _sparse_attention(q[0], k[0, :, 0], i[0, :, 0], sm_scale)[None],
+                    query[:, heads].contiguous(),
+                    kv_all,
+                    own_split,
+                    query.shape[0],
+                    attn.tp_group,
+                    sm_scale=ATTN_DIM**-0.5,
+                    d_v=ATTN_DIM,
+                )
+                same_own = same_own and torch.allclose(qsplit, mine_whole, rtol=1e-5, atol=1e-6)
+                results[(rank, name, chunk)] = (
+                    same_topk and same_own,
+                    same_on_ranks,
+                    same_attention,
+                    int((split >= 0).sum()),
+                )
     finally:
         dist.destroy_process_group()
 

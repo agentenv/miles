@@ -26,6 +26,7 @@ from miles_plugins.models.kimi_k3.layers import KimiK3Attention, _linear
 from miles_plugins.models.kimi_k3.kda_layout import kimi_k3_kda_layers
 from miles_plugins.models.kimi_k3.model import get_kimi_k3_spec
 from miles_plugins.models.kimi_k31.dsa_layout import checked_dsa_layers
+from miles_plugins.models.kimi_k31.dsa_query_split import query_split_attention, query_split_on
 from miles_plugins.models.kimi_k31.indexer_recompute_cache import (
     Phase,
     TopkRecomputeCache,
@@ -166,16 +167,21 @@ class KimiK31DSAAttention(KimiK3Attention):
         starts, ends = causal_ranges(cu_seqlens, positions)
         return index_q, index_k, weights, starts.to(torch.int32), ends.to(torch.int32)
 
-    def _select_topk(self, q_lora, hidden, cu_seqlens, cp_layout) -> torch.Tensor:
+    def _select_topk(self, q_lora, hidden, cu_seqlens, cp_layout, own_rows: bool = False) -> torch.Tensor:
+        """[T, topk] indices, or with ``own_rows`` only this TP rank's padded rows of them (``own_tp_part``), which
+        the TP-split indexer scores without the all-gather."""
         topk_fn = indexer_replay_manager.get_topk_fn(self.topk_fn, return_probs=False)
         if indexer_replay_manager.enabled:
             # replay hands back one top-k stream per layer call: keep a single call
             index_q, index_k, weights, starts, ends = self._indexer_inputs(q_lora, hidden, cu_seqlens, cp_layout)
-            return lighting_indexer(index_q, index_k, weights, starts, ends, self.index_topk, topk_fn=topk_fn)[1]
+            indices = lighting_indexer(index_q, index_k, weights, starts, ends, self.index_topk, topk_fn=topk_fn)[1]
+            return own_tp_part(indices, self.tp_group) if own_rows else indices
         phase = Phase.PLAIN
         if indexer_recompute_cache_on(self.tp_group, self.cp_group, q_lora.device):
             phase = recompute_phase(is_checkpointing(), torch.is_grad_enabled())
         if phase is Phase.PLAIN:
+            if own_rows:
+                return self._score_topk_part(q_lora, hidden, cu_seqlens, cp_layout, topk_fn)[0]
             return self._score_topk(q_lora, hidden, cu_seqlens, cp_layout, topk_fn)
         # a fully recomputed layer: the forward keeps this rank's rows of its top-k, the recompute reuses them
         part = self.topk_cache.take(cu_seqlens) if phase is Phase.REUSE else None
@@ -183,8 +189,10 @@ class KimiK31DSAAttention(KimiK3Attention):
             part, indices = self._score_topk_part(q_lora, hidden, cu_seqlens, cp_layout, topk_fn)
             if phase is Phase.STORE:
                 self.topk_cache.put(cu_seqlens, part)
-            if indices is not None:
+            if indices is not None and not own_rows:
                 return indices
+        if own_rows:
+            return part
         return gather_tp_parts(part, q_lora.shape[0], self.tp_group)
 
     def _score_topk(self, q_lora, hidden, cu_seqlens, cp_layout, topk_fn) -> torch.Tensor:
@@ -250,14 +258,30 @@ class KimiK31DSAAttention(KimiK3Attention):
         )
         query = torch.cat((torch.einsum("thd,hdm->thm", query_nope, w_kc), query_extra), dim=-1)
 
-        topk_indices = self._select_topk(q_lora, x, packed_seq_params.cu_seqlens_q, cp_layout)
-        latent = sparse_attention(
-            query.unsqueeze(0),
-            kv.unsqueeze(0).unsqueeze(2),
-            topk_indices.unsqueeze(1).unsqueeze(0),
-            self.q_head_dim**-0.5,
-            d_v=self.kv_lora_rank,
-        ).squeeze(0)
+        split_mode = query_split_on(self.tp_group, query.device)
+        if split_mode:
+            # MILES_K31_DSA_QUERY_SPLIT: all heads of 1/TP of the rows per rank instead of 12 heads padded to 64
+            part = self._select_topk(q_lora, x, packed_seq_params.cu_seqlens_q, cp_layout, own_rows=True)
+            latent = query_split_attention(
+                sparse_attention,
+                query,
+                kv,
+                part,
+                x.shape[0],
+                self.tp_group,
+                mode=split_mode,
+                sm_scale=self.q_head_dim**-0.5,
+                d_v=self.kv_lora_rank,
+            )
+        else:
+            topk_indices = self._select_topk(q_lora, x, packed_seq_params.cu_seqlens_q, cp_layout)
+            latent = sparse_attention(
+                query.unsqueeze(0),
+                kv.unsqueeze(0).unsqueeze(2),
+                topk_indices.unsqueeze(1).unsqueeze(0),
+                self.q_head_dim**-0.5,
+                d_v=self.kv_lora_rank,
+            ).squeeze(0)
         output = torch.einsum("thm,hdm->thd", latent, w_vc).reshape(x.shape[0], 1, -1)
         output = output * torch.sigmoid(_linear(self.g_proj, hidden_states))
         return _linear(self.o_proj, output)
