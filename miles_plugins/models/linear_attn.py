@@ -37,6 +37,7 @@ from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group, mak
 
 from miles.backends.megatron_utils.fp32_param_utils import mark_param_dtype
 from miles.backends.megatron_utils.megatron_to_hf.linear_attn_layout import LinearAttnHeads
+from miles_plugins.models import fla_cp_block
 from miles_plugins.models.cp_utils import (
     CORE_RELAYOUT_OVERLAP_ENV,
     OUT_PROJ_RS_CHUNKS_ENV,
@@ -105,6 +106,7 @@ def kda_kernel():
     if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10:
         os.environ.setdefault("FLA_TILELANG", "0")
     logger.info(f"KDA backward: FLA_TILELANG={os.environ.get('FLA_TILELANG', 'unset')}")
+    fla_cp_block.install()  # MILES_K31_KDA_FLA_CP_BLOCK (default off)
     return chunk_kda
 
 
