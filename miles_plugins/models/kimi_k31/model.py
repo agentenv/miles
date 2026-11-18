@@ -21,7 +21,8 @@ from miles.utils.hf_utils.config import load_hf_config
 from miles.utils.replay_base import indexer_replay_manager
 from miles_plugins.models.cp_utils import zigzag_gather_layout
 from miles_plugins.models.kimi_k3.layers import KimiK3Attention, _linear
-from miles_plugins.models.kimi_k3.model import KIMI_K3_KDA_LAYERS, get_kimi_k3_spec
+from miles_plugins.models.kimi_k3.kda_layout import kimi_k3_kda_layers
+from miles_plugins.models.kimi_k3.model import get_kimi_k3_spec
 from miles_plugins.models.kimi_k31.dsa_layout import checked_dsa_layers
 from miles_plugins.models.kimi_k31.indexer_tp_split import indexer_tp_split_on, tp_split_topk
 
@@ -176,9 +177,10 @@ class KimiK31DSAAttention(KimiK3Attention):
         return _linear(self.o_proj, output)
 
 
-def configure_kimi_k31_dsa(config, dsa_config: dict, topk_backend: str) -> None:
-    """K3.1 adds a NoPE, LayerNorm-key indexer on every MLA layer; SGLang rejects other variants."""
-    dsa_layers = checked_dsa_layers(dsa_config["dsa_layers"], num_layers=config.num_layers, kda_layers=KIMI_K3_KDA_LAYERS)
+def configure_kimi_k31_dsa(config, dsa_config: dict, topk_backend: str, kda_layers: tuple[int, ...]) -> None:
+    """K3.1 adds a NoPE, LayerNorm-key indexer on every MLA layer; SGLang rejects other variants.
+    ``kda_layers``: ``kimi_k3_kda_layers`` of the checkpoint's text config, the table the K3 spec builds from."""
+    dsa_layers = checked_dsa_layers(dsa_config["dsa_layers"], num_layers=config.num_layers, kda_layers=kda_layers)
     assert dsa_config.get("index_topk_freq", 1) == 1 and dsa_config.get("index_rope_dim", 0) == 0
     assert dsa_config.get("index_k_norm_type", "layernorm") == "layernorm"
     config.kimi_dsa_layers = dsa_layers
@@ -189,6 +191,7 @@ def configure_kimi_k31_dsa(config, dsa_config: dict, topk_backend: str) -> None:
 
 
 def get_kimi_k31_spec(args, config, vp_stage):
-    hf_config = load_hf_config(args.hf_checkpoint)
-    configure_kimi_k31_dsa(config, hf_config.text_config.dsa_config, args.miles_dsa_topk_backend)
-    return get_kimi_k3_spec(args, config, vp_stage, mla_attention=KimiK31DSAAttention)
+    text_config = load_hf_config(args.hf_checkpoint).text_config
+    kda_layers = kimi_k3_kda_layers(text_config, config.num_layers)
+    configure_kimi_k31_dsa(config, text_config.dsa_config, args.miles_dsa_topk_backend, kda_layers)
+    return get_kimi_k3_spec(args, config, vp_stage, mla_attention=KimiK31DSAAttention, text_config=text_config)
