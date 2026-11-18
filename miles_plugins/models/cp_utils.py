@@ -432,3 +432,254 @@ def packed_shard_to_zigzag_a2a(hidden_states, cu_seqlens, cp_group, cp_rank, cp_
     """``packed_shard_to_zigzag`` by all-to-all. Same result and gradient, bit for bit."""
     _, to_zigzag = _relayout_plans(cu_seqlens, cp_rank, cp_size, hidden_states.size(0) * cp_size)
     return _A2ARelayout.apply(hidden_states, to_zigzag, cp_group, None)
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# MILES_K31_KDA_SP_RELAYOUT_FUSED: the sequence-parallel all-gather and the zigzag -> contiguous CP relayout of the
+# KDA layer input as one operation, with a backward that sums over TP before anything crosses CP.
+#
+# Under sequence parallelism the layer input arrives as rank (c, t)'s 1 / TP slice of CP rank c's zigzag shard.
+# Today it is all-gathered over TP (Megatron's ``gather_from_sequence_parallel_region``), relayouted over CP, and in
+# the backward each TP rank sends its own TP-distinct partial gradient of the whole packed shard across CP
+# (the largest KDA collective: [shard, hidden] bf16 per rank, 896 MiB at 262k / CP2 / TP8, 10.5-11 ms), before
+# Megatron's reduce-scatter sums the partials over TP.
+#
+# Here the forward routes every row from its sequence-parallel owner (c, t) to a "carrier" (c, x) over TP, from the
+# carrier to (c', x) over CP when its packed shard c' is the other one, and the TP ranks of c' all-gather what they
+# carry. The carrier x splits each (packed shard, source CP rank) class of rows evenly over the TP ranks, so every
+# rank sends and receives the same cross-CP bytes whatever the sequence layout (one long sequence or many short
+# ones), and the TP all-gather blocks are of equal size. It is pure data movement: the output is bit-identical.
+#
+# The backward is the mirror image: the TP ranks reduce-scatter the packed-shard gradient over their carried rows
+# (the sum the SP all-gather's backward did, now before the CP hop), then the summed rows go back over CP and TP to
+# their sequence-parallel owner. Cross-CP bytes drop by TP (the summed rows instead of every TP rank's partials) and
+# there is no second reduce-scatter. It sums the same TP partials as before; only which TP rank reduces a row (so
+# the bf16 ring order of NCCL's reduce-scatter) changes. Forward values (and log-probs) are unchanged bit for bit.
+# ---------------------------------------------------------------------------------------------------------------
+
+SP_RELAYOUT_FUSED_ENV = "MILES_K31_KDA_SP_RELAYOUT_FUSED"
+_SP_PLAN_CACHE: list = []
+
+
+def sp_relayout_fused_on() -> bool:
+    """MILES_K31_KDA_SP_RELAYOUT_FUSED=1 (default off; set it the same on every rank)."""
+    return os.environ.get(SP_RELAYOUT_FUSED_ENV, "0") == "1"
+
+
+class _Hop:
+    """One ``all_to_all_single`` that sends every input row exactly once. ``send_idx``: the input rows in send
+    order (grouped by destination rank, ascending); the output holds the received rows grouped by source rank,
+    ascending (the own block included: a rank also sends to itself)."""
+
+    def __init__(self, send_idx: torch.Tensor, send_splits: list[int], recv_splits: list[int]):
+        assert send_idx.numel() == sum(send_splits), (send_idx.numel(), send_splits)
+        self.send_idx, self.send_splits, self.recv_splits = send_idx, send_splits, recv_splits
+
+    def forward(self, x: torch.Tensor, group) -> torch.Tensor:
+        out = x.new_empty((sum(self.recv_splits), *x.shape[1:]))
+        dist.all_to_all_single(
+            out,
+            x.index_select(0, self.send_idx),
+            output_split_sizes=self.recv_splits,
+            input_split_sizes=self.send_splits,
+            group=group,
+        )
+        return out
+
+    def backward(self, grad: torch.Tensor, group) -> torch.Tensor:
+        back = grad.new_empty((sum(self.send_splits), *grad.shape[1:]))
+        dist.all_to_all_single(
+            back,
+            grad.contiguous(),
+            output_split_sizes=self.send_splits,
+            input_split_sizes=self.recv_splits,
+            group=group,
+        )
+        grad_x = grad.new_empty((self.send_idx.numel(), *grad.shape[1:]))
+        grad_x.index_copy_(0, self.send_idx, back)
+        return grad_x
+
+
+class _SPRelayoutPlan:
+    """Rank (``cp_rank``, ``tp_rank``)'s side of the fused SP all-gather + zigzag -> contiguous relayout of one
+    microbatch: ``hop_tp`` (SP owner -> carrier, over TP), ``hop_cp`` (carrier -> packed shard, over CP), then
+    ``pad_idx`` places the carried rows in this rank's ``width``-row all-gather block and ``final_idx`` picks the
+    packed shard out of the TP all-gather of the blocks."""
+
+    def __init__(self, cu_seqlens: torch.Tensor, cp_rank: int, cp_size: int, tp_rank: int, tp_size: int, total: int):
+        C, T, N = cp_size, tp_size, total
+        R = N // C
+        S = R // T
+        assert R * C == N and S * T == R, (N, C, T)
+        zigzag_position, _ = _zigzag_maps(cu_seqlens, C, N)
+        dev = zigzag_position.device
+        p = torch.arange(N, device=dev)
+        z = zigzag_position  # zigzag row of packed position p
+        pc, zc = p // R, z // R  # packed shard (destination CP rank), zigzag shard (source CP rank)
+        zt = (z % R) // S  # source SP owner
+        cls = pc * C + zc
+        # rank of each row within its (packed shard, source CP rank) class, rows in packed order
+        n_cls = torch.bincount(cls, minlength=C * C)
+        starts = torch.cumsum(n_cls, 0) - n_cls
+        order = torch.argsort(cls * N + p)
+        rank_in_cls = torch.empty_like(p)
+        rank_in_cls[order] = p - starts[cls[order]]
+        k_cls = (n_cls + T - 1) // T  # rows of a class each carrier takes (the last one may take fewer)
+        x = rank_in_cls // k_cls.clamp(min=1)[cls]  # carrier TP rank
+        # one DtoH: class sizes, [zc, zt, x] (TP hop) and [zc, x, pc] (CP hop) row counts
+        host = torch.cat(
+            [
+                n_cls,
+                torch.bincount((zc * T + zt) * T + x, minlength=C * T * T),
+                torch.bincount((zc * T + x) * C + pc, minlength=C * T * C),
+            ]
+        ).tolist()
+        n_host = host[: C * C]
+        tp_table = host[C * C : C * C + C * T * T]
+        cp_table = host[C * C + C * T * T :]
+        c, t = cp_rank, tp_rank
+        # TP hop: rank (c, t) sends its SP rows to their carriers (c, x), in packed order within each carrier
+        mine = torch.nonzero((zc == c) & (zt == t)).flatten()
+        mine = mine[torch.argsort(x[mine] * N + mine)]
+        self.hop_tp = _Hop(
+            (z[mine] % R) - t * S,
+            [tp_table[(c * T + t) * T + d] for d in range(T)],
+            [tp_table[(c * T + s) * T + t] for s in range(T)],
+        )
+        # what (c, t) carries after the TP hop: rows with zc == c and x == t, by source SP owner then packed order
+        carried = torch.nonzero((zc == c) & (x == t)).flatten()
+        carried = carried[torch.argsort(zt[carried] * N + carried)]
+        # CP hop: send them to their packed shard (c', t), in packed order within each destination
+        by_dest = torch.argsort(pc[carried] * N + carried)
+        self.hop_cp = _Hop(
+            by_dest,
+            [cp_table[(c * T + t) * C + d] for d in range(C)],
+            [cp_table[(s * T + t) * C + c] for s in range(C)],
+        )
+        # received rows: packed shard c, carrier t, by source CP rank then packed order = piece t of each class
+        k_host = [-(-n // T) for n in n_host]
+        offsets, width = [], 0
+        for s in range(C):
+            offsets.append(width)
+            width += k_host[c * C + s]
+        self.width = width
+        off_dev = torch.tensor(offsets, device=dev, dtype=p.dtype)
+        got = torch.nonzero((pc == c) & (x == t)).flatten()
+        got = got[torch.argsort(zc[got] * N + got)]
+        self.pad_idx = off_dev[zc[got]] + rank_in_cls[got] - t * k_cls[cls[got]]
+        shard = p[c * R : (c + 1) * R]
+        self.final_idx = x[shard] * width + off_dev[zc[shard]] + rank_in_cls[shard] - x[shard] * k_cls[cls[shard]]
+        self.rows_out = R
+        self.cross_cp_rows = sum(self.hop_cp.send_splits) - self.hop_cp.send_splits[c]
+
+
+def _sp_relayout_plan(cu_seqlens, cp_rank, cp_size, tp_rank, tp_size, total) -> _SPRelayoutPlan:
+    key = (cp_rank, cp_size, tp_rank, tp_size, total)
+    for cu, version, k, plan in _SP_PLAN_CACHE:
+        if cu is cu_seqlens and version == cu_seqlens._version and k == key:
+            return plan
+    plan = _SPRelayoutPlan(cu_seqlens, *key)
+    _SP_PLAN_CACHE.insert(0, (cu_seqlens, cu_seqlens._version, key, plan))
+    del _SP_PLAN_CACHE[_PLAN_CACHE_SIZE:]
+    return plan
+
+
+class _SPRelayout(torch.autograd.Function):
+    """``gather_from_sequence_parallel_region(tensor_parallel_output_grad=True)`` then ``zigzag_to_packed_shard``,
+    fused: SP rows -> carriers (TP all-to-all) -> packed shard (CP all-to-all) -> TP all-gather. Backward: TP
+    reduce-scatter, then the two all-to-alls reversed."""
+
+    @staticmethod
+    def forward(ctx, x_sp, plan, cp_group, tp_group):
+        ctx.plan, ctx.cp_group, ctx.tp_group = plan, cp_group, tp_group
+        carried = plan.hop_cp.forward(plan.hop_tp.forward(x_sp, tp_group), cp_group)
+        block = carried.new_zeros((plan.width, *carried.shape[1:]))
+        block.index_copy_(0, plan.pad_idx, carried)
+        gathered = block.new_empty((plan.width * dist.get_world_size(group=tp_group), *block.shape[1:]))
+        dist.all_gather_into_tensor(gathered, block, group=tp_group)
+        return gathered.index_select(0, plan.final_idx)
+
+    @staticmethod
+    def backward(ctx, grad):
+        plan = ctx.plan
+        spread = grad.new_zeros((plan.width * dist.get_world_size(group=ctx.tp_group), *grad.shape[1:]))
+        spread.index_copy_(0, plan.final_idx, grad.contiguous())
+        block = _reduce_scatter_rows(spread, ctx.tp_group)
+        carried = plan.hop_cp.backward(block.index_select(0, plan.pad_idx), ctx.cp_group)
+        return plan.hop_tp.backward(carried, ctx.tp_group), None, None, None
+
+
+def sp_gather_zigzag_to_packed_shard(x_sp, cu_seqlens, cp_group, tp_group):
+    """``zigzag_to_packed_shard(gather_from_sequence_parallel_region(x_sp))``: this CP rank's contiguous packed
+    shard ``[shard, ...]`` (the same on every TP rank) from this rank's sequence-parallel slice ``x_sp`` of its
+    zigzag shard. Forward bit-identical; see the MILES_K31_KDA_SP_RELAYOUT_FUSED note for the backward."""
+    cp_size, tp_size = dist.get_world_size(group=cp_group), dist.get_world_size(group=tp_group)
+    total = x_sp.size(0) * tp_size * cp_size
+    plan = _sp_relayout_plan(
+        cu_seqlens, dist.get_rank(group=cp_group), cp_size, dist.get_rank(group=tp_group), tp_size, total
+    )
+    return _SPRelayout.apply(x_sp, plan, cp_group, tp_group)
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# MILES_K31_KDA_CORE_RELAYOUT_OVERLAP: the KDA core output's contiguous -> zigzag relayout and ``out_proj`` as one
+# function, whose backward queues the relayout's all-to-all (on a side stream) between out_proj's data-gradient
+# and weight-gradient GEMMs, so the weight-gradient GEMM runs while the gradient crosses CP. The same aten ops on
+# the same tensors as autograd's ``linear`` backward (``mm_mat1_backward`` / ``mm_mat2_backward`` for a row-major
+# input and the transposed weight): bit-identical, forward and backward. Requires MILES_K31_KDA_CP_RELAYOUT_A2A.
+# ---------------------------------------------------------------------------------------------------------------
+
+CORE_RELAYOUT_OVERLAP_ENV = "MILES_K31_KDA_CORE_RELAYOUT_OVERLAP"
+_side_streams: dict[int, "torch.cuda.Stream"] = {}
+
+
+def core_relayout_overlap_on() -> bool:
+    """MILES_K31_KDA_CORE_RELAYOUT_OVERLAP=1 (default off)."""
+    return os.environ.get(CORE_RELAYOUT_OVERLAP_ENV, "0") == "1"
+
+
+def _side_stream(device: torch.device):
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    if index not in _side_streams:
+        # high priority: the NCCL CTAs get SMs ahead of the GEMM they overlap
+        _side_streams[index] = torch.cuda.Stream(device=index, priority=-1)
+    return _side_streams[index]
+
+
+class _A2ARelayoutLinear(torch.autograd.Function):
+    """``F.linear(packed_shard_to_zigzag_a2a(core), weight)``; see MILES_K31_KDA_CORE_RELAYOUT_OVERLAP."""
+
+    @staticmethod
+    def forward(ctx, core, weight, plan, cp_group):
+        ctx.plan, ctx.cp_group = plan, cp_group
+        zigzag = plan.forward(core, cp_group)
+        ctx.save_for_backward(zigzag, weight)
+        return torch.nn.functional.linear(zigzag, weight)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        zigzag, weight = ctx.saved_tensors
+        grad2d = grad_output.reshape(-1, grad_output.shape[-1])
+        input2d = zigzag.reshape(-1, zigzag.shape[-1])
+        grad_zigzag = grad2d.mm(weight).view(zigzag.shape)  # mm_mat1_backward: grad.mm(mat2.t()), mat2 = weight.t()
+        if grad_zigzag.is_cuda:
+            current, side = torch.cuda.current_stream(), _side_stream(grad_zigzag.device)
+            side.wait_stream(current)
+            with torch.cuda.stream(side):
+                grad_core = ctx.plan.backward(grad_zigzag, ctx.cp_group)
+            grad_zigzag.record_stream(side)
+        else:
+            grad_core = ctx.plan.backward(grad_zigzag, ctx.cp_group)
+        # mm_mat2_backward of the column-major mat2 = weight.t(): grad.t().mm(mat1).t(), then .t() for the weight
+        grad_weight = grad2d.t().mm(input2d)
+        if grad_zigzag.is_cuda:
+            current.wait_stream(side)
+            grad_core.record_stream(current)
+        return grad_core, grad_weight, None, None
+
+
+def packed_shard_to_zigzag_a2a_linear(core, weight, cu_seqlens, cp_group, cp_rank, cp_size):
+    """``F.linear(packed_shard_to_zigzag_a2a(core, ...), weight)``, the backward's all-to-all overlapping the
+    weight-gradient GEMM. Same values and gradients, bit for bit."""
+    _, to_zigzag = _relayout_plans(cu_seqlens, cp_rank, cp_size, core.size(0) * cp_size)
+    return _A2ARelayoutLinear.apply(core, weight, to_zigzag, cp_group)
