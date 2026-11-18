@@ -24,6 +24,7 @@ from miles.utils.audit_utils.witness.module import install_witness
 from miles.utils.function_registry import load_function
 from miles.utils.megatron_bridge_utils import describe_bridge_moe_runtime_config, load_auto_bridge
 from miles.utils.replay_base import routing_replay_manager
+from miles.utils.router_gemm import ROUTER_GEMM_ENV, install_router_gemm, router_gemm_mode
 from miles.backends.training_utils.critic_freeze import freeze_attention_parameters
 from miles.backends.megatron_utils.critic_head import critic_head_owner
 from miles.utils.args.configs.yeto_algo import yeto_algo_option
@@ -383,6 +384,7 @@ def get_model_provider_func(
         _maybe_freeze_native_dsa_indexer(args, model)
         _maybe_freeze_for_partial_experts(args, model)
         _maybe_install_routed_expert_qat(args, model)
+        _maybe_install_router_gemm(model)
 
         if post_process and role == "critic":
             model.output_layer = LinearForLastLayer(
@@ -447,6 +449,15 @@ def _maybe_install_routed_expert_qat(args: TrainerConfig, model: torch.nn.Module
     has_experts = any(".mlp.experts." in name for name, _ in model.named_parameters())
     assert count > 0 or not has_experts, "--routed-expert-qat: no trainable routed-expert grouped linear on this rank"
     logger.info("routed-expert MXFP4 QAT on %d grouped linears of this rank", count)
+
+
+def _maybe_install_router_gemm(model: torch.nn.Module) -> None:
+    """MILES_K31_ROUTER_GEMM=fp32|tf32|bf16: the MoE routers' gating GEMM precision (``miles.utils.router_gemm``)."""
+    mode = router_gemm_mode()
+    if mode is None:
+        return
+    count = install_router_gemm(model, mode)
+    logger.info("%s=%s on %d MoE routers of this rank", ROUTER_GEMM_ENV, mode, count)
 
 
 def _maybe_install_witness(
