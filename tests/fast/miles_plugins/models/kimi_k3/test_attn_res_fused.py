@@ -153,3 +153,15 @@ def test_fused_saves_only_inputs():
     with torch.autograd.graph.saved_tensors_hooks(lambda t: saved.append(t) or t, lambda t: t):
         attn_res_fused.attn_res_mix_fused(prefix, bank, w, EPS)
     assert {s.data_ptr() for s in saved} <= {prefix.data_ptr(), bank.data_ptr(), w.data_ptr()}
+
+
+@pytest.mark.parametrize("pad", [1, 9])
+def test_zero_bank_rows_match_eager(pad):
+    """All-zero bank rows (MILES_K3_ATTN_RES_BANK_PAD_ROWS): rsqrt(eps) * 0 scores 0 in both paths; rows > 16."""
+    prefix, bank, w, go = _inputs(9, 8, 96, torch.float32, seed=5)
+    bank = torch.cat((torch.zeros(9, 1, pad, 96), bank), dim=-2)
+    eager = _grads(_attn_res_mix, prefix, bank, w, go)
+    fused = _grads(attn_res_fused.attn_res_mix_fused, prefix, bank, w, go)
+    for name, e, f in zip(NAMES, eager, fused):
+        print(f"zero pad={pad} {name}: fused-eager {_rel(f, e):.2e}")
+        assert _rel(f, e) < 2e-5, name
