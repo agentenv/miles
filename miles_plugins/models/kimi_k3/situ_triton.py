@@ -14,8 +14,8 @@ The kernels below replay that chain op for op so the forward is meant to be bit-
   /25 -> *fp32(1/25);
 * sigmoid is ``1 / (1 + exp(-x))`` with an IEEE division (div_rn);
 * tanh / exp are libdevice (__nv_tanhf / __nv_expf), the same CUDA math library ATen calls;
-* every fp32 multiply / add / subtract is an explicit round-to-nearest intrinsic (libdevice ``mul_rn`` /
-  ``add_rn`` / ``sub_rn``), which no compiler pass contracts: ``enable_fp_fusion=False`` alone was not honored
+* every fp32 multiply / add / subtract is explicit PTX ``mul/add/sub.rn.f32`` (no ``.ftz``), which no
+  compiler pass contracts and which keeps subnormals as ATen does: ``enable_fp_fusion=False`` alone was not honored
   in every process (inside a Megatron/TE trainer process ``d_s * (1 - s) * s + d_g1 / 4`` came out fused,
   one BF16 ulp off where the two terms cancel, g = -1.21875); the only FMA is ATen's own, tanh_backward's
   ``a * (1 - b*b)`` as nvcc contracts it (``fma_rn(-b, b, 1)``; the plain form differs on B300).
@@ -85,21 +85,31 @@ else:
     def _div_rn(a, b):
         return tl.math.div_rn(a, b)
 
+    # PTX with an explicit rounding modifier is never contracted, and without .ftz keeps subnormals like ATen
+    # (libdevice's *_rn flush them: Triton links libdevice with __CUDA_FTZ=1)
     @triton.jit
     def _fma(a, b, c):
-        return libdevice.fma_rn(a, b, c)
+        return tl.inline_asm_elementwise(
+            "fma.rn.f32 $0, $1, $2, $3;", "=f,f,f,f", [a, b, c], dtype=tl.float32, is_pure=True, pack=1
+        )
 
     @triton.jit
     def _mul(a, b):
-        return libdevice.mul_rn(a, b)
+        return tl.inline_asm_elementwise(
+            "mul.rn.f32 $0, $1, $2;", "=f,f,f", [a, b], dtype=tl.float32, is_pure=True, pack=1
+        )
 
     @triton.jit
     def _add(a, b):
-        return libdevice.add_rn(a, b)
+        return tl.inline_asm_elementwise(
+            "add.rn.f32 $0, $1, $2;", "=f,f,f", [a, b], dtype=tl.float32, is_pure=True, pack=1
+        )
 
     @triton.jit
     def _sub(a, b):
-        return libdevice.sub_rn(a, b)
+        return tl.inline_asm_elementwise(
+            "sub.rn.f32 $0, $1, $2;", "=f,f,f", [a, b], dtype=tl.float32, is_pure=True, pack=1
+        )
 
 
 BETA = 4.0
@@ -130,12 +140,17 @@ def _situ_fwd_kernel(
     base = row * (2 * N) + col
     g = tl.load(x_ptr + base, mask=mask, other=0.0).to(tl.float32)
     lin = tl.load(x_ptr + base + N, mask=mask, other=0.0).to(tl.float32)
-    t1 = _tanh(_mul(g, INV_BETA))
-    a = _mul(t1, BETA)
-    s = _div_rn(1.0, _add(1.0, _exp(-g)))
+    one = tl.full([BLOCK], 1.0, tl.float32)
+    c_beta = tl.full([BLOCK], BETA, tl.float32)
+    c_inv_beta = tl.full([BLOCK], INV_BETA, tl.float32)
+    c_lbeta = tl.full([BLOCK], LBETA, tl.float32)
+    c_inv_lbeta = tl.full([BLOCK], INV_LBETA, tl.float32)
+    t1 = _tanh(_mul(g, c_inv_beta))
+    a = _mul(t1, c_beta)
+    s = _div_rn(one, _add(one, _exp(-g)))
     go = _mul(a, s)
-    t2 = _tanh(_mul(lin, INV_LBETA))
-    lo = _mul(t2, LBETA)
+    t2 = _tanh(_mul(lin, c_inv_lbeta))
+    lo = _mul(t2, c_lbeta)
     y = _mul(go, lo).to(tl.bfloat16)
     if HAS_P:
         p = tl.load(p_ptr + row, mask=mask, other=0.0).to(tl.float32)
@@ -169,6 +184,11 @@ def _situ_bwd_kernel(
     base = row * (2 * N) + col
     g = tl.load(x_ptr + base, mask=mask, other=0.0).to(tl.float32)
     lin = tl.load(x_ptr + base + N, mask=mask, other=0.0).to(tl.float32)
+    one = tl.full([BLOCK], 1.0, tl.float32)
+    c_beta = tl.full([BLOCK], BETA, tl.float32)
+    c_inv_beta = tl.full([BLOCK], INV_BETA, tl.float32)
+    c_lbeta = tl.full([BLOCK], LBETA, tl.float32)
+    c_inv_lbeta = tl.full([BLOCK], INV_LBETA, tl.float32)
     dy = tl.load(dy_ptr + offs, mask=mask, other=0.0).to(tl.float32)
     if HAS_P:
         p = tl.load(p_ptr + row, mask=mask, other=0.0).to(tl.float32)
@@ -176,29 +196,29 @@ def _situ_bwd_kernel(
         gy = _mul(dy, p).to(tl.bfloat16).to(tl.float32)
     else:
         gy = dy
-    t1 = _tanh(_mul(g, INV_BETA))
-    a = _mul(t1, BETA)
-    s = _div_rn(1.0, _add(1.0, _exp(-g)))
+    t1 = _tanh(_mul(g, c_inv_beta))
+    a = _mul(t1, c_beta)
+    s = _div_rn(one, _add(one, _exp(-g)))
     go = _mul(a, s)
-    t2 = _tanh(_mul(lin, INV_LBETA))
-    lo = _mul(t2, LBETA)
+    t2 = _tanh(_mul(lin, c_inv_lbeta))
+    lo = _mul(t2, c_lbeta)
     d_go = _mul(gy, lo)
     d_lo = _mul(gy, go)
-    d_t2 = _mul(d_lo, LBETA)
+    d_t2 = _mul(d_lo, c_lbeta)
     if TANH_BWD_FMA:
-        d_l1 = _mul(d_t2, _fma(-t2, t2, 1.0))
+        d_l1 = _mul(d_t2, _fma(-t2, t2, one))
     else:
-        d_l1 = _mul(d_t2, _sub(1.0, _mul(t2, t2)))
-    d_lin = _mul(d_l1, INV_LBETA)
+        d_l1 = _mul(d_t2, _sub(one, _mul(t2, t2)))
+    d_lin = _mul(d_l1, c_inv_lbeta)
     d_a = _mul(d_go, s)
     d_s = _mul(d_go, a)
-    d_g_sig = _mul(_mul(d_s, _sub(1.0, s)), s)  # sigmoid_backward a * (1 - b) * b
-    d_t1 = _mul(d_a, BETA)
+    d_g_sig = _mul(_mul(d_s, _sub(one, s)), s)  # sigmoid_backward a * (1 - b) * b
+    d_t1 = _mul(d_a, c_beta)
     if TANH_BWD_FMA:
-        d_g1 = _mul(d_t1, _fma(-t1, t1, 1.0))
+        d_g1 = _mul(d_t1, _fma(-t1, t1, one))
     else:
-        d_g1 = _mul(d_t1, _sub(1.0, _mul(t1, t1)))
-    d_g = _add(_mul(d_g1, INV_BETA), d_g_sig)
+        d_g1 = _mul(d_t1, _sub(one, _mul(t1, t1)))
+    d_g = _add(_mul(d_g1, c_inv_beta), d_g_sig)
     tl.store(dx_ptr + base, d_g.to(tl.bfloat16), mask=mask)
     tl.store(dx_ptr + base + N, d_lin.to(tl.bfloat16), mask=mask)
     if WRITE_Y:

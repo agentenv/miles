@@ -42,8 +42,21 @@ def test_matches_eager_bitwise(scale):
     ye, yf = _eager(xe), fused_situ_and_mul(xf)
     ye.backward(dy)
     yf.backward(dy)
-    assert torch.equal(_bits(yf), _bits(ye))
-    assert torch.equal(_bits(xf.grad), _bits(xe.grad))
+    assert not (msg := _where_differ("y", yf, ye, x[:, :N], x[:, N:])), msg
+    assert not (msg := _where_differ("dx", xf.grad, xe.grad, x, x)), msg
+
+
+def _where_differ(name, got, want, gate, linear) -> str:
+    """'' if bitwise equal, else the count and the input range of the differing elements."""
+    differ = _bits(got) != _bits(want)
+    if not differ.any():
+        return ""
+    g, lin, w = gate.float()[differ], linear.float()[differ], want.float()[differ]
+    return (
+        f"{name}: {int(differ.sum())}/{differ.numel()} differ; gate in [{g.min().item():.4g}, {g.max().item():.4g}], "
+        f"linear |.| in [{lin.abs().min().item():.4g}, {lin.abs().max().item():.4g}], eager |{name}| max "
+        f"{w.abs().max().item():.4g}"
+    )
 
 
 @pytest.mark.parametrize("probs_shape", ["rows", "rows1"])
