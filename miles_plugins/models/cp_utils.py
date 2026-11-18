@@ -683,3 +683,118 @@ def packed_shard_to_zigzag_a2a_linear(core, weight, cu_seqlens, cp_group, cp_ran
     weight-gradient GEMM. Same values and gradients, bit for bit."""
     _, to_zigzag = _relayout_plans(cu_seqlens, cp_rank, cp_size, core.size(0) * cp_size)
     return _A2ARelayoutLinear.apply(core, weight, to_zigzag, cp_group)
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# MILES_K31_KDA_OUT_PROJ_RS_CHUNKS=n (default 1: off): the KDA ``out_proj`` and the sequence-parallel
+# reduce-scatter after it, pipelined over n row chunks in the forward: chunk i+1's GEMM runs on the current stream
+# while chunk i's reduce-scatter runs on a side stream. Chunk i takes, from every TP rank's destination block, its
+# i-th slice of rows, so its reduce-scatter writes rows [i*c, (i+1)*c) of this rank's output: the same rows and
+# the same TP partials as the unchunked ``reduce_scatter_to_sequence_parallel_region(F.linear(x, w))``. Bit-exact
+# as long as (a) a GEMM over a row subset gives the same bits as those rows of the full GEMM and (b) NCCL sums a
+# reduce-scatter element in the same order whatever the message size; both hold for the K3 shapes on B300 TP8
+# (work/overlap2 tp_overlap_bench: n = 2, 4, 8 bit-equal) but are properties of the kernels, so the GPU check
+# re-tests them on the module. The backward is not chunked: Megatron's all-gather of the gradient, then the same
+# aten ops as autograd's ``linear`` backward (dgrad ``grad.mm(w)``, wgrad ``grad.t().mm(x)`` on the full rows), so it
+# is the unchunked backward. With MILES_K31_KDA_CORE_RELAYOUT_OVERLAP the output relayout is folded in as in
+# ``_A2ARelayoutLinear`` (its all-to-all overlaps the wgrad GEMM).
+# ---------------------------------------------------------------------------------------------------------------
+
+OUT_PROJ_RS_CHUNKS_ENV = "MILES_K31_KDA_OUT_PROJ_RS_CHUNKS"
+
+
+def out_proj_rs_chunks() -> int:
+    """MILES_K31_KDA_OUT_PROJ_RS_CHUNKS (default 1 = off)."""
+    value = int(os.environ.get(OUT_PROJ_RS_CHUNKS_ENV, "1"))
+    if value < 1:
+        raise ValueError(f"{OUT_PROJ_RS_CHUNKS_ENV} must be >= 1, got {value}")
+    return value
+
+
+def out_proj_rs_chunks_apply(rows: int, tp_size: int, chunks: int) -> bool:
+    """Whether ``rows`` (this CP rank's out_proj rows, before the reduce-scatter) split into the chunks."""
+    return chunks > 1 and tp_size > 1 and rows % (tp_size * chunks) == 0
+
+
+def _reduce_scatter_tensor(output: torch.Tensor, input_: torch.Tensor, group) -> None:
+    """Megatron's ``_reduce_scatter_along_first_dim`` collective (``dist_reduce_scatter_func``)."""
+    dist.reduce_scatter_tensor(output, input_, group=group)
+
+
+def _all_gather_tensor(output: torch.Tensor, input_: torch.Tensor, group) -> None:
+    """Megatron's ``_gather_along_first_dim`` collective (``dist_all_gather_func``)."""
+    dist.all_gather_into_tensor(output, input_, group=group)
+
+
+class _ChunkedLinearReduceScatter(torch.autograd.Function):
+    """``reduce_scatter_to_sequence_parallel_region(F.linear(relayout(core), weight))``, the forward pipelined over
+    row chunks; see MILES_K31_KDA_OUT_PROJ_RS_CHUNKS. ``plan``: the output relayout to fold in (or None)."""
+
+    @staticmethod
+    def forward(ctx, core, weight, plan, cp_group, tp_group, chunks):
+        ctx.plan, ctx.cp_group, ctx.tp_group = plan, cp_group, tp_group
+        x = plan.forward(core, cp_group) if plan is not None else core
+        ctx.save_for_backward(x, weight)
+        tp = tp_group.size()
+        rows = x.shape[0] // tp
+        c = rows // chunks
+        out = x.new_empty((rows, *x.shape[1:-1], weight.shape[0]))
+        blocks = x.view(tp, chunks, c, *x.shape[1:])
+        current = side = None
+        if x.is_cuda:
+            current, side = torch.cuda.current_stream(), _side_stream(x.device)
+            out.record_stream(side)
+        for i in range(chunks):
+            # every TP rank's i-th slice of its destination block: the reduce-scatter lands on rows [i*c, (i+1)*c)
+            part = torch.nn.functional.linear(blocks[:, i].reshape(tp * c, *x.shape[1:]), weight)
+            if side is None:
+                _reduce_scatter_tensor(out[i * c : (i + 1) * c], part, tp_group)
+                continue
+            side.wait_stream(current)
+            with torch.cuda.stream(side):
+                _reduce_scatter_tensor(out[i * c : (i + 1) * c], part, tp_group)
+            part.record_stream(side)
+        if side is not None:
+            current.wait_stream(side)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, weight = ctx.saved_tensors
+        tp_group = ctx.tp_group
+        grad_full = grad_output.new_empty((grad_output.shape[0] * tp_group.size(), *grad_output.shape[1:]))
+        _all_gather_tensor(grad_full, grad_output.contiguous(), tp_group)
+        grad2d = grad_full.reshape(-1, grad_full.shape[-1])
+        input2d = x.reshape(-1, x.shape[-1])
+        grad_core = grad_weight = None
+        side = None
+        if ctx.needs_input_grad[0]:
+            grad_x = grad2d.mm(weight).view(x.shape)  # mm_mat1_backward: grad.mm(mat2.t()), mat2 = weight.t()
+            if ctx.plan is None:
+                grad_core = grad_x
+            elif grad_x.is_cuda:
+                current, side = torch.cuda.current_stream(), _side_stream(grad_x.device)
+                side.wait_stream(current)
+                with torch.cuda.stream(side):
+                    grad_core = ctx.plan.backward(grad_x, ctx.cp_group)
+                grad_x.record_stream(side)
+            else:
+                grad_core = ctx.plan.backward(grad_x, ctx.cp_group)
+        if ctx.needs_input_grad[1]:
+            # mm_mat2_backward of the column-major mat2 = weight.t(): grad.t().mm(mat1).t(), then .t() for the weight
+            grad_weight = grad2d.t().mm(input2d)
+        if side is not None:
+            current.wait_stream(side)
+            grad_core.record_stream(current)
+        return grad_core, grad_weight, None, None, None, None
+
+
+def linear_reduce_scatter_chunked(core, weight, tp_group, chunks: int, cp_group=None, relayout=None):
+    """``reduce_scatter_to_sequence_parallel_region(F.linear(core, weight), group=tp_group)`` with the forward
+    pipelined over ``chunks`` row chunks. ``relayout = (cu_seqlens, cp_rank, cp_size)`` folds the output
+    contiguous -> zigzag all-to-all in first (MILES_K31_KDA_CORE_RELAYOUT_OVERLAP)."""
+    plan = None
+    if relayout is not None:
+        cu_seqlens, cp_rank, cp_size = relayout
+        _, plan = _relayout_plans(cu_seqlens, cp_rank, cp_size, core.size(0) * cp_size)
+    return _ChunkedLinearReduceScatter.apply(core, weight, plan, cp_group, tp_group, chunks)
