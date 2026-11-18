@@ -157,14 +157,41 @@ class RedequantFrozenExperts:
     """
 
     _redequant_scope: RedequantScope | None = None
+    # (weights, the rows they came from, the rows' versions, lut): set by prefetch_weights, taken by the next fetch
+    _prefetched: tuple | None = None
 
     def _packed_rows(self) -> list[torch.Tensor]:
         return [getattr(self, f"weight{i}") for i in range(self.num_gemms)]  # config-access-exempt: TE weight0..N-1
 
+    @staticmethod
+    def _dequantize(rows: list[torch.Tensor], lut: bool) -> list[torch.Tensor]:
+        return [dequantize_mxfp4_rows(packed, MXFP4_GROUP_SIZE, lut=lut) for packed in rows]
+
+    def prefetch_weights(self) -> None:
+        """Dequantize now, for the next ``_get_weight_tensors`` (``moe_a2a_overlap``: during the dispatch a2a)."""
+        rows = self._packed_rows()
+        lut = lut_dequant_enabled()
+        self._prefetched = (self._dequantize(rows, lut), rows, [r._version for r in rows], lut)
+
+    def _take_prefetched(self, rows: list[torch.Tensor], lut: bool) -> list[torch.Tensor] | None:
+        prefetched, self._prefetched = self._prefetched, None
+        if prefetched is None:
+            return None
+        weights, prefetched_rows, versions, prefetched_lut = prefetched
+        fresh = (
+            prefetched_lut == lut
+            and len(prefetched_rows) == len(rows)
+            and all(a is b and a._version == v for a, b, v in zip(prefetched_rows, rows, versions, strict=True))
+        )
+        # stale (bytes reloaded since): dequantize again; the values would be the new bytes' anyway
+        return weights if fresh else None
+
     def _get_weight_tensors(self):
         rows = self._packed_rows()
         lut = lut_dequant_enabled()
-        weights = [dequantize_mxfp4_rows(packed, MXFP4_GROUP_SIZE, lut=lut) for packed in rows]
+        weights = self._take_prefetched(rows, lut)
+        if weights is None:
+            weights = self._dequantize(rows, lut)
         if self._redequant_scope is not None:
             self._redequant_scope.register(weights, rows)
         return weights
