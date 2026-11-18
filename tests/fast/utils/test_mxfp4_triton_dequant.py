@@ -13,7 +13,9 @@ mxfp4_triton = pytest.importorskip("miles.utils.mxfp4_triton")
 if mxfp4_triton.triton is None:
     pytest.skip("triton is not installed", allow_module_level=True)
 if not torch.cuda.is_available() and type(mxfp4_triton._dequant_group_kernel).__name__ != "InterpretedFunction":
-    pytest.skip("triton was imported before TRITON_INTERPRET=1 was set: run this file on its own", allow_module_level=True)
+    pytest.skip(
+        "triton was imported before TRITON_INTERPRET=1 was set: run this file on its own", allow_module_level=True
+    )
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 

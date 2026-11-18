@@ -89,7 +89,6 @@ class _MXFP4FrozenExperts(RedequantFrozenExperts):
             super().set_activation_dtype(inp)
 
 
-
 class MXFP4ColumnParallelGroupedLinear(_MXFP4FrozenExperts, TEColumnParallelGroupedLinear):
     """Expert fc1 whose frozen weights stay MXFP4."""
 

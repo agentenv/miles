@@ -97,9 +97,17 @@ def attn_res_aggregate(
     elif chunk <= 0 or tokens <= chunk:
         mixed = _attn_res_mix(prefix_sum, block_residual, score_weight, score_norm.eps)
     else:
-        mixed = torch.cat([
-            checkpoint(_attn_res_mix, prefix_sum[start:start + chunk], block_residual[start:start + chunk],
-                       score_weight, score_norm.eps, use_reentrant=False)
-            for start in range(0, tokens, chunk)
-        ])
+        mixed = torch.cat(
+            [
+                checkpoint(
+                    _attn_res_mix,
+                    prefix_sum[start : start + chunk],
+                    block_residual[start : start + chunk],
+                    score_weight,
+                    score_norm.eps,
+                    use_reentrant=False,
+                )
+                for start in range(0, tokens, chunk)
+            ]
+        )
     return output_norm(mixed)

@@ -76,7 +76,7 @@ def install_chunk_sort_map(module=None) -> bool:
         except ImportError:
             logger.warning("%s=1 but TE's triton permutation module is not importable: unchanged", CHUNK_SORT_MAP_ENV)
             return False
-    if getattr(module.make_chunk_sort_map, "_miles_torch", False):
+    if getattr(module.make_chunk_sort_map, "_miles_torch", False):  # config-access-exempt: marker of our patch
         return True
     original = module.make_chunk_sort_map
 

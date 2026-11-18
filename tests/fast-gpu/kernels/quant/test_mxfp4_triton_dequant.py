@@ -5,7 +5,9 @@ import pytest
 import torch
 from tests.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=60, suite="stage-b-2-gpu-h200", labels=["precision"], hardware=["hopper", "blackwell"], num_gpus=1)
+register_cuda_ci(
+    est_time=60, suite="stage-b-2-gpu-h200", labels=["precision"], hardware=["hopper", "blackwell"], num_gpus=1
+)
 
 pytest.importorskip("triton")
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -36,7 +38,9 @@ def _random_experts(n_experts, out_features, in_features, seed):
     for _ in range(n_experts):
         r = torch.randint(0, 256, (out_features, width), dtype=torch.uint8, device="cuda", generator=g)
         # realistic E8M0 scales (weights ~1e-3..1e-1): 2 ** (e - 127), e in [110, 130]
-        r[:, in_features // 2 :] = torch.randint(110, 131, (out_features, width - in_features // 2), dtype=torch.uint8, device="cuda", generator=g)
+        r[:, in_features // 2 :] = torch.randint(
+            110, 131, (out_features, width - in_features // 2), dtype=torch.uint8, device="cuda", generator=g
+        )
         rows.append(r)
     return rows
 

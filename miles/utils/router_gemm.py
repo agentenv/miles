@@ -44,7 +44,7 @@ def router_gemm_mode() -> str | None:
 @contextlib.contextmanager
 def _tf32_matmul():
     matmul = torch.backends.cuda.matmul
-    if hasattr(matmul, "fp32_precision"):
+    if hasattr(matmul, "fp32_precision"):  # config-access-exempt: torch API probe, only newer torch has it
         previous = matmul.fp32_precision
         matmul.fp32_precision = "tf32"
         try:
@@ -103,7 +103,12 @@ class RouterGemm(torch.autograd.Function):
 def _gating(self, input: torch.Tensor) -> torch.Tensor:
     """``Router.gating`` for ``--moe-router-dtype fp32`` through ``RouterGemm`` (training: the router already
     lives on the device; Megatron's CPU-to-device move for inference is not needed here)."""
-    return RouterGemm.apply(input, self.weight, self.bias, getattr(self, _INSTALLED))
+    return RouterGemm.apply(
+        input,
+        self.weight,
+        self.bias,
+        getattr(self, _INSTALLED),  # config-access-exempt: mode set by install_router_gemm
+    )
 
 
 def install_router_gemm(model: torch.nn.Module, mode: str | None = None) -> int:
@@ -119,10 +124,15 @@ def install_router_gemm(model: torch.nn.Module, mode: str | None = None) -> int:
 
     count = 0
     for module in model.modules():
-        if not isinstance(module, Router) or getattr(module, _INSTALLED, None) is not None:
+        if (
+            not isinstance(module, Router)
+            or getattr(module, _INSTALLED, None) is not None  # config-access-exempt: install marker on the Router
+        ):
             continue
         if module.config.moe_router_dtype != "fp32":
-            raise ValueError(f"{ROUTER_GEMM_ENV}={mode} needs --moe-router-dtype fp32, got {module.config.moe_router_dtype!r}")
+            raise ValueError(
+                f"{ROUTER_GEMM_ENV}={mode} needs --moe-router-dtype fp32, got {module.config.moe_router_dtype!r}"
+            )
         setattr(module, _INSTALLED, mode)
         module.gating = types.MethodType(_gating, module)
         count += 1

@@ -22,8 +22,8 @@ from miles.kernels.attention.dsa import causal_ranges, get_dsa_topk_fn, lighting
 from miles.utils.hf_utils.config import load_hf_config
 from miles.utils.replay_base import indexer_replay_manager
 from miles_plugins.models.cp_utils import tp_slice_all_gather, zigzag_gather_layout
-from miles_plugins.models.kimi_k3.layers import KimiK3Attention, _linear
 from miles_plugins.models.kimi_k3.kda_layout import kimi_k3_kda_layers
+from miles_plugins.models.kimi_k3.layers import KimiK3Attention, _linear
 from miles_plugins.models.kimi_k3.model import get_kimi_k3_spec
 from miles_plugins.models.kimi_k31.dsa_layout import checked_dsa_layers
 from miles_plugins.models.kimi_k31.dsa_query_split import query_split_attention, query_split_on

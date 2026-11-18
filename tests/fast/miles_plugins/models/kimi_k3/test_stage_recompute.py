@@ -55,9 +55,13 @@ def test_apply_sets_recompute_num_layers(monkeypatch):
 def test_unset_needs_no_parallel_state(monkeypatch):
     """Converters build the spec without model-parallel state: unset must not ask Megatron for the PP rank."""
     monkeypatch.delenv(sr.STAGE_RECOMPUTE_ENV, raising=False)
-    monkeypatch.setitem(sys.modules, "megatron.core.parallel_state", None)   # any import of it would raise
-    config = types.SimpleNamespace(pipeline_model_parallel_size=3, recompute_granularity="full",
-                                   recompute_method="uniform", recompute_num_layers=1)
+    monkeypatch.setitem(sys.modules, "megatron.core.parallel_state", None)  # any import of it would raise
+    config = types.SimpleNamespace(
+        pipeline_model_parallel_size=3,
+        recompute_granularity="full",
+        recompute_method="uniform",
+        recompute_num_layers=1,
+    )
     assert sr.apply_stage_recompute(config, stage_layers=32) is None
     assert config.recompute_num_layers == 1
 
@@ -84,11 +88,18 @@ def _block_forward(config, num_layers, monkeypatch):
             return hidden_states + 1, context
 
     layers = [_Layer(i) for i in range(num_layers)]
-    block = types.SimpleNamespace(config=config, num_layers_per_pipeline_rank=num_layers,
-                                  _get_layer=lambda i: layers[i])
+    block = types.SimpleNamespace(
+        config=config, num_layers_per_pipeline_rank=num_layers, _get_layer=lambda i: layers[i]
+    )
     out = tb.TransformerBlock._checkpointed_forward(
-        block, hidden_states=torch.zeros(2, requires_grad=True), attention_mask=None, context=None,
-        context_mask=None, rotary_pos_emb=None, attention_bias=None, packed_seq_params=None,
+        block,
+        hidden_states=torch.zeros(2, requires_grad=True),
+        attention_mask=None,
+        context=None,
+        context_mask=None,
+        rotary_pos_emb=None,
+        attention_bias=None,
+        packed_seq_params=None,
         use_inner_quantization_context=False,
     )
     assert ran == list(range(num_layers)) and torch.equal(out, torch.full((2,), float(num_layers)))
@@ -98,8 +109,13 @@ def _block_forward(config, num_layers, monkeypatch):
 def test_megatron_block_recomputes_the_first_n_of_this_stage(monkeypatch):
     """The count apply_stage_recompute sets is the one Megatron's block loop reads at forward time."""
     config = types.SimpleNamespace(
-        pipeline_model_parallel_size=3, recompute_granularity="full", recompute_method="block",
-        recompute_num_layers=32, fp8=False, fp4=False, distribute_saved_activations=False,
+        pipeline_model_parallel_size=3,
+        recompute_granularity="full",
+        recompute_method="block",
+        recompute_num_layers=32,
+        fp8=False,
+        fp4=False,
+        distribute_saved_activations=False,
     )
     monkeypatch.setenv(sr.STAGE_RECOMPUTE_ENV, "31,27,24")
     assert sr.apply_stage_recompute(config, pp_rank=2, stage_layers=32) == 24

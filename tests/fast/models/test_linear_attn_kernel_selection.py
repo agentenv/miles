@@ -48,8 +48,16 @@ def test_kda_save_intermediates_switch(monkeypatch, flag, grad, expected):
     v = torch.zeros(1, 4, 2, 8)
     with torch.set_grad_enabled(grad):
         linear_attn.kda_recurrence(
-            v, v, v, torch.zeros(1, 4, 2), torch.zeros(1, 4, 16), torch.zeros(2), torch.zeros(16),
-            gate_lower_bound=-5.0, cu_seqlens=None, cp_context=None,
+            v,
+            v,
+            v,
+            torch.zeros(1, 4, 2),
+            torch.zeros(1, 4, 16),
+            torch.zeros(2),
+            torch.zeros(16),
+            gate_lower_bound=-5.0,
+            cu_seqlens=None,
+            cp_context=None,
         )
     assert seen.get("disable_recompute") is expected
 

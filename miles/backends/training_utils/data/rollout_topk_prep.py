@@ -80,7 +80,9 @@ def local_response_ranges(
     return ranges
 
 
-def _local_rows(values: torch.Tensor, ranges: Sequence[tuple[int, int]], dtype: torch.dtype, pin: bool) -> torch.Tensor:
+def _local_rows(
+    values: torch.Tensor, ranges: Sequence[tuple[int, int]], dtype: torch.dtype, pin: bool
+) -> torch.Tensor:
     rows = sum(end - start for start, end in ranges)
     out = torch.empty((rows, *values.shape[1:]), dtype=dtype, pin_memory=pin)
     offset = 0
