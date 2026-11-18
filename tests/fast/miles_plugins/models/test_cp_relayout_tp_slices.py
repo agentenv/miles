@@ -75,10 +75,15 @@ def _worker(rank, world, tp, port, results):
                 ((y * weight) * upstream).sum().backward()
                 outs.append(y.detach())
                 grads.append(sp.grad)
+            # the plain CP all-gather of the same TP-replicated tensor, rank-concatenated
+            plain = zigzag.new_empty((cp * shard, HIDDEN))
+            dist.all_gather_into_tensor(plain, zigzag.contiguous(), group=cp_group)
+            sliced = cp_utils.tp_slice_all_gather(zigzag, cp_group, tp_group)
             results[(rank, name)] = (
                 torch.equal(outs[0], full[cp_rank * shard : (cp_rank + 1) * shard]),
                 torch.equal(outs[0], outs[1]),
                 torch.equal(grads[0], grads[1]),
+                torch.equal(plain, sliced),
             )
     finally:
         dist.destroy_process_group()
