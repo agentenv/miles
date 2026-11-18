@@ -120,6 +120,12 @@ class _PackedGroup:
         self.group_size = group_size
         self._weights: list[torch.Tensor | None] | None = None
 
+    def prefetch(self) -> None:
+        """Dequantize the group now (``moe_a2a_overlap``: inside the combine-backward all-to-all's window); the
+        backward's unpacks then take these weights. A no-op once any of them is dequantized."""
+        if self._weights is None:
+            self._weights = dequantize_expert_rows(self.rows, self.group_size)
+
     def take(self, index: int) -> torch.Tensor:
         if self._weights is None or self._weights[index] is None:
             # first unpack (or a second read of the saved tensors): dequantize the whole group again
@@ -181,14 +187,16 @@ class RedequantScope:
         self.registered = 0
         self.packed = 0
 
-    def register(self, weights: Sequence[torch.Tensor], rows: Sequence[torch.Tensor]) -> None:
-        """``weights[i]`` was dequantized from ``rows[i]`` for this forward."""
+    def register(self, weights: Sequence[torch.Tensor], rows: Sequence[torch.Tensor]) -> _PackedGroup | None:
+        """``weights[i]`` was dequantized from ``rows[i]`` for this forward. Returns the group the backward will
+        dequantize them through (None off the grouped paths)."""
         assert len(weights) == len(rows)
         grouped = batched_dequant_enabled() or _triton_path(rows)
         group = _PackedGroup(rows, self.group_size) if grouped and len(rows) > 1 else None
         for index, (weight, packed) in enumerate(zip(weights, rows, strict=True)):
             self._packed[_key(weight)] = (packed, group, index)
         self.registered += len(weights)
+        return group
 
     def pack(self, tensor: torch.Tensor):
         entry = self._packed.get(_key(tensor)) if isinstance(tensor, torch.Tensor) else None
@@ -251,6 +259,8 @@ class RedequantFrozenExperts:
     _redequant_scope: RedequantScope | None = None
     # (weights, the rows they came from, the rows' versions, lut): set by prefetch_weights, taken by the next fetch
     _prefetched: tuple | None = None
+    # the packed group the last grad-enabled forward saved for the backward (moe_a2a_overlap's backward prefetch)
+    _saved_group: _PackedGroup | None = None
 
     def _packed_rows(self) -> list[torch.Tensor]:
         return [getattr(self, f"weight{i}") for i in range(self.num_gemms)]  # config-access-exempt: TE weight0..N-1
@@ -287,8 +297,13 @@ class RedequantFrozenExperts:
         if weights is None:
             weights = self._dequantize(rows, lut)
         if self._redequant_scope is not None:
-            self._redequant_scope.register(weights, rows)
+            self._saved_group = self._redequant_scope.register(weights, rows)
         return weights
+
+    def take_saved_group(self) -> _PackedGroup | None:
+        """The packed group of the forward that just ran (once), for an early backward dequantization."""
+        group, self._saved_group = self._saved_group, None
+        return group
 
     def forward(self, *args, **kwargs):
         if not redequant_enabled() or not torch.is_grad_enabled():

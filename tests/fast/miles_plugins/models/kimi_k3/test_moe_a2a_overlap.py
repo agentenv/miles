@@ -103,7 +103,43 @@ def _cpu_dtoh(self, point, tokens_per_expert=None):
     return tokens_per_expert
 
 
-def _build(world, seed):
+class _GroupedBase(torch.nn.Module):
+    """The TE grouped linear's forward: one grouped GEMM over the fetched weights."""
+
+    def forward(self, inp, m_splits):
+        return _GroupedGemm.apply(inp, m_splits, *self._get_weight_tensors())
+
+
+class _RedequantFrozen(RedequantFrozenExperts, _GroupedBase):
+    """A frozen MXFP4 grouped linear with the production forward (redequant hooks around the grouped GEMM)."""
+
+    def __init__(self, out_features, in_features, num_gemms):
+        _GroupedBase.__init__(self)
+        self.num_gemms = num_gemms
+        for i in range(num_gemms):
+            packed, scale = quantize_mxfp4(torch.randn(out_features, in_features), MXFP4_GROUP_SIZE)
+            rows = pack_mxfp4_rows(packed, scale, MXFP4_GROUP_SIZE)
+            self.register_parameter(f"weight{i}", torch.nn.Parameter(rows, requires_grad=False))
+
+
+class _FrozenExperts(torch.nn.Module):
+    """Frozen MXFP4 fc1 and fc2 (``experts.frozen.linear_fc{1,2}``), both saved packed for the backward."""
+
+    def __init__(self, num_local_experts, config, pg_collection=None, name=None):
+        super().__init__()
+        self.frozen = torch.nn.Module()
+        self.frozen.linear_fc1 = _RedequantFrozen(2 * FFN, HIDDEN, num_local_experts)
+        self.frozen.linear_fc2 = _RedequantFrozen(HIDDEN, FFN, num_local_experts)
+
+    def forward(self, x, tokens_per_expert, probs):
+        splits = [int(c) for c in torch.as_tensor(tokens_per_expert).tolist()]
+        h = self.frozen.linear_fc1(x.to(torch.bfloat16), splits).float()
+        gate, up = h.chunk(2, dim=-1)
+        h = F.silu(gate) * up * probs.unsqueeze(-1)
+        return self.frozen.linear_fc2(h.to(torch.bfloat16), splits).float(), None
+
+
+def _build(world, seed, experts_cls=None):
     group = dist.group.WORLD
     single = dist.new_group([dist.get_rank()])
     pgs = ProcessGroupCollection(
@@ -141,7 +177,7 @@ def _build(world, seed):
         config, MoESubmodules(experts=_Experts, shared_experts=shared), layer_number=1, pg_collection=pgs
     )
     torch.manual_seed(seed + 1 + dist.get_rank())  # rank-local experts
-    layer.experts = _Experts(EXPERTS // world, config)
+    layer.experts = (experts_cls or _Experts)(EXPERTS // world, config)
     return layer
 
 
@@ -225,6 +261,136 @@ def test_moe_a2a_overlap_is_bit_identical(world):
     assert len(results) == world, dict(results)
     for rank, (checks, orders) in results.items():
         assert all(checks.values()), (rank, checks, orders)
+
+
+def _setup_cpu_dispatcher():
+    torch.cuda.current_device = lambda: "cpu"  # Megatron's all-to-all allocates its output there
+    MoEAlltoAllTokenDispatcher.cuda_dtoh_stream = object()  # no CUDA stream on CPU
+    MoEAlltoAllTokenDispatcher._maybe_dtoh_and_synchronize = _cpu_dtoh
+    token_dispatcher._record_current_stream = lambda *tensors: None
+
+
+def _bwd_worker(rank, world, port, prefetch, results):
+    """``MILES_K3_MOE_A2A_OVERLAP_BWD=1``: bit-identical to Megatron, the combine-backward all-to-all is sent
+    before the shared experts' backward, and the backward dequantization of the frozen experts listed in
+    ``MILES_K3_MOE_A2A_OVERLAP_BWD_PREFETCH`` moves into its window (each weight still dequantized once)."""
+    from miles_plugins.models.kimi_k3 import mxfp4_redequant
+
+    os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port))
+    os.environ.update(
+        {
+            mxfp4_redequant.REDEQUANT_ENV: "1",
+            mxfp4_redequant.BATCHED_DEQUANT_ENV: "1",
+            overlap.BWD_PREFETCH_ENV: prefetch,
+        }
+    )
+    dist.init_process_group("gloo", rank=rank, world_size=world)
+    try:
+        _setup_cpu_dispatcher()
+        events = []
+        a2a_backward = mappings._AllToAll.backward
+
+        def recorded_backward(ctx, *grad):
+            events.append("a2a")
+            return a2a_backward(ctx, *grad)
+
+        mappings._AllToAll.backward = staticmethod(recorded_backward)
+        early_a2a = overlap._combine_backward_all_to_all
+
+        def recorded_early(*args):
+            events.append("a2a")
+            return early_a2a(*args)
+
+        overlap._combine_backward_all_to_all = recorded_early
+        dequant = mxfp4_redequant.dequantize_expert_rows
+
+        def recorded_dequant(rows, *args, **kwargs):
+            events.append("dequant")
+            return dequant(rows, *args, **kwargs)
+
+        mxfp4_redequant.dequantize_expert_rows = recorded_dequant
+
+        layer = _build(world, seed=11, experts_cls=_FrozenExperts)
+        assert layer._a2a_overlap_applies(None)
+        layer.shared_experts.register_full_backward_hook(lambda *_: events.append("shared"))
+        frozen = layer.experts.frozen
+        torch.manual_seed(200 + rank)
+        x = torch.randn(TOKENS, 1, HIDDEN)
+
+        checks, orders = {}, {}
+        for mode in ("plain", "no_grad", "checkpoint"):
+            os.environ[overlap.BWD_ENV] = "0"
+            ref = _run(layer, x, False, mode, events)
+            orders[(mode, "megatron")] = list(events)
+            os.environ[overlap.BWD_ENV] = "1"
+            got = _run(layer, x, True, mode, events)
+            orders[(mode, "bwd")] = list(events)
+            checks[f"{mode}_out"] = torch.equal(ref[0], got[0])
+            if mode != "no_grad":
+                checks[f"{mode}_dgrad"] = torch.equal(ref[1], got[1])
+                checks[f"{mode}_wgrad"] = ref[2].keys() == got[2].keys() and all(
+                    torch.equal(ref[2][k], got[2][k]) for k in ref[2]
+                )
+            # nothing left behind: prefetches taken, saved groups taken or released
+            checks[f"{mode}_clean"] = all(
+                lin._prefetched is None for lin in (frozen.linear_fc1, frozen.linear_fc2)
+            )
+        os.environ[overlap.BWD_ENV] = "0"
+        early = {"fc1,fc2": ["dequant", "dequant"], "none": []}[prefetch]
+        late = {"fc1,fc2": [], "none": ["dequant", "dequant"]}[prefetch]
+        # Megatron: combine-bwd a2a, the experts' unpacks (fc2, fc1), probs a2a, token a2a, shared experts last
+        checks["order_megatron"] = orders[("plain", "megatron")] == ["a2a", "dequant", "dequant", "a2a", "a2a", "shared"]
+        # switch: combine-bwd a2a first, then the prefetched dequantizations and the shared experts in its window
+        expected = ["a2a", *early, "shared", *late, "a2a", "a2a"]
+        checks["order_bwd"] = orders[("plain", "bwd")] == expected
+        # checkpoint: the recompute forward prefetches fc1 and fc2 in the dispatch window first
+        checks["order_bwd_checkpoint"] = orders[("checkpoint", "bwd")] == ["dequant", "dequant", *expected]
+        results[rank] = (checks, {str(k): v for k, v in orders.items()})
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("prefetch", ["fc1,fc2", "none"])
+@pytest.mark.parametrize("world", [2, 4])
+def test_moe_a2a_overlap_bwd_is_bit_identical(world, prefetch):
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    results = mp.Manager().dict()
+    mp.start_processes(_bwd_worker, args=(world, port, prefetch, results), nprocs=world, start_method="spawn")
+    assert len(results) == world, dict(results)
+    for rank, (checks, orders) in results.items():
+        assert all(checks.values()), (rank, checks, orders)
+
+
+def test_bwd_prefetch_switch(monkeypatch):
+    monkeypatch.delenv(overlap.BWD_ENV, raising=False)
+    monkeypatch.delenv(overlap.BWD_PREFETCH_ENV, raising=False)
+    assert not overlap.bwd_overlap_enabled()
+    assert overlap.bwd_prefetch_projections() == ("linear_fc2",)
+    monkeypatch.setenv(overlap.BWD_PREFETCH_ENV, "fc1,fc2")
+    assert overlap.bwd_prefetch_projections() == ("linear_fc2", "linear_fc1")
+    monkeypatch.setenv(overlap.BWD_PREFETCH_ENV, "bogus")
+    with pytest.raises(ValueError):
+        overlap.bwd_prefetch_projections()
+
+
+def test_packed_group_prefetch_is_taken_once():
+    from miles_plugins.models.kimi_k3 import mxfp4_redequant
+
+    rows = []
+    for _ in range(3):
+        packed, scale = quantize_mxfp4(torch.randn(8, 64), MXFP4_GROUP_SIZE)
+        rows.append(pack_mxfp4_rows(packed, scale, MXFP4_GROUP_SIZE))
+    group = mxfp4_redequant._PackedGroup(rows, MXFP4_GROUP_SIZE)
+    group.prefetch()
+    prefetched = list(group._weights)
+    group.prefetch()  # a second prefetch keeps the first copy
+    assert all(a is b for a, b in zip(prefetched, group._weights, strict=True))
+    taken = [group.take(i) for i in range(3)]
+    assert all(a is b for a, b in zip(prefetched, taken, strict=True)) and group._weights is None
+    ref = mxfp4_redequant.dequantize_expert_rows(rows, MXFP4_GROUP_SIZE)
+    assert all(torch.equal(a, b) for a, b in zip(taken, ref, strict=True))
 
 
 def test_spec_swap_and_switch(monkeypatch):
