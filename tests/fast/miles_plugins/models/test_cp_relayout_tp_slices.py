@@ -65,7 +65,8 @@ def _worker(rank, world, tp, port, results):
             torch.manual_seed(100 + rank)  # TP-distinct consumer weights and upstream gradient
             weight, upstream = torch.randn(HIDDEN), torch.randn(shard, HIDDEN)
             outs, grads = [], []
-            for relayout in ("plain", "tp_slices"):
+            for relayout in ("plain", "tp_slices", "tp_slices_bwd_reduce"):
+                os.environ[cp_utils.RELAYOUT_BWD_REDUCE_ENV] = "1" if relayout == "tp_slices_bwd_reduce" else "0"
                 sp = zigzag[tp_rank * part : (tp_rank + 1) * part].clone().requires_grad_(True)
                 x = _SPGather.apply(sp, tp_group)
                 if relayout == "plain":
@@ -75,6 +76,7 @@ def _worker(rank, world, tp, port, results):
                 ((y * weight) * upstream).sum().backward()
                 outs.append(y.detach())
                 grads.append(sp.grad)
+            os.environ[cp_utils.RELAYOUT_BWD_REDUCE_ENV] = "0"
             # the plain CP all-gather of the same TP-replicated tensor, rank-concatenated
             plain = zigzag.new_empty((cp * shard, HIDDEN))
             dist.all_gather_into_tensor(plain, zigzag.contiguous(), group=cp_group)
@@ -84,6 +86,10 @@ def _worker(rank, world, tp, port, results):
                 torch.equal(outs[0], outs[1]),
                 torch.equal(grads[0], grads[1]),
                 torch.equal(plain, sliced),
+                # MILES_K31_KDA_RELAYOUT_BWD_REDUCE: same forward; the gradient sums the same TP partials in
+                # another order (fp32 here: equal up to rounding)
+                torch.equal(outs[0], outs[2]),
+                torch.allclose(grads[0], grads[2], rtol=1e-6, atol=1e-6),
             )
     finally:
         dist.destroy_process_group()
