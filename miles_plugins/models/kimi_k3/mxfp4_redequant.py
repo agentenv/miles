@@ -34,6 +34,12 @@ about 9 B per weight.
 kernels each, and the a1d trace shows the host launching them as the bottleneck: ~0.2-0.66 ms of CPU per expert
 against tens of microseconds of GPU, 12 ms of GPU idle per MoE layer and pass (24 per layer and microbatch).
 
+``MILES_K31_MXFP4_TRITON_DEQUANT=1`` (wins over the batched and LUT switches) dequantizes all the same-shape experts of
+a fetch in one Triton kernel (``miles.utils.mxfp4_triton``: 0.53 B read + 2 B written per weight, the same bits; the
+n1 trace measured the LUT path at 9.2 ms per MoE layer and fetch, ~0.6 ms is the HBM bound). It goes through
+``dequantize_expert_rows`` like the batched path, so the forward fetch, the a2a-overlap prefetch and the redequant
+backward's group unpack all use it. CUDA only (or ``TRITON_INTERPRET=1``); elsewhere the batched/per-expert path.
+
 Default off: the module forward is TE's, unchanged. Torch-only (plus ``miles.utils.mxfp4``) so the CPU tests load
 it without Megatron or TE.
 """
@@ -53,6 +59,7 @@ from miles.utils.mxfp4 import (
     dequantize_mxfp4_rows,
     dequantize_mxfp4_rows_batched,
 )
+from miles.utils.mxfp4_triton import dequantize_mxfp4_rows_triton, triton_dequant_available
 
 REDEQUANT_ENV = "MILES_K31_MXFP4_REDEQUANT_BACKWARD"
 # dequantize through the byte table (miles.utils.mxfp4.dequantize_mxfp4_lut): the same bits, about 1/8 of the traffic
@@ -60,6 +67,8 @@ LUT_DEQUANT_ENV = "MILES_K31_MXFP4_LUT_DEQUANT"
 # dequantize all the experts of a fetch in a few stacked chunks (dequantize_mxfp4_rows_batched): the same bits
 BATCHED_DEQUANT_ENV = "MILES_K31_MXFP4_BATCHED_DEQUANT"
 BATCHED_DEQUANT_CHUNK_ENV = "MILES_K31_MXFP4_BATCHED_DEQUANT_CHUNK"
+# one Triton kernel per fetch (miles.utils.mxfp4_triton): the same bits, 2.53 B per weight, no per-expert launches
+TRITON_DEQUANT_ENV = "MILES_K31_MXFP4_TRITON_DEQUANT"
 
 logger = logging.getLogger(__name__)
 _reported = False
@@ -77,8 +86,23 @@ def batched_dequant_enabled() -> bool:
     return os.environ.get(BATCHED_DEQUANT_ENV, "0") == "1"
 
 
+def triton_dequant_enabled() -> bool:
+    return os.environ.get(TRITON_DEQUANT_ENV, "0") == "1"
+
+
+def _triton_path(rows: Sequence[torch.Tensor]) -> bool:
+    return triton_dequant_enabled() and len(rows) > 0 and triton_dequant_available(rows[0].device)
+
+
+def dequant_mode() -> tuple[bool, bool, bool]:
+    """(LUT, batched, Triton) switches: keys the prefetch's freshness check (every mode gives the same bits)."""
+    return lut_dequant_enabled(), batched_dequant_enabled(), triton_dequant_enabled()
+
+
 def dequantize_expert_rows(rows: Sequence[torch.Tensor], group_size: int = MXFP4_GROUP_SIZE) -> list[torch.Tensor]:
-    """The exact BF16 weights of a grouped linear's packed experts, per the LUT and batched switches."""
+    """The exact BF16 weights of a grouped linear's packed experts, per the Triton, batched and LUT switches."""
+    if _triton_path(rows):
+        return list(dequantize_mxfp4_rows_triton(list(rows), group_size))
     lut = lut_dequant_enabled()
     if batched_dequant_enabled():
         chunk = int(os.environ.get(BATCHED_DEQUANT_CHUNK_ENV, BATCHED_DEQUANT_CHUNK_ELEMENTS))
@@ -104,6 +128,9 @@ class _PackedGroup:
         if all(w is None for w in self._weights):
             self._weights = None
         return weight
+
+
+_FetchGroup = _PackedGroup  # the name the Triton switch tests use
 
 
 def _key(tensor: torch.Tensor) -> tuple:
@@ -157,7 +184,8 @@ class RedequantScope:
     def register(self, weights: Sequence[torch.Tensor], rows: Sequence[torch.Tensor]) -> None:
         """``weights[i]`` was dequantized from ``rows[i]`` for this forward."""
         assert len(weights) == len(rows)
-        group = _PackedGroup(rows, self.group_size) if batched_dequant_enabled() and len(rows) > 1 else None
+        grouped = batched_dequant_enabled() or _triton_path(rows)
+        group = _PackedGroup(rows, self.group_size) if grouped and len(rows) > 1 else None
         for index, (weight, packed) in enumerate(zip(weights, rows, strict=True)):
             self._packed[_key(weight)] = (packed, group, index)
         self.registered += len(weights)
@@ -228,15 +256,15 @@ class RedequantFrozenExperts:
         return [getattr(self, f"weight{i}") for i in range(self.num_gemms)]  # config-access-exempt: TE weight0..N-1
 
     @staticmethod
-    def _dequantize(rows: list[torch.Tensor], lut: bool) -> list[torch.Tensor]:
-        # dequantize_expert_rows reads the LUT and batched switches itself (same bits either way); ``lut`` keys the
-        # prefetch's freshness check and is read from the same switch at the same moment
+    def _dequantize(rows: list[torch.Tensor], lut) -> list[torch.Tensor]:
+        # dequantize_expert_rows reads the Triton, batched and LUT switches itself (same bits either way); ``lut``
+        # (``dequant_mode()``) keys the prefetch's freshness check, read from the same switches at the same moment
         return dequantize_expert_rows(rows, MXFP4_GROUP_SIZE)
 
     def prefetch_weights(self) -> None:
         """Dequantize now, for the next ``_get_weight_tensors`` (``moe_a2a_overlap``: during the dispatch a2a)."""
         rows = self._packed_rows()
-        lut = lut_dequant_enabled()
+        lut = dequant_mode()
         self._prefetched = (self._dequantize(rows, lut), rows, [r._version for r in rows], lut)
 
     def _take_prefetched(self, rows: list[torch.Tensor], lut: bool) -> list[torch.Tensor] | None:
@@ -254,7 +282,7 @@ class RedequantFrozenExperts:
 
     def _get_weight_tensors(self):
         rows = self._packed_rows()
-        lut = lut_dequant_enabled()
+        lut = dequant_mode()
         weights = self._take_prefetched(rows, lut)
         if weights is None:
             weights = self._dequantize(rows, lut)
