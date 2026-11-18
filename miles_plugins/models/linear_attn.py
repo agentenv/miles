@@ -38,12 +38,18 @@ from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group, mak
 from miles.backends.megatron_utils.fp32_param_utils import mark_param_dtype
 from miles.backends.megatron_utils.megatron_to_hf.linear_attn_layout import LinearAttnHeads
 from miles_plugins.models.cp_utils import (
+    CORE_RELAYOUT_OVERLAP_ENV,
+    SP_RELAYOUT_FUSED_ENV,
     build_fla_cp_context,
     RELAYOUT_BWD_REDUCE_ENV,
+    core_relayout_overlap_on,
     cp_relayout_a2a_on,
     packed_shard_to_zigzag,
     packed_shard_to_zigzag_a2a,
+    packed_shard_to_zigzag_a2a_linear,
     relayout_bwd_reduce_on,
+    sp_gather_zigzag_to_packed_shard,
+    sp_relayout_fused_on,
     zigzag_to_packed_shard,
     zigzag_to_packed_shard_a2a,
     zigzag_to_packed_shard_tp_replicated,
@@ -530,6 +536,34 @@ def _cp_relayout_a2a_on() -> bool:
     return on
 
 
+_SP_RELAYOUT_FUSED_LOGGED = False
+_CORE_RELAYOUT_OVERLAP_LOGGED = False
+
+
+def _sp_relayout_fused_on() -> bool:
+    """MILES_K31_KDA_SP_RELAYOUT_FUSED=1 (default off): the SP all-gather and the input relayout as one op whose
+    backward sums over TP before crossing CP (cp_utils). Applies under sequence parallelism with a zigzag CP
+    relayout; takes precedence over MILES_K31_KDA_CP_RELAYOUT_V2 / _A2A / MILES_K31_KDA_RELAYOUT_BWD_REDUCE for
+    the input (the output relayout still follows MILES_K31_KDA_CP_RELAYOUT_A2A)."""
+    global _SP_RELAYOUT_FUSED_LOGGED
+    on = sp_relayout_fused_on()
+    if on and not _SP_RELAYOUT_FUSED_LOGGED:
+        _SP_RELAYOUT_FUSED_LOGGED = True
+        print(f"[k31] {SP_RELAYOUT_FUSED_ENV}=1: KDA input SP gather + CP relayout fused", flush=True)
+    return on
+
+
+def _core_relayout_overlap_on() -> bool:
+    """MILES_K31_KDA_CORE_RELAYOUT_OVERLAP=1 (default off; needs MILES_K31_KDA_CP_RELAYOUT_A2A=1): the output
+    relayout and out_proj as one op whose backward overlaps the all-to-all with out_proj's weight gradient."""
+    global _CORE_RELAYOUT_OVERLAP_LOGGED
+    on = core_relayout_overlap_on()
+    if on and not _CORE_RELAYOUT_OVERLAP_LOGGED:
+        _CORE_RELAYOUT_OVERLAP_LOGGED = True
+        print(f"[k31] {CORE_RELAYOUT_OVERLAP_ENV}=1: KDA output relayout a2a overlaps out_proj wgrad", flush=True)
+    return on
+
+
 def _tp_slice_relayout_on(tp_group, rows: int) -> bool:
     """MILES_K31_KDA_CP_RELAYOUT_V2=1 (default off): relayout the TP-replicated layer input by TP slices."""
     global _TP_SLICE_RELAYOUT_LOGGED
@@ -565,10 +599,11 @@ class LinearAttentionLayer(MegatronModule):
         for param in self.input_layernorm.parameters():
             param.sequence_parallel = self.sequence_parallel
 
-    def _global_cu_seqlens(self, hidden_states, packed_seq_params):
+    def _global_cu_seqlens(self, hidden_states, packed_seq_params, rows: int | None = None):
+        """``rows``: this CP rank's zigzag-shard rows when ``hidden_states`` is only its SP slice."""
         if packed_seq_params is not None and packed_seq_params.cu_seqlens_q is not None:
             return packed_seq_params.cu_seqlens_q
-        total = hidden_states.shape[0] * self.cp_size
+        total = (hidden_states.shape[0] if rows is None else rows) * self.cp_size
         return torch.tensor([0, total], dtype=torch.int32, device=hidden_states.device)
 
     def forward(
@@ -587,16 +622,23 @@ class LinearAttentionLayer(MegatronModule):
         **kwargs,
     ) -> tuple[torch.Tensor, None]:
         x = self.input_layernorm(hidden_states)
-        if self.sequence_parallel:
+        relayout = self.cp_size > 1 and not self.allgather_cp
+        fused = relayout and self.sequence_parallel and _sp_relayout_fused_on()
+        if fused:
+            # SP gather + zigzag -> contiguous in one op: x is this rank's SP slice until it returns
+            global_cu_seqlens = self._global_cu_seqlens(x, packed_seq_params, rows=x.shape[0] * self.tp_group.size())
+        elif self.sequence_parallel:
             x = gather_from_sequence_parallel_region(x, tensor_parallel_output_grad=True, group=self.tp_group)
         else:
             x = copy_to_tensor_model_parallel_region(x, group=self.tp_group)
 
-        global_cu_seqlens = self._global_cu_seqlens(x, packed_seq_params)
-        relayout = self.cp_size > 1 and not self.allgather_cp
+        if not fused:
+            global_cu_seqlens = self._global_cu_seqlens(x, packed_seq_params)
         by_a2a = relayout and _cp_relayout_a2a_on()
         cp_rank = self.cp_group.rank() if relayout else None
-        if by_a2a:
+        if fused:
+            x = sp_gather_zigzag_to_packed_shard(x, global_cu_seqlens, self.cp_group, self.tp_group)
+        elif by_a2a:
             # only the rows each rank needs, by all-to-all (TP slices of them when x is TP-replicated)
             tp_slices = _tp_slice_relayout_on(self.tp_group, x.shape[0])
             x = zigzag_to_packed_shard_a2a(
@@ -619,11 +661,19 @@ class LinearAttentionLayer(MegatronModule):
 
         core = self.linear_attn(x.transpose(0, 1), cu_seqlens, cp_context).transpose(0, 1)
 
-        if by_a2a:
-            core = packed_shard_to_zigzag_a2a(core, global_cu_seqlens, self.cp_group, cp_rank, self.cp_size)
-        elif relayout:
-            core = packed_shard_to_zigzag(core, global_cu_seqlens, self.cp_group, self.cp_group.rank(), self.cp_size)
-        output = self.linear_attn.out_proj(core)
+        out_proj = self.linear_attn.out_proj
+        if by_a2a and out_proj.bias is None and _core_relayout_overlap_on():
+            output = packed_shard_to_zigzag_a2a_linear(
+                core, out_proj.weight, global_cu_seqlens, self.cp_group, cp_rank, self.cp_size
+            )
+        else:
+            if by_a2a:
+                core = packed_shard_to_zigzag_a2a(core, global_cu_seqlens, self.cp_group, cp_rank, self.cp_size)
+            elif relayout:
+                core = packed_shard_to_zigzag(
+                    core, global_cu_seqlens, self.cp_group, self.cp_group.rank(), self.cp_size
+                )
+            output = out_proj(core)
         if self.sequence_parallel:
             output = reduce_scatter_to_sequence_parallel_region(output, group=self.tp_group)
         else:
