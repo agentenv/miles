@@ -176,7 +176,7 @@ class _TPReplicatedRelayout(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         (inverse_index,) = ctx.saved_tensors
-        if _relayout_bwd_reduce_on():
+        if relayout_bwd_reduce_on():
             grad = _tp_reduced_gather_select(grad_output, inverse_index, ctx.cp_group, ctx.tp_group)
             return grad, None, None, None, None
         return _gather_select(grad_output, inverse_index, ctx.cp_group), None, None, None, None
@@ -185,9 +185,11 @@ class _TPReplicatedRelayout(torch.autograd.Function):
 RELAYOUT_BWD_REDUCE_ENV = "MILES_K31_KDA_RELAYOUT_BWD_REDUCE"
 
 
-def _relayout_bwd_reduce_on() -> bool:
+def relayout_bwd_reduce_on() -> bool:
     """MILES_K31_KDA_RELAYOUT_BWD_REDUCE=1 (default off; set it the same on every rank, the backward's collectives
-    differ): ``_TPReplicatedRelayout``'s backward sums the gradient over TP before it crosses CP."""
+    differ): ``_TPReplicatedRelayout``'s backward sums the gradient over TP before it crosses CP. Only that class
+    reads it: under MILES_K31_KDA_CP_RELAYOUT_A2A the layer uses ``_A2ARelayout`` (bit-identical, half the CP bytes
+    of the all-gather at CP2) and this switch has no effect; the layer logs that once."""
     return os.environ.get(RELAYOUT_BWD_REDUCE_ENV, "0") == "1"
 
 
