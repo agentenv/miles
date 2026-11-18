@@ -36,7 +36,7 @@ def test_torch_map_is_the_triton_map(ep, n_local, mean):
     torch.cuda.synchronize()
     times = []
     for impl in impls:
-        fn = lambda: impl(sizes, order, tokens, n)  # noqa: E731
+        fn = lambda impl=impl: impl(sizes, order, tokens, n)  # noqa: E731
         s, e = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         s.record()
         for _ in range(20):

@@ -21,7 +21,7 @@ def _triton_reference(split_sizes, sorted_indices, num_tokens, num_splits):
     for pid in range(num_tokens):
         mask = [1 if c <= pid else 0 for c in cumsum]
         chunk = sum(mask)
-        presum = sum(s * m for s, m in zip(sizes, mask))
+        presum = sum(s * m for s, m in zip(sizes, mask, strict=True))
         offset = pid - presum
         match = [1 if o == chunk else 0 for o in order]
         out_pos = match.index(1) if 1 in match else 0  # tl.argmax: first max

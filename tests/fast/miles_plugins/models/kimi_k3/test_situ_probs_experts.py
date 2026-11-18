@@ -49,7 +49,7 @@ class _GroupedLinear(torch.nn.Module):
     def forward(self, x, m_splits):
         assert isinstance(m_splits, list)
         chunks = x.split(m_splits)
-        return torch.cat([c @ w.t() for c, w in zip(chunks, self.weight)]), None
+        return torch.cat([c @ w.t() for c, w in zip(chunks, self.weight, strict=True)]), None
 
 
 def _bare(cls, config, w1, w2):
@@ -104,7 +104,7 @@ def test_forward_matches_te_grouped_mlp_bitwise(monkeypatch, counts):
         assert bias is None
         out.backward(dy)
         results.append((out, xi.grad, pi.grad, mod.linear_fc1.weight.grad, mod.linear_fc2.weight.grad))
-    for ref, got in zip(*results):
+    for ref, got in zip(*results, strict=True):
         assert got.dtype == ref.dtype and got.shape == ref.shape
         assert torch.equal(_bits(got), _bits(ref))
 
