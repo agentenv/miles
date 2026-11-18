@@ -10,6 +10,8 @@ chunk. Anything that hands a sequence to fla under CP therefore has to relayout
 first and undo it afterwards.
 """
 
+import os
+
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -152,7 +154,7 @@ class _TPReplicatedRelayout(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x, index, inverse_index, cp_group, tp_group):
-        ctx.cp_group = cp_group
+        ctx.cp_group, ctx.tp_group = cp_group, tp_group
         ctx.save_for_backward(inverse_index)
         cp_size, cp_rank = dist.get_world_size(group=cp_group), dist.get_rank(group=cp_group)
         tp_size, tp_rank = dist.get_world_size(group=tp_group), dist.get_rank(group=tp_group)
@@ -174,7 +176,60 @@ class _TPReplicatedRelayout(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         (inverse_index,) = ctx.saved_tensors
+        if _relayout_bwd_reduce_on():
+            grad = _tp_reduced_gather_select(grad_output, inverse_index, ctx.cp_group, ctx.tp_group)
+            return grad, None, None, None, None
         return _gather_select(grad_output, inverse_index, ctx.cp_group), None, None, None, None
+
+
+RELAYOUT_BWD_REDUCE_ENV = "MILES_K31_KDA_RELAYOUT_BWD_REDUCE"
+
+
+def _relayout_bwd_reduce_on() -> bool:
+    """MILES_K31_KDA_RELAYOUT_BWD_REDUCE=1 (default off; set it the same on every rank, the backward's collectives
+    differ): ``_TPReplicatedRelayout``'s backward sums the gradient over TP before it crosses CP."""
+    return os.environ.get(RELAYOUT_BWD_REDUCE_ENV, "0") == "1"
+
+
+def _reduce_scatter_rows(x: torch.Tensor, group) -> torch.Tensor:
+    """Sum ``x`` over ``group`` and keep this rank's 1 / size block of rows (gloo, the CPU tests' backend, has no
+    reduce-scatter: all-reduce and slice there)."""
+    size, rank = dist.get_world_size(group=group), dist.get_rank(group=group)
+    part = x.shape[0] // size
+    if dist.get_backend(group) == "gloo":
+        x = x.clone()
+        dist.all_reduce(x, group=group)
+        return x[rank * part : (rank + 1) * part].contiguous()
+    out = x.new_empty((part, *x.shape[1:]))
+    dist.reduce_scatter_tensor(out, x, group=group)
+    return out
+
+
+def _tp_reduced_gather_select(grad, inverse_index, cp_group, tp_group):
+    """The gradient of ``_TPReplicatedRelayout`` with 1 / TP of the cross-CP bytes.
+
+    ``_gather_select`` all-gathers each TP rank's whole TP-distinct partial gradient over CP (the n1 trace: 19.8 ms
+    per KDA layer and microbatch for [131072, 7168] bf16, against 2.6-3.2 ms for the forward's TP-slice gather).
+    The layer input is the sequence-parallel gather (``tensor_parallel_output_grad=True``), whose backward sums its
+    gradient over TP, so any split of the true gradient over the TP ranks is as good as the partials. Here the TP
+    ranks first reduce-scatter the packed-layout partials (rank t gets packed rows [t * part, (t + 1) * part) summed,
+    over the intra-node link), the CP ranks all-gather those sums (1 / TP of today's cross-CP bytes), and rank t
+    returns, for every zigzag row, the summed gradient if its packed row is in slice t, else zero: the TP sum of the
+    returned tensors is the summed gradient, exactly once per row. The values differ from the default only in the
+    order of the TP sum (bf16 reduce-scatter in packed instead of zigzag row blocks), not in what is summed."""
+    cp_size = dist.get_world_size(group=cp_group)
+    tp_size, tp_rank = dist.get_world_size(group=tp_group), dist.get_rank(group=tp_group)
+    rows, rest = grad.shape[0], grad.shape[1:]
+    part = rows // tp_size
+    summed = _reduce_scatter_rows(grad.contiguous(), tp_group)  # [part, ...] packed rows of slice tp_rank
+    slices = grad.new_empty((cp_size * part, *rest))  # [cp, part, ...]
+    dist.all_gather_into_tensor(slices, summed, group=cp_group)
+    # zigzag row i takes packed row inverse_index[i] of the rank-concatenated packed shards
+    owner, local = inverse_index // rows, inverse_index % rows
+    mine = local // part == tp_rank
+    src = torch.where(mine, owner * part + local - tp_rank * part, torch.zeros_like(local))
+    picked = slices.index_select(0, src)
+    return torch.where(mine.view(-1, *([1] * len(rest))), picked, torch.zeros_like(picked))
 
 
 def zigzag_to_packed_shard_tp_replicated(hidden_states, cu_seqlens, cp_group, cp_rank, cp_size, tp_group):
