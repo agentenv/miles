@@ -119,5 +119,42 @@ def test_grouped_linear_matches_bf16_host(config, linear):
     assert all(getattr(frozen, f"weight{i}").grad is None for i in range(num))
 
 
+@pytest.mark.parametrize("linear", ["fc1", "fc2"])
+def test_redequant_in_backward_matches_and_frees_the_bf16_copies(config, linear, monkeypatch):
+    """MILES_K31_MXFP4_REDEQUANT_BACKWARD=1 on the real TE grouped linear: the forward output and the input
+    gradient are bitwise those of keeping the dequantized weights, and the graph holds no BF16 copy of them."""
+    from miles_plugins.models.kimi_k3.mxfp4_redequant import REDEQUANT_ENV
+
+    mxfp4_cls, _ = _LINEARS[linear]
+    num, in_features, out_features = 3, 256, 384
+    kwargs = dict(config=config, init_method=torch.nn.init.zeros_, bias=False, skip_bias_add=False, is_expert=True)
+    frozen = mxfp4_cls(num, in_features, out_features, **kwargs)
+    rows, _ = _packed_experts(num, out_features, in_features)
+    with torch.no_grad():
+        for i in range(num):
+            getattr(frozen, f"weight{i}").copy_(rows[i])
+    m_splits = torch.tensor([5, 0, 7])
+    x0 = torch.randn(int(m_splits.sum()), in_features, device="cuda", dtype=torch.bfloat16)
+    grad_out = torch.randn(int(m_splits.sum()), out_features, device="cuda", dtype=torch.bfloat16)
+
+    def run(enabled):
+        monkeypatch.setenv(REDEQUANT_ENV, "1" if enabled else "0")
+        x = x0.clone().requires_grad_(True)
+        torch.cuda.synchronize()
+        before = torch.cuda.memory_allocated()
+        out, _ = frozen(x, m_splits)
+        torch.cuda.synchronize()
+        held = torch.cuda.memory_allocated() - before - out.numel() * out.element_size()
+        out.backward(grad_out)
+        return out.detach(), x.grad, held
+
+    out_plain, grad_plain, held_plain = run(False)
+    out_redo, grad_redo, held_redo = run(True)
+    assert torch.equal(out_plain, out_redo) and torch.equal(grad_plain, grad_redo)
+    bf16_copies = num * out_features * in_features * 2
+    assert held_plain >= bf16_copies
+    assert held_redo <= held_plain - bf16_copies
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
