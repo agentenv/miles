@@ -140,3 +140,47 @@ def dequantize_mxfp4_rows(rows: torch.Tensor, group_size: int, lut: bool = False
     """The BF16 [N, K] weight a packed row tensor encodes; exact. ``lut``: through ``dequantize_mxfp4_lut``."""
     dequantize = dequantize_mxfp4_lut if lut else dequantize_mxfp4
     return dequantize(*split_mxfp4_rows(rows, group_size), group_size)
+
+
+# elements per batched dequantization chunk: about 0.13 G weights, ~1 GB of transient LUT intermediates
+BATCHED_DEQUANT_CHUNK_ELEMENTS = 1 << 27
+
+
+def dequantize_mxfp4_rows_batched(
+    rows: list[torch.Tensor] | tuple[torch.Tensor, ...],
+    group_size: int,
+    lut: bool = False,
+    max_elements: int = BATCHED_DEQUANT_CHUNK_ELEMENTS,
+) -> list[torch.Tensor]:
+    """``[dequantize_mxfp4_rows(r, group_size, lut) for r in rows]`` bit for bit, in a few kernel sequences.
+
+    Consecutive row tensors of one shape are stacked into chunks of at most ``max_elements`` weights (at least one
+    tensor each) and each chunk is dequantized as one [c * N, width] row tensor; both dequantizations are
+    row-wise elementwise, so every output row is the same bits. The outputs are contiguous views of their chunk.
+    One call per chunk instead of per tensor: a grouped linear's 48 frozen experts take a handful of kernel
+    sequences instead of 48, which is what keeps the host from becoming the bottleneck of the weight fetch.
+    """
+    out: list[torch.Tensor] = []
+    i, n = 0, len(rows)
+    while i < n:
+        shape = rows[i].shape
+        assert rows[i].dim() == 2, shape
+        width = mxfp4_row_width_inverse(shape[-1], group_size)
+        per = max(1, shape[0] * width)
+        j = i + 1
+        while j < n and rows[j].shape == shape and (j - i + 1) * per <= max_elements:
+            j += 1
+        if j - i == 1:
+            out.append(dequantize_mxfp4_rows(rows[i], group_size, lut=lut))
+        else:
+            stacked = torch.stack(list(rows[i:j])).view(-1, shape[-1])
+            weights = dequantize_mxfp4_rows(stacked, group_size, lut=lut)
+            out.extend(weights.view(j - i, shape[0], width).unbind(0))
+        i = j
+    return out
+
+
+def mxfp4_row_width_inverse(row_width: int, group_size: int) -> int:
+    """``in_features`` of a packed row tensor ``row_width`` bytes wide; the inverse of ``mxfp4_row_width``."""
+    assert (row_width * 2 * group_size) % (group_size + 2) == 0, (row_width, group_size)
+    return row_width * 2 * group_size // (group_size + 2)
