@@ -58,6 +58,15 @@ def _indexer():
     return indexer
 
 
+class _Attn(model.KimiK31DSAAttention):
+    """The production methods over just the attributes ``_select_topk`` reads (no Megatron layer init)."""
+
+    def __init__(self, **attrs):
+        torch.nn.Module.__init__(self)
+        for name, value in attrs.items():
+            setattr(self, name, value)
+
+
 def _sparse_attention(query, kv, indices, scale):
     """Reference for the absorbed DSA core: query [T, h, D] attends kv [T_kv, D] at its row's indices (-1 = pad)."""
     valid = indices >= 0
@@ -76,7 +85,7 @@ def _worker(rank, world, tp, port, results):
         cp_rank, tp_rank = divmod(rank, tp)
         tp_groups = [dist.new_group(list(range(c * tp, (c + 1) * tp))) for c in range(cp)]
         cp_groups = [dist.new_group(list(range(t, world, tp))) for t in range(tp)]
-        attn = types.SimpleNamespace(
+        attn = _Attn(
             indexer=_indexer(),
             tp_group=tp_groups[cp_rank],
             cp_group=cp_groups[tp_rank],
@@ -100,11 +109,11 @@ def _worker(rank, world, tp, port, results):
                 model.INDEXER_QUERY_CHUNK = chunk
                 os.environ["MILES_K31_INDEXER_TP_SPLIT"] = "0"
                 tps._SPLIT_ON = None  # decide again (and re-check across the TP ranks) on the next call
-                whole = model.KimiK31DSAAttention._select_topk(attn, q_lora, hidden, cu, layout)
+                whole = attn._select_topk(q_lora, hidden, cu, layout)
                 took_whole = tps._SPLIT_ON is False
                 os.environ["MILES_K31_INDEXER_TP_SPLIT"] = "1"
                 tps._SPLIT_ON = None
-                split = model.KimiK31DSAAttention._select_topk(attn, q_lora, hidden, cu, layout)
+                split = attn._select_topk(q_lora, hidden, cu, layout)
                 took_split = tps._SPLIT_ON is True
                 same_topk = took_whole and took_split and whole.dtype == split.dtype == torch.int32
                 same_topk = same_topk and torch.equal(whole, split)
