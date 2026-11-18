@@ -4,10 +4,13 @@ experts and an all-empty microbatch."""
 
 import os
 
-import pytest
-import torch
-import torch.distributed as dist
-from tests.ci.ci_register import register_cuda_ci
+# cuBLAS on several streams (TE grouped GEMM) is only run-to-run deterministic with a fixed workspace config
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
+import pytest  # noqa: E402
+import torch  # noqa: E402
+import torch.distributed as dist  # noqa: E402
+from tests.ci.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(
     est_time=120, suite="stage-b-2-gpu-h200", labels=["miles-plugin"], hardware=["hopper", "blackwell"], num_gpus=1
@@ -63,7 +66,33 @@ def _bits(t):
     return t.contiguous().view(torch.int16) if t.dtype == torch.bfloat16 else t.contiguous().view(torch.int32)
 
 
-@pytest.mark.parametrize("counts", [[700, 0, 1301, 47], [0, 0, 0, 0]])
+def _mismatch(name, got, ref) -> str:
+    if got.dtype != ref.dtype or got.shape != ref.shape:
+        return f"{name}: {got.dtype}{tuple(got.shape)} vs {ref.dtype}{tuple(ref.shape)}"
+    differ = _bits(got) != _bits(ref)
+    if not differ.any():
+        return ""
+    delta = (got.float() - ref.float()).abs()
+    return f"{name}: {int(differ.sum())}/{differ.numel()} differ, max |diff| {delta.max().item():.3e}"
+
+
+def _run(mod, x, tokens, probs, dy):
+    """Output, input / prob / parameter grads and the fc2 input (the SiTU*probs activation), by name."""
+    seen = {}
+    hook = mod.linear_fc2.register_forward_pre_hook(lambda _m, args: seen.update(act=args[0].detach().clone()))
+    xi, pi = x.clone().requires_grad_(), probs.clone().requires_grad_()
+    out, bias = mod(xi, tokens, pi)
+    hook.remove()
+    assert bias is None
+    out.backward(dy)
+    named = {"act": seen["act"], "out": out.detach(), "dx": xi.grad, "dprobs": pi.grad}
+    # TE skips the wgrad GEMM of an empty expert, so without fused accumulation its .grad holds whatever the
+    # allocator returned (production accumulates into main_grad); compare the experts that received tokens
+    named.update({f"grad.{n}": p.grad for n, p in mod.named_parameters() if tokens[int(n.rsplit("weight", 1)[1])] > 0})
+    return named
+
+
+@pytest.mark.parametrize("counts", [[700, 300, 1301, 47], [700, 0, 1301, 47], [0, 0, 0, 0]])
 def test_matches_te_grouped_mlp_bitwise(setup, counts):
     config, pg_collection = setup
     submodules = GroupedMLPSubmodules(linear_fc1=TEColumnParallelGroupedLinear, linear_fc2=TERowParallelGroupedLinear)
@@ -81,17 +110,21 @@ def test_matches_te_grouped_mlp_bitwise(setup, counts):
     dy = torch.randn(rows, HIDDEN, device="cuda").to(torch.bfloat16)
     tokens = torch.tensor(counts)
 
-    results = []
-    for mod in (ref, fused):
-        xi, pi = x.clone().requires_grad_(), probs.clone().requires_grad_()
-        out, bias = mod(xi, tokens, pi)
-        assert bias is None
-        out.backward(dy)
-        results.append((out, xi.grad, pi.grad, *[p.grad for p in mod.parameters()]))
-    assert rows == 0 or all(g is not None for g in results[0])
-    for got_ref, got in zip(*results, strict=True):
-        if got_ref is None:
-            assert got is None
+    want = _run(ref, x, tokens, probs, dy)
+    for p in ref.parameters():
+        p.grad = None
+    again = _run(ref, x, tokens, probs, dy)  # control: TE / cuBLAS run-to-run determinism on this host
+    got = _run(fused, x, tokens, probs, dy)
+    assert want.keys() == got.keys()
+    assert rows == 0 or all(t is not None for t in want.values())
+    unstable = [m for n in want if want[n] is not None and (m := _mismatch(n, again[n], want[n]))]
+    assert not unstable, f"reference TEGroupedMLP is not deterministic: {unstable}"
+    problems = []
+    for name, ref_t in want.items():
+        if ref_t is None or got[name] is None:
+            if ref_t is not got[name]:
+                problems.append(f"{name}: grad None mismatch")
             continue
-        assert got.dtype == got_ref.dtype and got.shape == got_ref.shape
-        assert torch.equal(_bits(got), _bits(got_ref))
+        if msg := _mismatch(name, got[name], ref_t):
+            problems.append(msg)
+    assert not problems, problems
