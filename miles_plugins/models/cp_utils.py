@@ -126,6 +126,49 @@ def zigzag_to_packed_shard(hidden_states, cu_seqlens, cp_group, cp_rank, cp_size
     return _Relayout.apply(hidden_states, to_packed, to_zigzag, cp_group)
 
 
+class _TPReplicatedRelayout(torch.autograd.Function):
+    """``_Relayout`` of a tensor that is identical on every TP rank (the sequence-parallel-gathered layer input).
+
+    ``_Relayout`` all-gathers the whole [rows, ...] tensor over CP on every TP rank: TP copies of the same bytes
+    over the (cross-node) CP link. Here TP rank t sends only its 1 / TP slice of rows over CP, then the TP ranks
+    all-gather the peers' slices over the (intra-node) TP link. Pure data movement, so the output is bit-identical.
+    The gradient is TP-distinct (the consumers are column-parallel), so the backward is ``_Relayout``'s."""
+
+    @staticmethod
+    def forward(ctx, x, index, inverse_index, cp_group, tp_group):
+        ctx.cp_group = cp_group
+        ctx.save_for_backward(inverse_index)
+        cp_size, cp_rank = dist.get_world_size(group=cp_group), dist.get_rank(group=cp_group)
+        tp_size, tp_rank = dist.get_world_size(group=tp_group), dist.get_rank(group=tp_group)
+        rows, rest = x.shape[0], x.shape[1:]
+        part = rows // tp_size
+        # [cp, part, ...]: slice tp_rank of every CP rank's rows
+        slices = x.new_empty((cp_size * part, *rest))
+        dist.all_gather_into_tensor(slices, x[tp_rank * part : (tp_rank + 1) * part].contiguous(), group=cp_group)
+        # the peers' slices only: this CP rank's own rows are x itself
+        peers = slices.view(cp_size, part, *rest)[[c for c in range(cp_size) if c != cp_rank]].reshape(-1, *rest)
+        remote = x.new_empty((tp_size * (cp_size - 1) * part, *rest))  # [tp, cp - 1, part, ...]
+        dist.all_gather_into_tensor(remote, peers, group=tp_group)
+        # row g of the rank-concatenated zigzag shards: CP rank g // rows, TP slice (g % rows) // part
+        owner, local = index // rows, index % rows
+        peer = owner - (owner > cp_rank).to(owner.dtype)
+        remote_row = rows + ((local // part) * (cp_size - 1) + peer) * part + local % part
+        return torch.cat((x, remote)).index_select(0, torch.where(owner == cp_rank, local, remote_row))
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (inverse_index,) = ctx.saved_tensors
+        return _gather_select(grad_output, inverse_index, ctx.cp_group), None, None, None, None
+
+
+def zigzag_to_packed_shard_tp_replicated(hidden_states, cu_seqlens, cp_group, cp_rank, cp_size, tp_group):
+    """``zigzag_to_packed_shard`` of a tensor identical on every rank of ``tp_group``: the same result and
+    gradient, with 1 / TP of its cross-CP forward bytes. Rows must split evenly over TP (they do under SP)."""
+    assert hidden_states.size(0) % tp_group.size() == 0, (hidden_states.size(0), tp_group.size())
+    to_packed, to_zigzag = _relayout_indices(cu_seqlens, cp_rank, cp_size, hidden_states.size(0) * cp_size)
+    return _TPReplicatedRelayout.apply(hidden_states, to_packed, to_zigzag, cp_group, tp_group)
+
+
 def packed_shard_to_zigzag(hidden_states, cu_seqlens, cp_group, cp_rank, cp_size):
     to_packed, to_zigzag = _relayout_indices(cu_seqlens, cp_rank, cp_size, hidden_states.size(0) * cp_size)
     return _Relayout.apply(hidden_states, to_zigzag, to_packed, cp_group)
