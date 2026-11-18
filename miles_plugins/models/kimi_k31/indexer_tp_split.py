@@ -28,6 +28,17 @@ def indexer_tp_split_enabled() -> bool:
 _SPLIT_ON: bool | None = None
 
 
+def check_switch_agrees(name: str, on: bool, group, device, what: str) -> None:
+    """Raise on every rank of ``group`` unless all of them read switch ``name`` the same: a rank that runs a
+    collective the others skip would hang it until the distributed timeout."""
+    if dist.get_world_size(group=group) == 1:
+        return
+    flags = torch.tensor([int(on), -int(on)], dtype=torch.int32, device=device)
+    dist.all_reduce(flags, op=dist.ReduceOp.MAX, group=group)
+    if int(flags[0]) != -int(flags[1]):
+        raise RuntimeError(f"rank {dist.get_rank()}: {name} differs across its {what}; set it the same on every rank")
+
+
 def indexer_tp_split_on(tp_group, device) -> bool:
     """Whether this TP group splits: decided once per process, on its first call. A rank that splits
     all-gathers and a rank that does not would hang that collective until the distributed timeout, so the
@@ -36,14 +47,7 @@ def indexer_tp_split_on(tp_group, device) -> bool:
     if _SPLIT_ON is None:
         on = indexer_tp_split_enabled()
         tp_size = dist.get_world_size(group=tp_group)
-        if tp_size > 1:
-            flags = torch.tensor([int(on), -int(on)], dtype=torch.int32, device=device)
-            dist.all_reduce(flags, op=dist.ReduceOp.MAX, group=tp_group)
-            if int(flags[0]) != -int(flags[1]):
-                raise RuntimeError(
-                    f"rank {dist.get_rank()}: MILES_K31_INDEXER_TP_SPLIT differs across its TP group; "
-                    "set it the same on every rank"
-                )
+        check_switch_agrees("MILES_K31_INDEXER_TP_SPLIT", on, tp_group, device, "TP group")
         _SPLIT_ON = on and tp_size > 1
         if _SPLIT_ON and dist.get_rank(group=tp_group) == 0:
             print(f"[k31] indexer TP split on tp={tp_size} (rank {dist.get_rank()})", flush=True)
@@ -72,12 +76,10 @@ def merge_tp_parts(gathered: torch.Tensor, rows: int, tp_size: int) -> torch.Ten
     )
 
 
-def tp_split_topk(select, index_q, weights, starts, ends, topk: int, tp_group) -> torch.Tensor:
-    """``select(q, w, ks, ke) -> [n, topk]`` on this rank's rows, all-gathered over ``tp_group`` to [T, topk]."""
+def tp_split_part(select, index_q, weights, starts, ends, topk: int, tp_group) -> torch.Tensor:
+    """``select(q, w, ks, ke) -> [n, topk]`` on this rank's rows, padded to [ceil(T / tp), topk] with -1."""
     tp_size = dist.get_world_size(group=tp_group)
     rows = index_q.shape[0]
-    if tp_size == 1:
-        return select(index_q, weights, starts, ends)
     mine = tp_rows(rows, dist.get_rank(group=tp_group), tp_size)
     if index_q[mine].shape[0] > 0:
         part = select(
@@ -87,7 +89,31 @@ def tp_split_topk(select, index_q, weights, starts, ends, topk: int, tp_group) -
         part = torch.empty((0, topk), dtype=torch.int32, device=index_q.device)
     # every rank must gather the same dtype; the empty part above is int32 like every DSA top-k backend
     assert part.dtype == torch.int32 and part.shape[1:] == (topk,), (part.dtype, part.shape)
-    part = pad_tp_part(part, rows, tp_size)
+    return pad_tp_part(part, rows, tp_size)
+
+
+def own_tp_part(indices: torch.Tensor, tp_group) -> torch.Tensor:
+    """This rank's padded part of the whole [T, topk] indices: what ``tp_split_part`` would have scored."""
+    tp_size = dist.get_world_size(group=tp_group)
+    if tp_size == 1:
+        return indices
+    rows = indices.shape[0]
+    return pad_tp_part(indices[tp_rows(rows, dist.get_rank(group=tp_group), tp_size)], rows, tp_size)
+
+
+def gather_tp_parts(part: torch.Tensor, rows: int, tp_group) -> torch.Tensor:
+    """Every rank's padded part, all-gathered over ``tp_group`` and merged back to [rows, topk] in row order."""
+    tp_size = dist.get_world_size(group=tp_group)
+    if tp_size == 1:
+        return part
     gathered = part.new_empty((part.shape[0] * tp_size, *part.shape[1:]))
     dist.all_gather_into_tensor(gathered, part, group=tp_group)
     return merge_tp_parts(gathered, rows, tp_size)
+
+
+def tp_split_topk(select, index_q, weights, starts, ends, topk: int, tp_group) -> torch.Tensor:
+    """``select(q, w, ks, ke) -> [n, topk]`` on this rank's rows, all-gathered over ``tp_group`` to [T, topk]."""
+    if dist.get_world_size(group=tp_group) == 1:
+        return select(index_q, weights, starts, ends)
+    part = tp_split_part(select, index_q, weights, starts, ends, topk, tp_group)
+    return gather_tp_parts(part, index_q.shape[0], tp_group)
