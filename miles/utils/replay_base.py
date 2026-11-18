@@ -14,6 +14,15 @@ def _get_rank():
     return dist.get_rank() if dist.is_initialized() else 0
 
 
+# Replayed ids narrower than int32 (a producer that ships R3 as int16: the uint16 engine payload
+# viewed signed, 0xFFFF is -1) are widened to int32 after the host-to-device copy, on the device.
+# The host buffers and the copy stay narrow; the router gets the ids an int32 R3 gives (same values:
+# -1 pads, expert ids below 32768). int32/int64 ids are returned as they are. Producers check this
+# flag before they ship narrow ids.
+REPLAY_IDS_WIDENED_ON_DEVICE = True
+_NARROW_ID_DTYPES = (torch.int8, torch.uint8, torch.int16)
+
+
 def _to_current_device(top_indices: torch.Tensor) -> torch.Tensor:
     # record() keeps each replay buffer in pinned host memory until clear() (dynamic-shape
     # platforms), so the copy need not make the host wait for the device queue: kernels queued
@@ -21,7 +30,10 @@ def _to_current_device(top_indices: torch.Tensor) -> torch.Tensor:
     # reuse a buffer before its pending copies finish. A pageable buffer (the host-side ids of
     # static-shape platforms, or one set by the debug replay tools) is staged synchronously by
     # the driver, so non_blocking stays safe for it.
-    return top_indices.to(current_platform.current_device(), non_blocking=sync_free.enabled())
+    moved = top_indices.to(current_platform.current_device(), non_blocking=sync_free.enabled())
+    if getattr(moved, "dtype", None) in _NARROW_ID_DTYPES:
+        moved = moved.to(torch.int32)
+    return moved
 
 
 class Replay:
