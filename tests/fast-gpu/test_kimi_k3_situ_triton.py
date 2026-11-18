@@ -65,6 +65,57 @@ def test_with_probs_matches_megatron_bitwise(probs_shape):
     assert torch.equal(pf.grad, pe.grad)
 
 
+def _bf16_values(device="cuda"):
+    """Every BF16 value in 2**-40 <= |v| <= 40, and 0: no fp32 intermediate of the chain gets subnormal (where
+    Triton's denormal handling is not asserted to match ATen; it only touches results below 1e-38)."""
+    bits = torch.arange(65536, dtype=torch.int32, device=device)
+    v = torch.where(bits >= 32768, bits - 65536, bits).to(torch.int16).view(torch.bfloat16)
+    a = v.float().abs()
+    return v[(a <= 40) & ((a >= 2.0**-40) | (a == 0))]
+
+
+def _same(a, b):
+    """Bitwise equal, NaN only where the other is NaN too (payloads may differ)."""
+    nan = torch.isnan(a.float())
+    return torch.equal(nan, torch.isnan(b.float())) and torch.equal(_bits(a)[~nan], _bits(b)[~nan])
+
+
+@pytest.mark.parametrize("with_probs", [False, True])
+def test_every_bf16_input_matches_eager_bitwise(with_probs):
+    # Megatron / TE in the process: the libdevice recompute matched eager standalone but not after these
+    # imports (one ulp in d(gate) where its two terms cancel, g = -1.21875)
+    import megatron.core.transformer.moe.experts  # noqa: F401
+    import transformer_engine.pytorch  # noqa: F401
+
+    values = _bf16_values()
+    torch.manual_seed(3)
+    reps = 8
+    gate = values.repeat(reps)
+    linear = values[torch.randperm(values.numel(), device="cuda")].repeat(reps)
+    pad = (-gate.numel()) % N
+    gate = torch.cat([gate, gate[:pad]]).view(-1, N)
+    linear = torch.cat([linear, linear[:pad]]).view(-1, N)
+    x = torch.cat([gate, linear], dim=1).contiguous()
+    rows = x.shape[0]
+    dy = torch.randn(rows, N, device="cuda").to(torch.bfloat16)
+    probs = torch.rand(rows, device="cuda") if with_probs else None
+    xe, xf = x.clone().requires_grad_(), x.clone().requires_grad_()
+    if with_probs:
+        pe, pf = probs.clone().requires_grad_(), probs.clone().requires_grad_()
+        ye = _eager(xe)
+        ye = (ye * pe.reshape(-1, 1)).to(ye.dtype)
+        yf = fused_situ_and_mul(xf, pf)
+    else:
+        ye, yf = _eager(xe), fused_situ_and_mul(xf)
+    ye.backward(dy)
+    yf.backward(dy)
+    assert _same(yf, ye)
+    differ = (_bits(xf.grad) != _bits(xe.grad)) & ~torch.isnan(xe.grad.float())
+    assert _same(xf.grad, xe.grad), f"{int(differ.sum())} dx differ, gate values {x[differ][:8].float().tolist()}"
+    if with_probs:
+        assert _same(pf.grad, pe.grad)
+
+
 def test_switch_routes_and_keeps_shape(monkeypatch):
     monkeypatch.setattr(ops, "SITU_TRITON", True)
     x = (torch.randn(2, 64, 2 * N, device="cuda") * 3).to(torch.bfloat16)
