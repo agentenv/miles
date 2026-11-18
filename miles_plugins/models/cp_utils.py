@@ -126,6 +126,22 @@ def zigzag_to_packed_shard(hidden_states, cu_seqlens, cp_group, cp_rank, cp_size
     return _Relayout.apply(hidden_states, to_packed, to_zigzag, cp_group)
 
 
+def tp_slice_all_gather(x: torch.Tensor, cp_group, tp_group) -> torch.Tensor:
+    """``all_gather_into_tensor`` of ``x`` over ``cp_group`` (rank-concatenated rows) for an ``x`` identical on
+    every rank of ``tp_group``: each TP rank moves only its 1 / TP slice over CP, the TP ranks all-gather the
+    slices. Same bytes out; 1 / TP of the cross-CP traffic. No autograd: the caller owns the backward."""
+    cp_size = dist.get_world_size(group=cp_group)
+    tp_size, tp_rank = dist.get_world_size(group=tp_group), dist.get_rank(group=tp_group)
+    rows, rest = x.shape[0], x.shape[1:]
+    assert rows % tp_size == 0, (rows, tp_size)
+    part = rows // tp_size
+    slices = x.new_empty((cp_size * part, *rest))  # [cp, part, ...]
+    dist.all_gather_into_tensor(slices, x[tp_rank * part : (tp_rank + 1) * part].contiguous(), group=cp_group)
+    full = x.new_empty((tp_size * cp_size * part, *rest))  # [tp, cp, part, ...]
+    dist.all_gather_into_tensor(full, slices, group=tp_group)
+    return full.view(tp_size, cp_size, part, *rest).transpose(0, 1).reshape(cp_size * rows, *rest)
+
+
 class _TPReplicatedRelayout(torch.autograd.Function):
     """``_Relayout`` of a tensor that is identical on every TP rank (the sequence-parallel-gathered layer input).
 
