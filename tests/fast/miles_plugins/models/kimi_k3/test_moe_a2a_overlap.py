@@ -332,14 +332,19 @@ def _bwd_worker(rank, world, port, prefetch, results):
                     torch.equal(ref[2][k], got[2][k]) for k in ref[2]
                 )
             # nothing left behind: prefetches taken, saved groups taken or released
-            checks[f"{mode}_clean"] = all(
-                lin._prefetched is None for lin in (frozen.linear_fc1, frozen.linear_fc2)
-            )
+            checks[f"{mode}_clean"] = all(lin._prefetched is None for lin in (frozen.linear_fc1, frozen.linear_fc2))
         os.environ[overlap.BWD_ENV] = "0"
         early = {"fc1,fc2": ["dequant", "dequant"], "none": []}[prefetch]
         late = {"fc1,fc2": [], "none": ["dequant", "dequant"]}[prefetch]
         # Megatron: combine-bwd a2a, the experts' unpacks (fc2, fc1), probs a2a, token a2a, shared experts last
-        checks["order_megatron"] = orders[("plain", "megatron")] == ["a2a", "dequant", "dequant", "a2a", "a2a", "shared"]
+        checks["order_megatron"] = orders[("plain", "megatron")] == [
+            "a2a",
+            "dequant",
+            "dequant",
+            "a2a",
+            "a2a",
+            "shared",
+        ]
         # switch: combine-bwd a2a first, then the prefetched dequantizations and the shared experts in its window
         expected = ["a2a", *early, "shared", *late, "a2a", "a2a"]
         checks["order_bwd"] = orders[("plain", "bwd")] == expected

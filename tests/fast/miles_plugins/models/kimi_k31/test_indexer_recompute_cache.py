@@ -10,7 +10,8 @@ import torch
 # Load the module file directly: the package's model module imports Megatron, which CPU CI does not install.
 _ROOT = Path(__file__).resolve().parents[5]
 _SPEC = importlib.util.spec_from_file_location(
-    "_indexer_recompute_cache_under_test", _ROOT / "miles_plugins" / "models" / "kimi_k31" / "indexer_recompute_cache.py"
+    "_indexer_recompute_cache_under_test",
+    _ROOT / "miles_plugins" / "models" / "kimi_k31" / "indexer_recompute_cache.py",
 )
 irc = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(irc)
@@ -18,8 +19,12 @@ _SPEC.loader.exec_module(irc)
 
 @pytest.mark.parametrize(
     "checkpointing,grad,phase",
-    [(False, False, irc.Phase.PLAIN), (False, True, irc.Phase.PLAIN), (True, False, irc.Phase.STORE),
-     (True, True, irc.Phase.REUSE)],
+    [
+        (False, False, irc.Phase.PLAIN),
+        (False, True, irc.Phase.PLAIN),
+        (True, False, irc.Phase.STORE),
+        (True, True, irc.Phase.REUSE),
+    ],
 )
 def test_phase(checkpointing, grad, phase):
     # forward-only passes (no grad, Megatron skips the checkpoint) and layers that are not recomputed are plain

@@ -26,8 +26,16 @@ def _run(monkeypatch, flag):
     dt_bias = (torch.randn(H * D, device="cuda") * 0.5).requires_grad_()
     cu_seqlens = torch.tensor([0, 1000, 2944, T], device="cuda", dtype=torch.long)
     out = linear_attn.kda_recurrence(
-        q, k, v, beta_logits, decay.flatten(2), A_log, dt_bias,
-        gate_lower_bound=-5.0, cu_seqlens=cu_seqlens, cp_context=None,
+        q,
+        k,
+        v,
+        beta_logits,
+        decay.flatten(2),
+        A_log,
+        dt_bias,
+        gate_lower_bound=-5.0,
+        cu_seqlens=cu_seqlens,
+        cp_context=None,
     )
     out.backward(torch.randn_like(out))
     return [out.detach()] + [t.grad for t in (q, k, v, decay, beta_logits, A_log, dt_bias)]

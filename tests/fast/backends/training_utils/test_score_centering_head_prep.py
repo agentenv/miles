@@ -87,9 +87,11 @@ def _case(tp: GroupInfo, cp: GroupInfo, *, qkv_format, mode, dtype, vocab_size, 
     advantages = [torch.randn(response, generator=generator) for response in RESPONSES]
     advantages[1][3] = 0  # an inactive token
     candidates = [
-        torch.stack([torch.randperm(vocab_size, generator=generator)[:K] for _ in range(response)])
-        if response
-        else torch.zeros(0, K, dtype=torch.long)
+        (
+            torch.stack([torch.randperm(vocab_size, generator=generator)[:K] for _ in range(response)])
+            if response
+            else torch.zeros(0, K, dtype=torch.long)
+        )
         for response in RESPONSES
     ]
     if RESPONSES[0]:

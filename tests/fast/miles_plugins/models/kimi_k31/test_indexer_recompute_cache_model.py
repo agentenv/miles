@@ -141,9 +141,11 @@ def _worker(rank, world, tp, port, results):
                 runs[cache] = _run_schedule(attn, cp, cp_rank, tp_rank, tp)
             (plain, plain_calls, plain_left), (cached, cached_calls, cached_left) = runs["0"], runs["1"]
             same = plain.keys() == cached.keys() and all(
-                all(torch.equal(a, b) for a, b in zip(plain[e], cached[e], strict=True))
-                if isinstance(plain[e], tuple)
-                else torch.equal(plain[e], cached[e])
+                (
+                    all(torch.equal(a, b) for a, b in zip(plain[e], cached[e], strict=True))
+                    if isinstance(plain[e], tuple)
+                    else torch.equal(plain[e], cached[e])
+                )
                 for e in plain
             )
             results[(rank, split)] = (same, plain_calls, cached_calls, plain_left, cached_left)

@@ -66,8 +66,10 @@ def test_fp32_matches_eager(tokens, nbank, hidden):
     for name, e, f, r in zip(NAMES, eager, fused, ref):
         assert f.shape == e.shape and f.dtype == e.dtype, name
         err, err_eager = _rel(f, e), _rel(e, r)
-        print(f"fp32 T={tokens} H={hidden} bank={nbank} {name}: fused-eager {err:.2e}, "
-              f"fused-fp64 {_rel(f, r):.2e}, eager-fp64 {err_eager:.2e}")
+        print(
+            f"fp32 T={tokens} H={hidden} bank={nbank} {name}: fused-eager {err:.2e}, "
+            f"fused-fp64 {_rel(f, r):.2e}, eager-fp64 {err_eager:.2e}"
+        )
         # fp32 rounding only: the sums over H (and over tokens for the weight grad) run in another order
         assert err < 2e-5, name
 
@@ -83,8 +85,10 @@ def test_bf16_matches_eager(nbank):
         assert f.dtype == e.dtype, name
         exact = (f == e).float().mean().item()
         err_f, err_e = _rel(f, r.to(f.dtype)), _rel(e, r.to(e.dtype))
-        print(f"bf16 bank={nbank} {name}: bitwise-equal {exact:.4f}, fused-eager {_rel(f, e):.2e}, "
-              f"fused-fp64 {err_f:.2e}, eager-fp64 {err_e:.2e}")
+        print(
+            f"bf16 bank={nbank} {name}: bitwise-equal {exact:.4f}, fused-eager {_rel(f, e):.2e}, "
+            f"fused-fp64 {err_f:.2e}, eager-fp64 {err_e:.2e}"
+        )
         # both round the same fp32 value to bf16; an fp32-ulp difference flips at most one bf16 ulp
         assert _rel(f, e) < 1.6e-2, name
         assert err_f <= err_e * 1.5 + 1e-6, name

@@ -72,10 +72,20 @@ def _row_stats(sumsq, dot, valid, eps, inv_h):
 
 @triton.jit
 def _attn_res_fwd_kernel(
-    prefix_ptr, bank_ptr, w_ptr, out_ptr,
-    H, stride_pt, stride_bt, stride_br, stride_ot,
-    eps, inv_h,
-    R: tl.constexpr, ROWS_PAD: tl.constexpr, BLOCK_H: tl.constexpr,
+    prefix_ptr,
+    bank_ptr,
+    w_ptr,
+    out_ptr,
+    H,
+    stride_pt,
+    stride_bt,
+    stride_br,
+    stride_ot,
+    eps,
+    inv_h,
+    R: tl.constexpr,
+    ROWS_PAD: tl.constexpr,
+    BLOCK_H: tl.constexpr,
 ):
     t = tl.program_id(0).to(tl.int64)
     rows = tl.arange(0, ROWS_PAD)
@@ -100,10 +110,21 @@ def _attn_res_fwd_kernel(
 
 @triton.jit
 def _attn_res_bwd_stats_kernel(
-    prefix_ptr, bank_ptr, w_ptr, go_ptr, coef_ptr,
-    H, stride_pt, stride_bt, stride_br, stride_gt,
-    eps, inv_h,
-    R: tl.constexpr, ROWS_PAD: tl.constexpr, BLOCK_H: tl.constexpr,
+    prefix_ptr,
+    bank_ptr,
+    w_ptr,
+    go_ptr,
+    coef_ptr,
+    H,
+    stride_pt,
+    stride_bt,
+    stride_br,
+    stride_gt,
+    eps,
+    inv_h,
+    R: tl.constexpr,
+    ROWS_PAD: tl.constexpr,
+    BLOCK_H: tl.constexpr,
 ):
     """coef[t] = [p, ds, r, c] per row: ds = softmax grad of the scores, c = d(loss)/d(mean x^2) / H."""
     t = tl.program_id(0).to(tl.int64)
@@ -134,9 +155,24 @@ def _attn_res_bwd_stats_kernel(
 
 @triton.jit
 def _attn_res_bwd_grads_kernel(
-    prefix_ptr, bank_ptr, w_ptr, go_ptr, coef_ptr, gprefix_ptr, gbank_ptr, gw_partial_ptr,
-    T, H, stride_pt, stride_bt, stride_br, stride_gt,
-    R: tl.constexpr, ROWS_PAD: tl.constexpr, BLOCK_H: tl.constexpr, TOKENS: tl.constexpr,
+    prefix_ptr,
+    bank_ptr,
+    w_ptr,
+    go_ptr,
+    coef_ptr,
+    gprefix_ptr,
+    gbank_ptr,
+    gw_partial_ptr,
+    T,
+    H,
+    stride_pt,
+    stride_bt,
+    stride_br,
+    stride_gt,
+    R: tl.constexpr,
+    ROWS_PAD: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    TOKENS: tl.constexpr,
 ):
     """d x_j = g p_j + (ds_j w) r_j + c_j (2 x_j);  partial d w = sum over this token block of ds_j (x_j r_j)."""
     tb = tl.program_id(0)
@@ -192,10 +228,21 @@ class AttnResMixFn(torch.autograd.Function):
         out = torch.empty_like(prefix)
         if tokens > 0:
             _attn_res_fwd_kernel[(tokens,)](
-                prefix, bank, w, out,
-                hidden, prefix.stride(0), bank.stride(0), bank.stride(1), out.stride(0),
-                float(eps), 1.0 / hidden,
-                R=nbank, ROWS_PAD=rows_pad, BLOCK_H=block_h, num_warps=_NUM_WARPS,
+                prefix,
+                bank,
+                w,
+                out,
+                hidden,
+                prefix.stride(0),
+                bank.stride(0),
+                bank.stride(1),
+                out.stride(0),
+                float(eps),
+                1.0 / hidden,
+                R=nbank,
+                ROWS_PAD=rows_pad,
+                BLOCK_H=block_h,
+                num_warps=_NUM_WARPS,
             )
         ctx.save_for_backward(prefix_sum, block_residual, score_weight)
         ctx.eps = float(eps)
@@ -216,15 +263,42 @@ class AttnResMixFn(torch.autograd.Function):
         if tokens > 0:
             coef = torch.empty(tokens, 4, rows_pad, dtype=torch.float32, device=prefix.device)
             _attn_res_bwd_stats_kernel[(tokens,)](
-                prefix, bank, w, go, coef,
-                hidden, prefix.stride(0), bank.stride(0), bank.stride(1), go.stride(0),
-                ctx.eps, 1.0 / hidden,
-                R=nbank, ROWS_PAD=rows_pad, BLOCK_H=block_h, num_warps=_NUM_WARPS,
+                prefix,
+                bank,
+                w,
+                go,
+                coef,
+                hidden,
+                prefix.stride(0),
+                bank.stride(0),
+                bank.stride(1),
+                go.stride(0),
+                ctx.eps,
+                1.0 / hidden,
+                R=nbank,
+                ROWS_PAD=rows_pad,
+                BLOCK_H=block_h,
+                num_warps=_NUM_WARPS,
             )
             _attn_res_bwd_grads_kernel[(n_tb, triton.cdiv(hidden, block_h))](
-                prefix, bank, w, go, coef, gprefix, gbank, gw_partial,
-                tokens, hidden, prefix.stride(0), bank.stride(0), bank.stride(1), go.stride(0),
-                R=nbank, ROWS_PAD=rows_pad, BLOCK_H=block_h, TOKENS=_GRAD_TOKENS_PER_PROGRAM,
+                prefix,
+                bank,
+                w,
+                go,
+                coef,
+                gprefix,
+                gbank,
+                gw_partial,
+                tokens,
+                hidden,
+                prefix.stride(0),
+                bank.stride(0),
+                bank.stride(1),
+                go.stride(0),
+                R=nbank,
+                ROWS_PAD=rows_pad,
+                BLOCK_H=block_h,
+                TOKENS=_GRAD_TOKENS_PER_PROGRAM,
                 num_warps=_NUM_WARPS,
             )
         gw = gw_partial.sum(dim=0).to(score_weight.dtype)

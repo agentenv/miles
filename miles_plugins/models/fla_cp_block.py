@@ -73,7 +73,7 @@ class BlockOverride:
         return launch
 
     def __getattr__(self, name):
-        return getattr(self.kernel, name)
+        return getattr(self.kernel, name)  # config-access-exempt: proxy for the wrapped Triton kernel
 
 
 def install() -> int | None:
@@ -83,8 +83,8 @@ def install() -> int | None:
         return None
     module = importlib.import_module(FLA_MODULE)
     for kernel_name, launcher_name in KERNELS.items():
-        launcher = getattr(module, launcher_name, None)
-        kernel = getattr(module, kernel_name, None)
+        launcher = getattr(module, launcher_name, None)  # config-access-exempt: fla module global by name
+        kernel = getattr(module, kernel_name, None)  # config-access-exempt: fla module global by name
         if launcher is None or kernel is None or kernel_name not in launcher.__code__.co_names:
             raise RuntimeError(
                 f"{FLA_CP_BLOCK_ENV}: {FLA_MODULE}.{launcher_name} does not launch the global {kernel_name} in "

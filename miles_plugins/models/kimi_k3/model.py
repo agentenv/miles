@@ -121,9 +121,9 @@ def get_kimi_k3_spec(args, config, vp_stage, mla_attention=KimiK3Attention, text
         )
         # every MoE layer has its own trainable set: the selection must name exactly the model's MoE layers
         moe_layers = [i for i, is_moe in enumerate(config.moe_layer_freq) if is_moe]
-        assert layout.moe_layers == moe_layers, (
-            f"--partial-experts-selection covers layers {layout.moe_layers}, the model's MoE layers are {moe_layers}"
-        )
+        assert (
+            layout.moe_layers == moe_layers
+        ), f"--partial-experts-selection covers layers {layout.moe_layers}, the model's MoE layers are {moe_layers}"
         # the mbridge loader reads the table from the model config; the converter and R3 read the active layout
         config.partial_experts_layout = layout
         num_local_trainable = layout.num_local_trainable

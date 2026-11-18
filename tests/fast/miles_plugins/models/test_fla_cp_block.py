@@ -17,7 +17,7 @@ _SPEC = importlib.util.spec_from_file_location("_fla_cp_block_under_test", _PATH
 fla_cp_block = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(fla_cp_block)
 
-_FAKE_SRC = '''
+_FAKE_SRC = """
 calls = []
 
 class _Kernel:
@@ -43,7 +43,7 @@ def chunk_gated_delta_rule_bwd_dhu_pre_process(K, V, HV):
     BLOCK_SIZE = 32 if K <= 64 else 64
     grid = (cdiv(V, BLOCK_SIZE) + cdiv(K, BLOCK_SIZE), HV)
     pre_process_bwd_kernel_merged[grid](K=K, V=V, BLOCK_SIZE=BLOCK_SIZE)
-'''
+"""
 
 
 @pytest.fixture

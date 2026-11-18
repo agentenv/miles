@@ -19,13 +19,17 @@ mxfp4_triton = pytest.importorskip("miles.utils.mxfp4_triton")
 if mxfp4_triton.triton is None:
     pytest.skip("triton is not installed", allow_module_level=True)
 if not torch.cuda.is_available() and type(mxfp4_triton._dequant_group_kernel).__name__ != "InterpretedFunction":
-    pytest.skip("triton was imported before TRITON_INTERPRET=1 was set: run this file on its own", allow_module_level=True)
+    pytest.skip(
+        "triton was imported before TRITON_INTERPRET=1 was set: run this file on its own", allow_module_level=True
+    )
 
 
 def _count_triton_calls(monkeypatch):
     calls = []
     original = redequant.dequantize_mxfp4_rows_triton
-    monkeypatch.setattr(redequant, "dequantize_mxfp4_rows_triton", lambda rows, g: calls.append(len(rows)) or original(rows, g))
+    monkeypatch.setattr(
+        redequant, "dequantize_mxfp4_rows_triton", lambda rows, g: calls.append(len(rows)) or original(rows, g)
+    )
     return calls
 
 

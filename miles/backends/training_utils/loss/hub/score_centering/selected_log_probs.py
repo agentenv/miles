@@ -291,7 +291,9 @@ def selected_log_probs_and_entropy(
         if sampling_support:
             chunks.append(_SupportLogProbs.apply(chunk, ids, group, temperature, with_entropy))
         elif lean:
-            chunks.append(_LeanSelectedLogProbs.apply(chunk, ids, group, vocab_size, with_entropy, lean == "recompute"))
+            chunks.append(
+                _LeanSelectedLogProbs.apply(chunk, ids, group, vocab_size, with_entropy, lean == "recompute")
+            )
         else:
             chunks.append(_SelectedLogProbs.apply(chunk.to(dtype) / temperature, ids, group, vocab_size, with_entropy))
     return torch.cat([chunk[0] for chunk in chunks]), torch.cat([chunk[1] for chunk in chunks])

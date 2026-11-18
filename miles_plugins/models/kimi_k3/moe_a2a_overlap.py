@@ -134,8 +134,9 @@ def _join(comm: torch.cuda.Stream | None, *outputs: torch.Tensor) -> None:
 def _frozen_projection(experts, name: str):
     from miles_plugins.models.kimi_k3.mxfp4_redequant import RedequantFrozenExperts
 
-    frozen = getattr(experts, "frozen", experts)  # PartiallyTrainableGroupedMLP or a whole-MXFP4 TEGroupedMLP
-    linear = getattr(frozen, name, None)
+    # PartiallyTrainableGroupedMLP or a whole-MXFP4 TEGroupedMLP
+    frozen = getattr(experts, "frozen", experts)  # config-access-exempt: split MLP half or whole experts
+    linear = getattr(frozen, name, None)  # config-access-exempt: linear_fc1 / linear_fc2 by name
     return linear if isinstance(linear, RedequantFrozenExperts) else None
 
 
@@ -274,7 +275,7 @@ class A2AOverlapMoELayer(MoELayer):
             and not config.overlap_moe_expert_parallel_comm
             and not config.overlap_dispatch_backward_with_experts_wgrad
             and config.cuda_graph_impl == "none"
-            and not hasattr(self, "_inference_token_dispatcher")
+            and not hasattr(self, "_inference_token_dispatcher")  # config-access-exempt: Megatron version probe
             and list(self.fwd_execution_map) == _FULL_EXECUTION
         )
 

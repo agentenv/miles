@@ -28,12 +28,12 @@ Saves only the BF16 input (and probs) for backward instead of six fp32 [rows, N]
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import torch
 import triton
 import triton.language as tl
-
-import os
 
 try:
     from triton.language.extra.cuda import libdevice

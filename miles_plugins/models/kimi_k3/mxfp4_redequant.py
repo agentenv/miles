@@ -167,9 +167,9 @@ class PackedWeightRef:
         self.index = index
 
     def dequantize(self) -> torch.Tensor:
-        assert self.rows._version == self.version, (
-            "a frozen MXFP4 expert's packed bytes changed between its forward and its backward"
-        )
+        assert (
+            self.rows._version == self.version
+        ), "a frozen MXFP4 expert's packed bytes changed between its forward and its backward"
         if self.group is not None:
             weight = self.group.take(self.index)
         else:

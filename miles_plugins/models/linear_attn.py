@@ -41,9 +41,9 @@ from miles_plugins.models import fla_cp_block
 from miles_plugins.models.cp_utils import (
     CORE_RELAYOUT_OVERLAP_ENV,
     OUT_PROJ_RS_CHUNKS_ENV,
+    RELAYOUT_BWD_REDUCE_ENV,
     SP_RELAYOUT_FUSED_ENV,
     build_fla_cp_context,
-    RELAYOUT_BWD_REDUCE_ENV,
     core_relayout_overlap_on,
     cp_relayout_a2a_on,
     linear_reduce_scatter_chunked,
@@ -580,7 +580,9 @@ def _out_proj_rs_chunks() -> int:
     chunks = out_proj_rs_chunks()
     if chunks > 1 and not _OUT_PROJ_RS_CHUNKS_LOGGED:
         _OUT_PROJ_RS_CHUNKS_LOGGED = True
-        print(f"[k31] {OUT_PROJ_RS_CHUNKS_ENV}={chunks}: KDA out_proj + SP reduce-scatter in {chunks} chunks", flush=True)
+        print(
+            f"[k31] {OUT_PROJ_RS_CHUNKS_ENV}={chunks}: KDA out_proj + SP reduce-scatter in {chunks} chunks", flush=True
+        )
     return chunks
 
 
