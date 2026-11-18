@@ -118,8 +118,10 @@ def _assert_bitwise(a, b):
         assert x.dtype == y.dtype and torch.equal(x, y)
 
 
-def test_redequant_gradients_are_bitwise_equal_and_no_bf16_copy_survives(monkeypatch):
+@pytest.mark.parametrize("lut", ["0", "1"])
+def test_redequant_gradients_are_bitwise_equal_and_no_bf16_copy_survives(monkeypatch, lut):
     plain = _run(monkeypatch, enabled=False)
+    monkeypatch.setenv(redequant.LUT_DEQUANT_ENV, lut)  # MILES_K31_MXFP4_LUT_DEQUANT: same bits, either way
     redone = _run(monkeypatch, enabled=True)
     _assert_bitwise(plain, redone)
     # off: TE's graph holds every dequantized expert of both projections until the backward; on: none
