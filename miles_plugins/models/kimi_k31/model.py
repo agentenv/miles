@@ -15,6 +15,7 @@ from megatron.core.tensor_parallel.mappings import (
     copy_to_tensor_model_parallel_region,
     gather_from_sequence_parallel_region,
 )
+from megatron.core.tensor_parallel.random import is_checkpointing
 
 from miles.kernels.attention.dsa import causal_ranges, get_dsa_topk_fn, lighting_indexer, sparse_attention
 from miles.utils.hf_utils.config import load_hf_config
@@ -24,7 +25,19 @@ from miles_plugins.models.kimi_k3.layers import KimiK3Attention, _linear
 from miles_plugins.models.kimi_k3.kda_layout import kimi_k3_kda_layers
 from miles_plugins.models.kimi_k3.model import get_kimi_k3_spec
 from miles_plugins.models.kimi_k31.dsa_layout import checked_dsa_layers
-from miles_plugins.models.kimi_k31.indexer_tp_split import indexer_tp_split_on, tp_split_topk
+from miles_plugins.models.kimi_k31.indexer_recompute_cache import (
+    Phase,
+    TopkRecomputeCache,
+    indexer_recompute_cache_on,
+    recompute_phase,
+)
+from miles_plugins.models.kimi_k31.indexer_tp_split import (
+    gather_tp_parts,
+    indexer_tp_split_on,
+    own_tp_part,
+    tp_split_part,
+    tp_split_topk,
+)
 
 
 # Query rows the frozen DSA indexer scores per block (MILES_K31_INDEXER_QUERY_CHUNK overrides).
@@ -107,19 +120,41 @@ class KimiK31DSAAttention(KimiK3Attention):
         indexer_replay_manager.register_to_module(
             self, "indexer_replay", stream_idx=config.kimi_dsa_layers.index(layer_number), supports_zigzag_cp=True
         )
+        # MILES_K31_INDEXER_RECOMPUTE_CACHE: at most one pending top-k per microbatch in flight on this stage (1F1B)
+        self.topk_cache = TopkRecomputeCache(max_pending=config.pipeline_model_parallel_size)
 
-    def _select_topk(self, q_lora, hidden, cu_seqlens, cp_layout) -> torch.Tensor:
+    def _indexer_inputs(self, q_lora, hidden, cu_seqlens, cp_layout):
         index_q, index_k, weights = self.indexer(q_lora.detach(), hidden.detach())
         positions = None
         if cp_layout is not None:
             gather_order, positions = cp_layout
             index_k = gather_from_sequence_parallel_region(index_k, group=self.cp_group).index_select(0, gather_order)
         starts, ends = causal_ranges(cu_seqlens, positions)
-        starts, ends = starts.to(torch.int32), ends.to(torch.int32)
+        return index_q, index_k, weights, starts.to(torch.int32), ends.to(torch.int32)
+
+    def _select_topk(self, q_lora, hidden, cu_seqlens, cp_layout) -> torch.Tensor:
         topk_fn = indexer_replay_manager.get_topk_fn(self.topk_fn, return_probs=False)
         if indexer_replay_manager.enabled:
             # replay hands back one top-k stream per layer call: keep a single call
+            index_q, index_k, weights, starts, ends = self._indexer_inputs(q_lora, hidden, cu_seqlens, cp_layout)
             return lighting_indexer(index_q, index_k, weights, starts, ends, self.index_topk, topk_fn=topk_fn)[1]
+        phase = Phase.PLAIN
+        if indexer_recompute_cache_on(self.tp_group, self.cp_group, q_lora.device):
+            phase = recompute_phase(is_checkpointing(), torch.is_grad_enabled())
+        if phase is Phase.PLAIN:
+            return self._score_topk(q_lora, hidden, cu_seqlens, cp_layout, topk_fn)
+        # a fully recomputed layer: the forward keeps this rank's rows of its top-k, the recompute reuses them
+        part = self.topk_cache.take(cu_seqlens) if phase is Phase.REUSE else None
+        if part is None:
+            part, indices = self._score_topk_part(q_lora, hidden, cu_seqlens, cp_layout, topk_fn)
+            if phase is Phase.STORE:
+                self.topk_cache.put(cu_seqlens, part)
+            if indices is not None:
+                return indices
+        return gather_tp_parts(part, q_lora.shape[0], self.tp_group)
+
+    def _score_topk(self, q_lora, hidden, cu_seqlens, cp_layout, topk_fn) -> torch.Tensor:
+        index_q, index_k, weights, starts, ends = self._indexer_inputs(q_lora, hidden, cu_seqlens, cp_layout)
         if indexer_tp_split_on(self.tp_group, index_q.device):
             # every TP rank holds the same indexer inputs: score 1/TP of the rows, all-gather the indices
             return tp_split_topk(
@@ -132,6 +167,23 @@ class KimiK31DSAAttention(KimiK3Attention):
                 self.tp_group,
             )
         return chunked_indexer_topk(index_q, index_k, weights, starts, ends, self.index_topk, topk_fn)
+
+    def _score_topk_part(self, q_lora, hidden, cu_seqlens, cp_layout, topk_fn):
+        """(this TP rank's padded rows of the top-k, the whole [T, topk] top-k if it was scored whole else None)."""
+        index_q, index_k, weights, starts, ends = self._indexer_inputs(q_lora, hidden, cu_seqlens, cp_layout)
+        if indexer_tp_split_on(self.tp_group, index_q.device):
+            part = tp_split_part(
+                lambda q, w, ks, ke: chunked_indexer_topk(q, index_k, w, ks, ke, self.index_topk, topk_fn),
+                index_q,
+                weights,
+                starts,
+                ends,
+                self.index_topk,
+                self.tp_group,
+            )
+            return part, None
+        indices = chunked_indexer_topk(index_q, index_k, weights, starts, ends, self.index_topk, topk_fn)
+        return own_tp_part(indices, self.tp_group), indices
 
     def _forward_mla(self, hidden_states: torch.Tensor, packed_seq_params: PackedSeqParams | None) -> torch.Tensor:
         assert (
