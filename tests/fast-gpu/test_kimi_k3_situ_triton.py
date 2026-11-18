@@ -32,7 +32,7 @@ def _inputs(rows, scale, seed=0):
 
 
 def _bits(t):
-    return t.contiguous().view(torch.int16)
+    return t.contiguous().view(torch.int16 if t.element_size() == 2 else torch.int32)
 
 
 @pytest.mark.parametrize("scale", [0.1, 3.0, 40.0])
@@ -82,8 +82,9 @@ def _same(a, b):
 
 @pytest.mark.parametrize("with_probs", [False, True])
 def test_every_bf16_input_matches_eager_bitwise(with_probs):
-    # Megatron / TE in the process: the libdevice recompute matched eager standalone but not after these
-    # imports (one ulp in d(gate) where its two terms cancel, g = -1.21875)
+    # every gate value meets every cancellation point of d(gate) (e.g. g = -1.21875, where its tanh and
+    # sigmoid terms cancel and any contracted multiply-add shows up as a BF16 ulp); Megatron / TE imported
+    # as in the trainer
     import megatron.core.transformer.moe.experts  # noqa: F401
     import transformer_engine.pytorch  # noqa: F401
 
