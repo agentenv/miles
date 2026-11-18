@@ -39,9 +39,11 @@ from miles.backends.megatron_utils.fp32_param_utils import mark_param_dtype
 from miles.backends.megatron_utils.megatron_to_hf.linear_attn_layout import LinearAttnHeads
 from miles_plugins.models.cp_utils import (
     build_fla_cp_context,
+    RELAYOUT_BWD_REDUCE_ENV,
     cp_relayout_a2a_on,
     packed_shard_to_zigzag,
     packed_shard_to_zigzag_a2a,
+    relayout_bwd_reduce_on,
     zigzag_to_packed_shard,
     zigzag_to_packed_shard_a2a,
     zigzag_to_packed_shard_tp_replicated,
@@ -521,6 +523,10 @@ def _cp_relayout_a2a_on() -> bool:
     if on and not _CP_RELAYOUT_A2A_LOGGED:
         _CP_RELAYOUT_A2A_LOGGED = True
         print("[k31] KDA CP relayout by all-to-all (needed rows only) on", flush=True)
+        if relayout_bwd_reduce_on():
+            # the all-to-all relayout (bit-identical) has its own backward; the TP-sum backward of
+            # _TPReplicatedRelayout (MILES_K31_KDA_RELAYOUT_BWD_REDUCE) only applies without it
+            print(f"[k31] {RELAYOUT_BWD_REDUCE_ENV}=1 ignored: the all-to-all relayout takes precedence", flush=True)
     return on
 
 

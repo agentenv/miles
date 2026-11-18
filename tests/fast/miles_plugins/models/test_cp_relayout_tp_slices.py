@@ -65,12 +65,15 @@ def _worker(rank, world, tp, port, results):
             torch.manual_seed(100 + rank)  # TP-distinct consumer weights and upstream gradient
             weight, upstream = torch.randn(HIDDEN), torch.randn(shard, HIDDEN)
             outs, grads = [], []
-            for relayout in ("plain", "tp_slices", "tp_slices_bwd_reduce"):
-                os.environ[cp_utils.RELAYOUT_BWD_REDUCE_ENV] = "1" if relayout == "tp_slices_bwd_reduce" else "0"
+            for relayout in ("plain", "tp_slices", "tp_slices_bwd_reduce", "a2a_with_bwd_reduce_env"):
+                os.environ[cp_utils.RELAYOUT_BWD_REDUCE_ENV] = "0" if relayout in ("plain", "tp_slices") else "1"
                 sp = zigzag[tp_rank * part : (tp_rank + 1) * part].clone().requires_grad_(True)
                 x = _SPGather.apply(sp, tp_group)
                 if relayout == "plain":
                     y = cp_utils.zigzag_to_packed_shard(x, cu, cp_group, cp_rank, cp)
+                elif relayout == "a2a_with_bwd_reduce_env":
+                    # MILES_K31_KDA_CP_RELAYOUT_A2A takes precedence: its backward ignores the TP-sum switch
+                    y = cp_utils.zigzag_to_packed_shard_a2a(x, cu, cp_group, cp_rank, cp, tp_group)
                 else:
                     y = cp_utils.zigzag_to_packed_shard_tp_replicated(x, cu, cp_group, cp_rank, cp, tp_group)
                 ((y * weight) * upstream).sum().backward()
@@ -90,6 +93,7 @@ def _worker(rank, world, tp, port, results):
                 # another order (fp32 here: equal up to rounding)
                 torch.equal(outs[0], outs[2]),
                 torch.allclose(grads[0], grads[2], rtol=1e-6, atol=1e-6),
+                torch.equal(outs[0], outs[3]) and torch.equal(grads[0], grads[3]),
             )
     finally:
         dist.destroy_process_group()
