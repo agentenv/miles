@@ -39,11 +39,15 @@ from miles.backends.megatron_utils.fp32_param_utils import mark_param_dtype
 from miles.backends.megatron_utils.megatron_to_hf.linear_attn_layout import LinearAttnHeads
 from miles_plugins.models.cp_utils import (
     CORE_RELAYOUT_OVERLAP_ENV,
+    OUT_PROJ_RS_CHUNKS_ENV,
     SP_RELAYOUT_FUSED_ENV,
     build_fla_cp_context,
     RELAYOUT_BWD_REDUCE_ENV,
     core_relayout_overlap_on,
     cp_relayout_a2a_on,
+    linear_reduce_scatter_chunked,
+    out_proj_rs_chunks,
+    out_proj_rs_chunks_apply,
     packed_shard_to_zigzag,
     packed_shard_to_zigzag_a2a,
     packed_shard_to_zigzag_a2a_linear,
@@ -564,6 +568,20 @@ def _core_relayout_overlap_on() -> bool:
     return on
 
 
+_OUT_PROJ_RS_CHUNKS_LOGGED = False
+
+
+def _out_proj_rs_chunks() -> int:
+    """MILES_K31_KDA_OUT_PROJ_RS_CHUNKS=n (default 1 = off): out_proj and its SP reduce-scatter pipelined over n
+    row chunks in the forward (cp_utils); the backward is the unchunked one."""
+    global _OUT_PROJ_RS_CHUNKS_LOGGED
+    chunks = out_proj_rs_chunks()
+    if chunks > 1 and not _OUT_PROJ_RS_CHUNKS_LOGGED:
+        _OUT_PROJ_RS_CHUNKS_LOGGED = True
+        print(f"[k31] {OUT_PROJ_RS_CHUNKS_ENV}={chunks}: KDA out_proj + SP reduce-scatter in {chunks} chunks", flush=True)
+    return chunks
+
+
 def _tp_slice_relayout_on(tp_group, rows: int) -> bool:
     """MILES_K31_KDA_CP_RELAYOUT_V2=1 (default off): relayout the TP-replicated layer input by TP slices."""
     global _TP_SLICE_RELAYOUT_LOGGED
@@ -662,6 +680,25 @@ class LinearAttentionLayer(MegatronModule):
         core = self.linear_attn(x.transpose(0, 1), cu_seqlens, cp_context).transpose(0, 1)
 
         out_proj = self.linear_attn.out_proj
+        chunks = _out_proj_rs_chunks() if self.sequence_parallel and out_proj.bias is None else 1
+        if out_proj_rs_chunks_apply(core.shape[0], self.tp_group.size(), chunks):
+            fold = by_a2a and _core_relayout_overlap_on()
+            if by_a2a and not fold:
+                core = packed_shard_to_zigzag_a2a(core, global_cu_seqlens, self.cp_group, cp_rank, self.cp_size)
+            elif relayout and not by_a2a:
+                core = packed_shard_to_zigzag(
+                    core, global_cu_seqlens, self.cp_group, self.cp_group.rank(), self.cp_size
+                )
+            # out_proj + the SP reduce-scatter (and the folded output relayout), forward pipelined over row chunks
+            output = linear_reduce_scatter_chunked(
+                core,
+                out_proj.weight,
+                self.tp_group,
+                chunks,
+                cp_group=self.cp_group,
+                relayout=(global_cu_seqlens, cp_rank, self.cp_size) if fold else None,
+            )
+            return output, None
         if by_a2a and out_proj.bias is None and _core_relayout_overlap_on():
             output = packed_shard_to_zigzag_a2a_linear(
                 core, out_proj.weight, global_cu_seqlens, self.cp_group, cp_rank, self.cp_size
