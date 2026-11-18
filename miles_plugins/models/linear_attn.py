@@ -39,8 +39,11 @@ from miles.backends.megatron_utils.fp32_param_utils import mark_param_dtype
 from miles.backends.megatron_utils.megatron_to_hf.linear_attn_layout import LinearAttnHeads
 from miles_plugins.models.cp_utils import (
     build_fla_cp_context,
+    cp_relayout_a2a_on,
     packed_shard_to_zigzag,
+    packed_shard_to_zigzag_a2a,
     zigzag_to_packed_shard,
+    zigzag_to_packed_shard_a2a,
     zigzag_to_packed_shard_tp_replicated,
 )
 
@@ -508,6 +511,17 @@ class KimiDeltaAttention(LinearAttention):
 
 
 _TP_SLICE_RELAYOUT_LOGGED = False
+_CP_RELAYOUT_A2A_LOGGED = False
+
+
+def _cp_relayout_a2a_on() -> bool:
+    """MILES_K31_KDA_CP_RELAYOUT_A2A=1 (default off): the zigzag relayouts move only the rows each rank needs."""
+    global _CP_RELAYOUT_A2A_LOGGED
+    on = cp_relayout_a2a_on()
+    if on and not _CP_RELAYOUT_A2A_LOGGED:
+        _CP_RELAYOUT_A2A_LOGGED = True
+        print("[k31] KDA CP relayout by all-to-all (needed rows only) on", flush=True)
+    return on
 
 
 def _tp_slice_relayout_on(tp_group, rows: int) -> bool:
@@ -574,7 +588,15 @@ class LinearAttentionLayer(MegatronModule):
 
         global_cu_seqlens = self._global_cu_seqlens(x, packed_seq_params)
         relayout = self.cp_size > 1 and not self.allgather_cp
-        if relayout and _tp_slice_relayout_on(self.tp_group, x.shape[0]):
+        by_a2a = relayout and _cp_relayout_a2a_on()
+        cp_rank = self.cp_group.rank() if relayout else None
+        if by_a2a:
+            # only the rows each rank needs, by all-to-all (TP slices of them when x is TP-replicated)
+            tp_slices = _tp_slice_relayout_on(self.tp_group, x.shape[0])
+            x = zigzag_to_packed_shard_a2a(
+                x, global_cu_seqlens, self.cp_group, cp_rank, self.cp_size, self.tp_group if tp_slices else None
+            )
+        elif relayout and _tp_slice_relayout_on(self.tp_group, x.shape[0]):
             # x is the same on every TP rank: move 1 / TP of it over CP, rebuild the rest over TP
             x = zigzag_to_packed_shard_tp_replicated(
                 x, global_cu_seqlens, self.cp_group, self.cp_group.rank(), self.cp_size, self.tp_group
@@ -591,7 +613,9 @@ class LinearAttentionLayer(MegatronModule):
 
         core = self.linear_attn(x.transpose(0, 1), cu_seqlens, cp_context).transpose(0, 1)
 
-        if relayout:
+        if by_a2a:
+            core = packed_shard_to_zigzag_a2a(core, global_cu_seqlens, self.cp_group, cp_rank, self.cp_size)
+        elif relayout:
             core = packed_shard_to_zigzag(core, global_cu_seqlens, self.cp_group, self.cp_group.rank(), self.cp_size)
         output = self.linear_attn.out_proj(core)
         if self.sequence_parallel:
