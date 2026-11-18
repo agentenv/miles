@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.tensor_parallel import mappings
 from megatron.core.tensor_parallel.mappings import (
     copy_to_tensor_model_parallel_region,
     gather_from_sequence_parallel_region,
@@ -20,7 +21,7 @@ from megatron.core.tensor_parallel.random import is_checkpointing
 from miles.kernels.attention.dsa import causal_ranges, get_dsa_topk_fn, lighting_indexer, sparse_attention
 from miles.utils.hf_utils.config import load_hf_config
 from miles.utils.replay_base import indexer_replay_manager
-from miles_plugins.models.cp_utils import zigzag_gather_layout
+from miles_plugins.models.cp_utils import tp_slice_all_gather, zigzag_gather_layout
 from miles_plugins.models.kimi_k3.layers import KimiK3Attention, _linear
 from miles_plugins.models.kimi_k3.kda_layout import kimi_k3_kda_layers
 from miles_plugins.models.kimi_k3.model import get_kimi_k3_spec
@@ -38,7 +39,6 @@ from miles_plugins.models.kimi_k31.indexer_tp_split import (
     tp_split_part,
     tp_split_topk,
 )
-
 
 # Query rows the frozen DSA indexer scores per block (MILES_K31_INDEXER_QUERY_CHUNK overrides).
 INDEXER_QUERY_CHUNK = int(os.environ.get("MILES_K31_INDEXER_QUERY_CHUNK", "8192"))
@@ -73,6 +73,40 @@ def chunked_indexer_topk(
             for r in range(0, rows, chunk)
         ]
     )
+
+
+class _TPSliceGatherFromCP(torch.autograd.Function):
+    """``gather_from_sequence_parallel_region(x, group=cp_group)`` of a TP-replicated ``x`` (the MLA latent kv,
+    the indexer keys): the forward moves 1 / TP of it over CP (``tp_slice_all_gather``), same bytes out; the
+    gradient is TP-distinct (head-parallel attention), so the backward is the same CP reduce-scatter."""
+
+    @staticmethod
+    def forward(ctx, x, cp_group, tp_group):
+        ctx.cp_group = cp_group
+        return tp_slice_all_gather(x, cp_group, tp_group)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return mappings._reduce_scatter_along_first_dim(grad_output, ctx.cp_group), None, None
+
+
+_MLA_CP_GATHER_V2_LOGGED = False
+
+
+def gather_tp_replicated_over_cp(x: torch.Tensor, cp_group, tp_group) -> torch.Tensor:
+    """CP all-gather of a TP-replicated tensor. MILES_K31_MLA_CP_GATHER_V2=1 (default off) sends it by TP slices."""
+    global _MLA_CP_GATHER_V2_LOGGED
+    if (
+        os.environ.get("MILES_K31_MLA_CP_GATHER_V2", "0") == "1"
+        and tp_group.size() > 1
+        and x.shape[0] % tp_group.size() == 0
+    ):
+        if not _MLA_CP_GATHER_V2_LOGGED:
+            _MLA_CP_GATHER_V2_LOGGED = True
+            if tp_group.rank() == 0:
+                print(f"[k31] MLA/DSA CP gather v2 (TP slices) on tp={tp_group.size()}", flush=True)
+        return _TPSliceGatherFromCP.apply(x, cp_group, tp_group)
+    return gather_from_sequence_parallel_region(x, group=cp_group)
 
 
 class KimiK31Indexer(nn.Module):
@@ -128,7 +162,7 @@ class KimiK31DSAAttention(KimiK3Attention):
         positions = None
         if cp_layout is not None:
             gather_order, positions = cp_layout
-            index_k = gather_from_sequence_parallel_region(index_k, group=self.cp_group).index_select(0, gather_order)
+            index_k = gather_tp_replicated_over_cp(index_k, self.cp_group, self.tp_group).index_select(0, gather_order)
         starts, ends = causal_ranges(cu_seqlens, positions)
         return index_q, index_k, weights, starts.to(torch.int32), ends.to(torch.int32)
 
@@ -209,7 +243,7 @@ class KimiK31DSAAttention(KimiK3Attention):
             cp_layout = zigzag_gather_layout(
                 packed_seq_params.cu_seqlens_q, self.cp_group.rank(), self.cp_size, x.shape[0]
             )
-            kv = gather_from_sequence_parallel_region(kv, group=self.cp_group).index_select(0, cp_layout[0])
+            kv = gather_tp_replicated_over_cp(kv, self.cp_group, self.tp_group).index_select(0, cp_layout[0])
 
         w_kc, w_vc = self.kv_b_proj.weight.unflatten(0, (-1, self.qk_nope_head_dim + self.v_head_dim)).split(
             [self.qk_nope_head_dim, self.v_head_dim], dim=1
