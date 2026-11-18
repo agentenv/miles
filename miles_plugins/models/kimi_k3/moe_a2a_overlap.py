@@ -29,6 +29,21 @@ The NCCL collectives on each communicator keep their order, the same on every ra
 on the EP group, and the shared experts' TP collectives after the dispatch instead of before the router. A rank
 only waits on another stream for work it queued itself.
 
+``MILES_K3_MOE_A2A_OVERLAP_BWD=1`` (default off, needs the switch above) fixes the backward. Without it the
+combine-backward all-to-all is launched by its own autograd node, which the engine runs only after the shared
+experts' backward (their nodes have the higher sequence number). Under ``CUDA_DEVICE_MAX_CONNECTIONS=1`` that
+all-to-all then waits in the single hardware queue behind every shared-expert kernel, so the two run one after
+the other (x5 trace: the all-to-all starts 5.5-5.9 ms after its input is ready, in all 30 layer-microbatches of
+both profiled ranks). With the switch the combine output passes through :class:`_LaunchCombineBackward`, created
+after the shared experts. Its backward runs right after the unpermute's backward (before the shared experts'),
+launches the combine-backward all-to-all on the side stream, and stashes the result. The all-to-all's own node
+(:class:`_CombineAllToAll`) then returns the stash. The same backward also dequantizes, on the current stream
+inside that window, the frozen experts whose dgrad comes first (``MILES_K3_MOE_A2A_OVERLAP_BWD_PREFETCH``:
+``fc2`` by default, ``fc1,fc2`` or ``none``); this needs ``MILES_K31_MXFP4_REDEQUANT_BACKWARD=1`` with the
+grouped (Triton or batched) dequantization, which is what saves one packed group per fetch. In the forward the
+dispatch window also dequantizes fc2, after fc1. The all-to-all is the same call on the same gradient, the
+dequantization the same function of the same bytes, so every output and gradient stays bit-identical.
+
 Not used (``super()`` paths) under Megatron's own overlaps (``moe_shared_expert_overlap``,
 ``overlap_moe_expert_parallel_comm``, ``overlap_dispatch_backward_with_experts_wgrad``), MoE-module
 recompute, CUDA graphs, the inference dispatchers or any dispatcher other than all-to-all, partial
@@ -52,6 +67,9 @@ logger = logging.getLogger(__name__)
 
 A2A_OVERLAP_ENV = "MILES_K3_MOE_A2A_OVERLAP"
 PREFETCH_ENV = "MILES_K3_MOE_A2A_OVERLAP_PREFETCH"
+BWD_ENV = "MILES_K3_MOE_A2A_OVERLAP_BWD"
+BWD_PREFETCH_ENV = "MILES_K3_MOE_A2A_OVERLAP_BWD_PREFETCH"
+_BWD_PREFETCH_CHOICES = {"none": (), "fc2": ("linear_fc2",), "fc1,fc2": ("linear_fc2", "linear_fc1")}
 _FULL_EXECUTION = ["route", "expert_compute", "postprocess"]
 _comm_streams: dict[int, torch.cuda.Stream] = {}
 _reported = False
@@ -63,6 +81,18 @@ def a2a_overlap_enabled() -> bool:
 
 def prefetch_enabled() -> bool:
     return os.environ.get(PREFETCH_ENV, "1") == "1"
+
+
+def bwd_overlap_enabled() -> bool:
+    return os.environ.get(BWD_ENV, "0") == "1"
+
+
+def bwd_prefetch_projections() -> tuple[str, ...]:
+    """The frozen projections whose backward dequantization runs in the combine-backward window, in order."""
+    value = os.environ.get(BWD_PREFETCH_ENV, "fc2")
+    if value not in _BWD_PREFETCH_CHOICES:
+        raise ValueError(f"{BWD_PREFETCH_ENV} must be one of {sorted(_BWD_PREFETCH_CHOICES)}, got {value!r}")
+    return _BWD_PREFETCH_CHOICES[value]
 
 
 def _comm_stream(device: torch.device) -> torch.cuda.Stream:
@@ -101,17 +131,101 @@ def _join(comm: torch.cuda.Stream | None, *outputs: torch.Tensor) -> None:
         tensor.record_stream(current)
 
 
-def prefetch_frozen_expert_weights(experts) -> bool:
-    """Dequantize the frozen MXFP4 experts' fc1 weights now; their grouped linear's next weight fetch
-    takes them. Returns whether there was anything to prefetch."""
+def _frozen_projection(experts, name: str):
     from miles_plugins.models.kimi_k3.mxfp4_redequant import RedequantFrozenExperts
 
     frozen = getattr(experts, "frozen", experts)  # PartiallyTrainableGroupedMLP or a whole-MXFP4 TEGroupedMLP
-    fc1 = getattr(frozen, "linear_fc1", None)
-    if not isinstance(fc1, RedequantFrozenExperts):
-        return False
-    fc1.prefetch_weights()
-    return True
+    linear = getattr(frozen, name, None)
+    return linear if isinstance(linear, RedequantFrozenExperts) else None
+
+
+def prefetch_frozen_expert_weights(experts, projections=("linear_fc1",)) -> bool:
+    """Dequantize the frozen MXFP4 experts' weights of ``projections`` now, in order; each grouped linear's
+    next weight fetch takes them. Returns whether there was anything to prefetch."""
+    found = False
+    for name in projections:
+        linear = _frozen_projection(experts, name)
+        if linear is not None:
+            linear.prefetch_weights()
+            found = True
+    return found
+
+
+def _take_saved_groups(experts, projections) -> list:
+    """The packed groups the frozen projections saved for the backward in the forward that just ran (one per
+    projection, in ``projections`` order; projections that saved none are skipped)."""
+    groups = []
+    for name in projections:
+        linear = _frozen_projection(experts, name)
+        group = linear.take_saved_group() if linear is not None else None
+        if group is not None:
+            groups.append(group)
+    return groups
+
+
+def _combine_backward_all_to_all(group, grad, output_splits, input_splits):
+    """The combine all-to-all's gradient: Megatron's ``_AllToAll.backward`` call."""
+    return all_to_all(group, grad, output_splits, input_splits)
+
+
+class _CombineBackwardHandle:
+    """What the two combine nodes share: the backward all-to-all's arguments, its early result, and the packed
+    frozen-expert groups to dequantize in its window."""
+
+    __slots__ = ("group", "output_splits", "input_splits", "result", "prefetch_groups")
+
+    def __init__(self, group, output_splits, input_splits, prefetch_groups):
+        self.group = group
+        self.output_splits = output_splits
+        self.input_splits = input_splits
+        self.result = None
+        self.prefetch_groups = prefetch_groups
+
+    def all_to_all(self, grad):
+        return _combine_backward_all_to_all(self.group, grad, self.output_splits, self.input_splits)
+
+
+class _CombineAllToAll(torch.autograd.Function):
+    """Megatron's combine all-to-all (``token_combine``'s ``all_to_all`` call); its backward returns the
+    gradient :class:`_LaunchCombineBackward` already sent, and only falls back to sending it itself."""
+
+    @staticmethod
+    def forward(ctx, hidden_states, group, output_splits, input_splits, handle):
+        ctx.handle = handle
+        return all_to_all(group, hidden_states, output_splits, input_splits)
+
+    @staticmethod
+    def backward(ctx, grad):
+        handle, ctx.handle = ctx.handle, None
+        result, handle.result = handle.result, None
+        if result is None:
+            result = handle.all_to_all(grad)
+        return result, None, None, None, None
+
+
+class _LaunchCombineBackward(torch.autograd.Function):
+    """Identity on the combine output, created after the shared experts. Its backward runs before theirs and
+    launches the combine-backward all-to-all on the side stream, then dequantizes the frozen experts the
+    expert backward needs first, on the current stream, while it is in flight."""
+
+    @staticmethod
+    def forward(ctx, combined, handle):
+        ctx.handle = handle
+        return combined.view_as(combined)
+
+    @staticmethod
+    def backward(ctx, grad):
+        handle, ctx.handle = ctx.handle, None
+        with _on_comm_stream(grad) as comm:
+            result = handle.all_to_all(grad)
+        if comm is not None:
+            # read on the current stream by the expert backward; freed only after that work
+            result.record_stream(torch.cuda.current_stream())
+        handle.result = result
+        groups, handle.prefetch_groups = handle.prefetch_groups, ()
+        for packed_group in groups:
+            packed_group.prefetch()
+        return grad, None
 
 
 class _ForkSharedInput(torch.autograd.Function):
@@ -204,7 +318,8 @@ class A2AOverlapMoELayer(MoELayer):
                 dispatcher.ep_group, hidden_states, dispatcher.output_splits, dispatcher.input_splits
             )
         if prefetch_enabled():
-            prefetch_frozen_expert_weights(self.experts)
+            projections = ("linear_fc1", "linear_fc2") if bwd_overlap_enabled() else ("linear_fc1",)
+            prefetch_frozen_expert_weights(self.experts, projections)
         # probs were ready with the tokens: no second wait, which would queue this behind the dequantization
         with _on_comm_stream(probs, wait=False):
             global_probs = all_to_all(dispatcher.ep_group, probs, dispatcher.output_splits, dispatcher.input_splits)
@@ -214,12 +329,30 @@ class A2AOverlapMoELayer(MoELayer):
     def combine(self, output):
         if not self._a2a_overlap:
             return super().combine(output)
+        handle = None
+        if bwd_overlap_enabled() and torch.is_grad_enabled() and output.requires_grad:
+            dispatcher = self.token_dispatcher
+            # this forward's saved groups (each forward saves its own: recompute, or several microbatches in flight)
+            groups = _take_saved_groups(self.experts, bwd_prefetch_projections())
+            # backward splits = Megatron's _AllToAll.backward: the forward's output/input splits swapped
+            handle = _CombineBackwardHandle(
+                dispatcher.ep_group, dispatcher.output_splits, dispatcher.input_splits, groups
+            )
         with _on_comm_stream(output) as comm:
-            combined = super().combine(output)
+            if handle is None:
+                combined = super().combine(output)
+            else:
+                dispatcher = self.token_dispatcher
+                combined = _CombineAllToAll.apply(
+                    output, dispatcher.ep_group, dispatcher.input_splits, dispatcher.output_splits, handle
+                )
         shared_input, self._deferred_shared_input = self._deferred_shared_input, None
         if shared_input is not None:
             self._deferred_shared_output = super().shared_experts_compute(shared_input)
         _join(comm, combined)
+        if handle is not None:
+            # created after the shared experts: its backward runs before theirs (higher sequence number)
+            combined = _LaunchCombineBackward.apply(combined, handle)
         return combined
 
     def postprocess(self, output, shared_expert_output):
@@ -236,6 +369,12 @@ def _report_once(active: bool) -> None:
     _reported = True
     if active:
         print(f"[k3] {A2A_OVERLAP_ENV}=1: MoE EP all-to-alls overlap shared experts / expert dequant", flush=True)
+        if bwd_overlap_enabled():
+            print(
+                f"[k3] {BWD_ENV}=1: combine-backward all-to-all launched before the shared experts' backward; "
+                f"backward prefetch {bwd_prefetch_projections()}",
+                flush=True,
+            )
     else:
         logger.warning(
             "%s=1 but this MoE layer's configuration is not supported; Megatron's order is kept", A2A_OVERLAP_ENV
