@@ -63,7 +63,7 @@ def test_fp32_matches_eager(tokens, nbank, hidden):
     eager = _grads(_attn_res_mix, *args)
     fused = _grads(attn_res_fused.attn_res_mix_fused, *args)
     ref = _grads(_attn_res_mix, *args, device="cpu", cast=torch.float64)
-    for name, e, f, r in zip(NAMES, eager, fused, ref):
+    for name, e, f, r in zip(NAMES, eager, fused, ref, strict=True):
         assert f.shape == e.shape and f.dtype == e.dtype, name
         err, err_eager = _rel(f, e), _rel(e, r)
         print(
@@ -81,7 +81,7 @@ def test_bf16_matches_eager(nbank):
     eager = _grads(_attn_res_mix, *args)
     fused = _grads(attn_res_fused.attn_res_mix_fused, *args)
     ref = _grads(_attn_res_mix, *args, device="cpu", cast=torch.float64)
-    for name, e, f, r in zip(NAMES, eager, fused, ref):
+    for name, e, f, r in zip(NAMES, eager, fused, ref, strict=True):
         assert f.dtype == e.dtype, name
         exact = (f == e).float().mean().item()
         err_f, err_e = _rel(f, r.to(f.dtype)), _rel(e, r.to(e.dtype))
@@ -123,7 +123,7 @@ def _aggregate(fused, wrap=None, tokens=40, nbank=3, hidden=96, chunk=16):
 def test_aggregate_fused_matches_eager_with_param_grads():
     eager = _aggregate(False)
     fused = _aggregate(True)
-    for name, e, f in zip(NAMES[:3] + ("d_score_proj", "d_score_norm", "d_output_norm"), eager, fused):
+    for name, e, f in zip(NAMES[:3] + ("d_score_proj", "d_score_norm", "d_output_norm"), eager, fused, strict=True):
         print(f"aggregate {name}: fused-eager {_rel(f, e):.2e}")
         assert _rel(f, e) < 2e-5, name
 
@@ -134,7 +134,7 @@ def test_fused_under_recompute_is_bitwise_stable(reentrant):
     plain = _aggregate(True)
     again = _aggregate(True)
     recomputed = _aggregate(True, wrap=lambda f, p, b: checkpoint(f, p, b, use_reentrant=reentrant))
-    for a, b, c in zip(plain, again, recomputed):
+    for a, b, c in zip(plain, again, recomputed, strict=True):
         assert torch.equal(a, b) and torch.equal(a, c)
 
 
@@ -166,6 +166,6 @@ def test_zero_bank_rows_match_eager(pad):
     bank = torch.cat((torch.zeros(9, 1, pad, 96), bank), dim=-2)
     eager = _grads(_attn_res_mix, prefix, bank, w, go)
     fused = _grads(attn_res_fused.attn_res_mix_fused, prefix, bank, w, go)
-    for name, e, f in zip(NAMES, eager, fused):
+    for name, e, f in zip(NAMES, eager, fused, strict=True):
         print(f"zero pad={pad} {name}: fused-eager {_rel(f, e):.2e}")
         assert _rel(f, e) < 2e-5, name

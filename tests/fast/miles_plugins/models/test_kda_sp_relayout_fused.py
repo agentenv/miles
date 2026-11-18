@@ -89,7 +89,7 @@ def _worker(rank, world, tp, port, results):
                 ((y * weight.to(dtype)) * up.to(dtype)).sum().backward()
                 outs[path], grads[path] = y.detach(), sp.grad
             plan = cp_utils._sp_relayout_plan(cu, cp_rank, cp, tp_rank, tp, total)
-            err = lambda g: (g.double() - grads["fp64"]).abs().max().item()  # noqa: E731
+            err = lambda g, grads=grads: (g.double() - grads["fp64"]).abs().max().item()  # noqa: E731
             checks = {
                 "out_is_packed_shard": torch.equal(outs["fused"], full[cp_rank * shard : (cp_rank + 1) * shard]),
                 "out_equal": torch.equal(outs["fused"], outs["reference"]),

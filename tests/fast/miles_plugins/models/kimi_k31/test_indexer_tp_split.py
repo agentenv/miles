@@ -63,7 +63,7 @@ def _inputs(cu, positions=None, seed=0):
 def _zigzag_positions(cu, cp_rank, cp_size):
     # each sequence in 2 * cp chunks; rank r holds chunks r and 2 cp - 1 - r
     out = []
-    for a, b in zip(cu[:-1].tolist(), cu[1:].tolist()):
+    for a, b in zip(cu[:-1].tolist(), cu[1:].tolist(), strict=True):
         c = (b - a) // (2 * cp_size)
         out += [
             torch.arange(a + cp_rank * c, a + (cp_rank + 1) * c),
@@ -131,7 +131,13 @@ def _worker(rank, world, port, results):
             q, k, w, ks, ke = _case(name)
             for chunk in [0, 5]:
                 got = split.tp_split_topk(
-                    lambda q_, w_, s_, e_: _chunked(q_, k, w_, s_, e_, 16, chunk), q, w, ks, ke, 16, dist.group.WORLD
+                    lambda q_, w_, s_, e_, k=k, chunk=chunk: _chunked(q_, k, w_, s_, e_, 16, chunk),
+                    q,
+                    w,
+                    ks,
+                    ke,
+                    16,
+                    dist.group.WORLD,
                 )
                 results[(rank, name, chunk)] = bool(torch.equal(got, _indexer(q, k, w, ks, ke, 16)))
     finally:
