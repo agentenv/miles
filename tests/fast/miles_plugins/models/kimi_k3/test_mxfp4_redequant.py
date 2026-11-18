@@ -196,3 +196,69 @@ def test_packed_ref_is_what_the_graph_keeps(monkeypatch):
     width = mxfp4_row_width(HIDDEN, MXFP4_GROUP_SIZE)
     assert all(r.rows.dtype == torch.uint8 and r.rows.shape == (2 * WIDTH, width) for r in refs)
     assert all(r.shape == (2 * WIDTH, HIDDEN) and r.dtype == torch.bfloat16 for r in refs)
+
+
+# ----------------------------------------------------------- MILES_K31_MXFP4_BATCHED_DEQUANT (all experts of a fetch)
+
+
+@pytest.mark.parametrize("lut", ["0", "1"])
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("chunk", [None, "1", str(2 * WIDTH * HIDDEN * 2)])
+def test_batched_dequant_gradients_are_bitwise_equal(monkeypatch, lut, enabled, chunk):
+    monkeypatch.setenv(redequant.LUT_DEQUANT_ENV, lut)
+    monkeypatch.setenv(redequant.BATCHED_DEQUANT_ENV, "0")
+    plain = _run(monkeypatch, enabled=False)
+    monkeypatch.setenv(redequant.BATCHED_DEQUANT_ENV, "1")
+    if chunk is not None:
+        monkeypatch.setenv(redequant.BATCHED_DEQUANT_CHUNK_ENV, chunk)
+    batched = _run(monkeypatch, enabled=enabled)
+    _assert_bitwise(plain, batched)
+    assert batched[3] == (0 if enabled else 2 * len(M_SPLITS))
+
+
+@pytest.mark.parametrize("reentrant", [True, False])
+def test_batched_dequant_under_activation_checkpointing(monkeypatch, reentrant):
+    def wrap(fn, x):
+        return torch.utils.checkpoint.checkpoint(fn, x, use_reentrant=reentrant)
+
+    plain = _run(monkeypatch, enabled=False)
+    monkeypatch.setenv(redequant.BATCHED_DEQUANT_ENV, "1")
+    _assert_bitwise(plain, _run(monkeypatch, enabled=False, wrap=wrap))
+    _assert_bitwise(plain, _run(monkeypatch, enabled=True, wrap=wrap))
+
+
+def test_batched_unpack_dequantizes_the_group_once(monkeypatch):
+    monkeypatch.setenv(redequant.REDEQUANT_ENV, "1")
+    monkeypatch.setenv(redequant.BATCHED_DEQUANT_ENV, "1")
+    fc1, _ = _experts()
+    calls = []
+    real = redequant.dequantize_expert_rows
+    monkeypatch.setattr(
+        redequant, "dequantize_expert_rows", lambda rows, *a: calls.append(len(rows)) or real(rows, *a)
+    )
+    x = torch.randn(sum(M_SPLITS), HIDDEN).bfloat16().requires_grad_(True)
+    out = fc1(x, M_SPLITS)
+    assert calls == [len(M_SPLITS)]  # the forward fetch: one batched call
+    out.sum().backward()
+    assert calls == [len(M_SPLITS), len(M_SPLITS)]  # the backward: one more for all four experts, not four
+
+
+def test_batched_group_survives_a_second_read():
+    rows = _rows(3, 2 * WIDTH, HIDDEN, seed=9)
+    group = redequant._PackedGroup(rows, MXFP4_GROUP_SIZE)
+    first = [group.take(i) for i in range(3)]
+    assert group._weights is None  # every slice handed out: nothing cached
+    again = group.take(1)  # a second unpack of the saved tensors re-dequantizes
+    assert torch.equal(again.view(torch.int16), first[1].view(torch.int16))
+
+
+def test_batched_changed_bytes_are_still_refused(monkeypatch):
+    monkeypatch.setenv(redequant.REDEQUANT_ENV, "1")
+    monkeypatch.setenv(redequant.BATCHED_DEQUANT_ENV, "1")
+    fc1, _ = _experts()
+    x = torch.randn(sum(M_SPLITS), HIDDEN).bfloat16().requires_grad_(True)
+    out = fc1(x, M_SPLITS)
+    with torch.no_grad():
+        fc1.weight2.add_(1)
+    with pytest.raises(AssertionError, match="changed between its forward and its backward"):
+        out.sum().backward()
