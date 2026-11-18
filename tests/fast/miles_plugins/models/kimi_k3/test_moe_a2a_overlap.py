@@ -17,6 +17,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
+from tests.ci.ci_register import register_cpu_ci
 
 overlap = pytest.importorskip("miles_plugins.models.kimi_k3.moe_a2a_overlap")
 from megatron.core.process_groups_config import ProcessGroupCollection  # noqa: E402
@@ -30,6 +31,8 @@ from megatron.core.transformer.transformer_config import TransformerConfig  # no
 
 from miles.utils.mxfp4 import MXFP4_GROUP_SIZE, pack_mxfp4_rows, quantize_mxfp4  # noqa: E402
 from miles_plugins.models.kimi_k3.mxfp4_redequant import RedequantFrozenExperts  # noqa: E402
+
+register_cpu_ci(est_time=120, suite="stage-b-cpu", labels=["miles-plugin"])
 
 HIDDEN, FFN, SHARED_FFN, EXPERTS, TOPK, TOKENS = 64, 32, 48, 8, 2, 24
 
