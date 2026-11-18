@@ -9,9 +9,14 @@ def reset_optimizer_state(
 ) -> None:
     assert isinstance(optimizer, ChainedOptimizer)
     assert not optimizer.config.offload_optimizer_states
-    assert (
-        not chunked_optimizer_state_offload
-    ), "--chunked-optimizer-state-offload keeps the canonical moments outside the optimizer state this clears"
+    if chunked_optimizer_state_offload:
+        # Its CPU store holds the canonical moments (and an optimizer-owned master) only once a step has
+        # moved them there. Before that -- the reset of a fresh launch from HF weights -- the store is
+        # empty and the optimizer state is everything there is to clear.
+        assert not any(_offloader_holds_state(chained) for chained in optimizer.chained_optimizers), (
+            "--chunked-optimizer-state-offload keeps the canonical moments outside the optimizer state this "
+            "clears"
+        )
     assert not optimizer.config.fp16, (
         "an fp16 optimizer keeps a loss scaler with a scale and a growth tracker beside the state this clears, so "
         "the reset would leave the trainer with the scaler of the rollouts it just discarded"
@@ -34,15 +39,25 @@ def reset_optimizer_state(
             for param_group in leaf.param_groups:
                 param_group.pop("step", None)
 
-        if chained.init_state_fn is not None and not USING_PYTORCH_OPTIMIZER:
+        # Chunked offload leaves the state empty: TE FusedAdam builds it on the first step, chunk by chunk, from
+        # the weights loaded after this reset, and the offloader moves it to the host. Built here it would sit on
+        # the GPU in full through the first forward/backward (and a non-remainder master would predate the load).
+        if chained.init_state_fn is not None and not USING_PYTORCH_OPTIMIZER and not chunked_optimizer_state_offload:
             chained.init_state_fn(inner, chained.config)
 
         chained.zero_grad(set_to_none=True)
 
-    _check_optimizer_state_empty(optimizer)
+    _check_optimizer_state_empty(optimizer, lazy_state=chunked_optimizer_state_offload)
 
 
-def _check_optimizer_state_empty(optimizer: MegatronOptimizer) -> None:
+def _offloader_holds_state(chained: MegatronOptimizer) -> bool:
+    offloader = getattr(chained, "_optimizer_state_offloader", None)  # config-access-exempt: set only by Megatron's chunked optimizer-state offload
+    if offloader is None:
+        return False
+    return bool(getattr(offloader, "_cpu_state", None) or getattr(offloader, "_cpu_master", None))  # config-access-exempt: the offloader's CPU canonical stores
+
+
+def _check_optimizer_state_empty(optimizer: MegatronOptimizer, *, lazy_state: bool = False) -> None:
     checked_optimizers = 0
     checked_params = 0
     checked_state_keys: set[str] = set()
@@ -74,7 +89,8 @@ def _check_optimizer_state_empty(optimizer: MegatronOptimizer) -> None:
     assert checked_params > 0
     # if you use a non-adam optimizer, add the asserts for its state keys here
     # HybridDeviceOptimizer has no init_state_fn: its sub-optimizers allocate the moments on their first step
-    lazy = USING_PYTORCH_OPTIMIZER or optimizer.config.optimizer_cpu_offload
+    # (lazy_state: the chunked optimizer-state offload, whose reset skips the initializer)
+    lazy = USING_PYTORCH_OPTIMIZER or optimizer.config.optimizer_cpu_offload or lazy_state
     assert checked_state_keys == (set() if lazy else {"exp_avg", "exp_avg_sq"})
 
 
