@@ -21,6 +21,11 @@ Under ``--recompute-granularity full`` the first forward runs without grad (noth
 installed) and the backward recompute dequantizes once more, so a recomputed layer dequantizes three times
 instead of twice; its peak still drops by the experts the backward is not currently using.
 
+Every weight fetch dequantizes with the fp32 chain of ``dequantize_mxfp4`` (about 77 B of memory traffic per
+weight: 122 GB per MoE layer and fetch at EP16, two fetches per layer under full recompute, three with this switch);
+``MILES_K31_MXFP4_LUT_DEQUANT=1`` uses ``dequantize_mxfp4_lut`` instead, the same bits through a byte table at
+about 9 B per weight.
+
 Default off: the module forward is TE's, unchanged. Torch-only (plus ``miles.utils.mxfp4``) so the CPU tests load
 it without Megatron or TE.
 """
@@ -37,6 +42,8 @@ import torch
 from miles.utils.mxfp4 import MXFP4_GROUP_SIZE, dequantize_mxfp4_rows
 
 REDEQUANT_ENV = "MILES_K31_MXFP4_REDEQUANT_BACKWARD"
+# dequantize through the byte table (miles.utils.mxfp4.dequantize_mxfp4_lut): the same bits, about 1/8 of the traffic
+LUT_DEQUANT_ENV = "MILES_K31_MXFP4_LUT_DEQUANT"
 
 logger = logging.getLogger(__name__)
 _reported = False
@@ -44,6 +51,10 @@ _reported = False
 
 def redequant_enabled() -> bool:
     return os.environ.get(REDEQUANT_ENV, "0") == "1"
+
+
+def lut_dequant_enabled() -> bool:
+    return os.environ.get(LUT_DEQUANT_ENV, "0") == "1"
 
 
 def _key(tensor: torch.Tensor) -> tuple:
@@ -67,7 +78,7 @@ class PackedWeightRef:
         assert self.rows._version == self.version, (
             "a frozen MXFP4 expert's packed bytes changed between its forward and its backward"
         )
-        weight = dequantize_mxfp4_rows(self.rows, self.group_size)
+        weight = dequantize_mxfp4_rows(self.rows, self.group_size, lut=lut_dequant_enabled())
         assert weight.shape == self.shape and weight.dtype == self.dtype, (weight.shape, self.shape, weight.dtype)
         return weight
 
@@ -152,7 +163,8 @@ class RedequantFrozenExperts:
 
     def _get_weight_tensors(self):
         rows = self._packed_rows()
-        weights = [dequantize_mxfp4_rows(packed, MXFP4_GROUP_SIZE) for packed in rows]
+        lut = lut_dequant_enabled()
+        weights = [dequantize_mxfp4_rows(packed, MXFP4_GROUP_SIZE, lut=lut) for packed in rows]
         if self._redequant_scope is not None:
             self._redequant_scope.register(weights, rows)
         return weights
