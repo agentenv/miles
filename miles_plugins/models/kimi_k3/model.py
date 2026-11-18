@@ -10,6 +10,7 @@ from miles.utils.lora.utils import is_lora_enabled
 
 from .kda_layout import kimi_k3_kda_layers
 from .layers import KimiK3Attention, KimiK3KDAAttention, KimiK3TransformerLayer
+from .moe_a2a_overlap import a2a_overlap_enabled, a2a_overlap_moe_spec
 from .mxfp4_experts import (
     MXFP4ColumnParallelGroupedLinear,
     MXFP4RowParallelGroupedLinear,
@@ -76,6 +77,9 @@ def build_kimi_k3_spec(
             experts = layer_spec.submodules.mlp.keywords["submodules"].experts.keywords["submodules"]
             experts.linear_fc1 = MXFP4ColumnParallelGroupedLinear
             experts.linear_fc2 = MXFP4RowParallelGroupedLinear
+        if config.moe_layer_freq[layer_offset + len(layer_specs)] and a2a_overlap_enabled():
+            # MILES_K3_MOE_A2A_OVERLAP: the EP all-to-alls overlap the shared experts and the expert dequant
+            layer_spec.submodules.mlp = a2a_overlap_moe_spec(layer_spec.submodules.mlp)
 
         layer_specs.append(layer_spec)
 
