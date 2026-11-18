@@ -50,6 +50,17 @@ class KimiRMSNorm(nn.Module):
 # blocks are exact. The fp32 rows of one call are [T, blocks + 1, H] (7.9 GiB at 32k tokens and
 # 9 rows); scoring them in checkpointed token blocks bounds those temporaries. <= 0 disables.
 ATTN_RES_TOKEN_CHUNK = int(os.environ.get("MILES_K3_ATTN_RES_TOKEN_CHUNK", "4096"))
+# Fused Triton mix (attn_res_fused.py): reads the bf16 rows directly and saves only its inputs, so the token
+# blocks above are not used. CUDA tensors only (or CPU under TRITON_INTERPRET=1); default off.
+ATTN_RES_FUSED = os.environ.get("MILES_K3_ATTN_RES_FUSED", "0") == "1"
+
+
+def _use_fused_mix(prefix_sum: torch.Tensor, block_residual: torch.Tensor, fused: bool | None) -> bool:
+    if not (ATTN_RES_FUSED if fused is None else fused):
+        return False
+    if prefix_sum.dtype != block_residual.dtype:
+        return False
+    return prefix_sum.is_cuda or os.environ.get("TRITON_INTERPRET") == "1"
 
 
 def _attn_res_mix(
@@ -73,11 +84,17 @@ def attn_res_aggregate(
     score_norm: KimiRMSNorm,
     output_norm: nn.Module,
     chunk: int | None = None,
+    fused: bool | None = None,
 ) -> torch.Tensor:
     chunk = ATTN_RES_TOKEN_CHUNK if chunk is None else int(chunk)
     score_weight = score_norm.weight.float() * score_proj.weight.squeeze(0).float()
     tokens = prefix_sum.shape[0]
-    if chunk <= 0 or tokens <= chunk:
+    if _use_fused_mix(prefix_sum, block_residual, fused):
+        # deferred: triton is needed only on the fused path
+        from miles_plugins.models.kimi_k3.attn_res_fused import attn_res_mix_fused
+
+        mixed = attn_res_mix_fused(prefix_sum, block_residual, score_weight, score_norm.eps)
+    elif chunk <= 0 or tokens <= chunk:
         mixed = _attn_res_mix(prefix_sum, block_residual, score_weight, score_norm.eps)
     else:
         mixed = torch.cat([
