@@ -25,6 +25,7 @@ from miles.utils.function_registry import load_function
 from miles.utils.megatron_bridge_utils import describe_bridge_moe_runtime_config, load_auto_bridge
 from miles.utils.replay_base import routing_replay_manager
 from miles.utils.router_gemm import ROUTER_GEMM_ENV, install_router_gemm, router_gemm_mode
+from miles.utils.chunk_sort_map import chunk_sort_map_enabled, install_chunk_sort_map
 from miles.backends.training_utils.critic_freeze import freeze_attention_parameters
 from miles.backends.megatron_utils.critic_head import critic_head_owner
 from miles.utils.args.configs.yeto_algo import yeto_algo_option
@@ -385,6 +386,9 @@ def get_model_provider_func(
         _maybe_freeze_for_partial_experts(args, model)
         _maybe_install_routed_expert_qat(args, model)
         _maybe_install_router_gemm(model)
+        if chunk_sort_map_enabled():
+            # MILES_K31_CHUNK_SORT_MAP_TORCH: TE's chunk-sort row map as torch ops (miles.utils.chunk_sort_map)
+            install_chunk_sort_map()
 
         if post_process and role == "critic":
             model.output_layer = LinearForLastLayer(
